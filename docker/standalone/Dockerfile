@@ -21,8 +21,9 @@ WORKDIR /app/api
 # Sync dependencies (will create lock file if needed)
 RUN uv sync
 
-# Copy source code
+# Copy source code and alembic migrations
 COPY hindsight-api/hindsight_api ./hindsight_api
+COPY hindsight-api/alembic ./alembic
 
 # Build TypeScript SDK
 FROM node:20-alpine AS sdk-builder
@@ -70,6 +71,7 @@ RUN apt-get update && apt-get install -y \
     libxml2 \
     libssl3 \
     libgssapi-krb5-2 \
+    libossp-uuid16 \
     && apt-get install -y libicu72 || apt-get install -y libicu74 || apt-get install -y libicu* \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
@@ -97,6 +99,10 @@ COPY --from=cp-builder /app/.next ./.next
 COPY --from=cp-builder /app/public ./public
 COPY --from=cp-builder /app/next.config.ts ./next.config.ts
 
+# For standalone mode, static files must be in .next/standalone/.next/static
+RUN cp -r .next/static .next/standalone/.next/static
+RUN cp -r public .next/standalone/public
+
 WORKDIR /app
 
 # Copy startup script
@@ -109,24 +115,20 @@ RUN mkdir -p /app/data && chown -R hindsight:hindsight /app
 # Switch to non-root user
 USER hindsight
 
-# Install pg0
-RUN curl -fsSL https://raw.githubusercontent.com/vectorize-io/pg0/main/install.sh | bash
-
-# Start pg0 once to verify it works and pre-download PostgreSQL libraries
-RUN pg0 --help && \
-    pg0 start --wait && \
-    pg0 stop
-
-# Expose ports
-EXPOSE 8888 3000
-
-# Environment variables
+# Environment variables (set PATH early so pg0 is accessible after install)
+ENV PATH="/home/hindsight/.local/bin:/app/api/.venv/bin:${PATH}"
 ENV HINDSIGHT_API_HOST=0.0.0.0
 ENV HINDSIGHT_API_PORT=8888
 ENV HINDSIGHT_API_LOG_LEVEL=info
 ENV NODE_ENV=production
 ENV HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:8888
-ENV PATH="/home/hindsight/.local/bin:/app/api/.venv/bin:${PATH}"
+
+# Install pg0 CLI (the API will handle starting PostgreSQL at runtime)
+RUN curl -fsSL https://raw.githubusercontent.com/vectorize-io/pg0/main/install.sh | bash && \
+    pg0 --help
+
+# Expose ports
+EXPOSE 8888 3000
 
 # Run startup script
 CMD ["/app/start-all.sh"]
