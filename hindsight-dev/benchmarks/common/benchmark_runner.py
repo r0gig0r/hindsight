@@ -38,6 +38,47 @@ import os
 console = Console()
 
 
+def get_model_config() -> Dict[str, Dict[str, str]]:
+    """
+    Get the model configuration for all three LLM roles.
+
+    Returns:
+        Dict with 'hindsight', 'answer_generation', and 'judge' keys,
+        each containing 'provider' and 'model' info.
+    """
+    from hindsight_api.engine.llm_wrapper import LLMConfig
+
+    memory_config = LLMConfig.for_memory()
+    answer_config = LLMConfig.for_answer_generation()
+    judge_config = LLMConfig.for_judge()
+
+    return {
+        'hindsight': {
+            'provider': memory_config.provider,
+            'model': memory_config.model,
+        },
+        'answer_generation': {
+            'provider': answer_config.provider,
+            'model': answer_config.model,
+        },
+        'judge': {
+            'provider': judge_config.provider,
+            'model': judge_config.model,
+        }
+    }
+
+
+def print_model_config():
+    """Print the model configuration to console."""
+    config = get_model_config()
+
+    console.print("\n[bold cyan]Model Configuration:[/bold cyan]")
+    console.print(f"  Hindsight:         {config['hindsight']['provider']}/{config['hindsight']['model']}")
+    console.print(f"  Answer Generation: {config['answer_generation']['provider']}/{config['answer_generation']['model']}")
+    console.print(f"  LLM Judge:         {config['judge']['provider']}/{config['judge']['model']}")
+    console.print()
+
+
 async def create_memory_engine() -> MemoryEngine:
     """
     Create and initialize a MemoryEngine instance from environment variables.
@@ -780,6 +821,9 @@ class BenchmarkRunner:
         console.print(f"\n[bold cyan]Benchmark Evaluation[/bold cyan]")
         console.print("=" * 80)
 
+        # Print model configuration
+        print_model_config()
+
         # Load dataset
         console.print(f"\n[1] Loading dataset from {dataset_path}...")
         items = self.dataset.load(dataset_path, max_items)
@@ -869,6 +913,7 @@ class BenchmarkRunner:
             'total_invalid': total_invalid,
             'total_valid': total_valid,
             'num_items': len(items),
+            'model_config': get_model_config(),
             'item_results': all_results
         }
 
@@ -1130,6 +1175,15 @@ class BenchmarkRunner:
         """Display benchmark results in a formatted table."""
         console.print("\n[bold green]✓ Benchmark Complete![/bold green]\n")
 
+        # Display model configuration
+        if 'model_config' in results:
+            config = results['model_config']
+            console.print("[bold cyan]Model Configuration:[/bold cyan]")
+            console.print(f"  Hindsight:         {config['hindsight']['provider']}/{config['hindsight']['model']}")
+            console.print(f"  Answer Generation: {config['answer_generation']['provider']}/{config['answer_generation']['model']}")
+            console.print(f"  LLM Judge:         {config['judge']['provider']}/{config['judge']['model']}")
+            console.print()
+
         # Display results table
         table = Table(title="Benchmark Results", box=box.ROUNDED)
         table.add_column("Item ID", style="cyan")
@@ -1244,6 +1298,7 @@ class BenchmarkRunner:
             'total_invalid': total_invalid,
             'total_valid': total_valid,
             'num_items': len(all_results),
+            'model_config': get_model_config(),
             'item_results': all_results
         }
 

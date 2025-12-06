@@ -238,7 +238,7 @@ class LLMConfig:
         skip_validation: bool,
         start_time: float,
         **kwargs
-    ) -> Any:
+) -> Any:
         """Handle Gemini-specific API calls using google-genai SDK."""
         import json
 
@@ -287,6 +287,8 @@ class LLMConfig:
             config_kwargs['max_output_tokens'] = kwargs['max_tokens']
         if response_format is not None:
             config_kwargs['response_mime_type'] = 'application/json'
+            # Pass the Pydantic model directly as response_schema for structured output
+            config_kwargs['response_schema'] = response_format
 
         generation_config = genai_types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
@@ -301,6 +303,23 @@ class LLMConfig:
                 )
 
                 content = response.text
+
+                # Handle empty/None response (can happen with content filtering or timeouts)
+                if content is None:
+                    # Check if there's a block reason
+                    block_reason = None
+                    if hasattr(response, 'candidates') and response.candidates:
+                        candidate = response.candidates[0]
+                        if hasattr(candidate, 'finish_reason'):
+                            block_reason = candidate.finish_reason
+
+                    if attempt < max_retries:
+                        logger.warning(f"Gemini returned empty response (reason: {block_reason}), retrying... (attempt {attempt + 1}/{max_retries + 1})")
+                        backoff = min(initial_backoff * (2 ** attempt), max_backoff)
+                        await asyncio.sleep(backoff)
+                        continue
+                    else:
+                        raise RuntimeError(f"Gemini returned empty response after {max_retries + 1} attempts (reason: {block_reason})")
 
                 if response_format is not None:
                     # Parse the JSON response
@@ -357,6 +376,35 @@ class LLMConfig:
         api_key = os.getenv("HINDSIGHT_API_LLM_API_KEY")
         base_url = os.getenv("HINDSIGHT_API_LLM_BASE_URL")
         model = os.getenv("HINDSIGHT_API_LLM_MODEL", "openai/gpt-oss-120b")
+
+        # Set default base URL if not provided
+        if not base_url:
+            if provider == "groq":
+                base_url = "https://api.groq.com/openai/v1"
+            elif provider == "ollama":
+                base_url = "http://localhost:11434/v1"
+            else:
+                base_url = ""
+
+        return cls(
+            provider=provider,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+        )
+
+    @classmethod
+    def for_answer_generation(cls) -> "LLMConfig":
+        """
+        Create configuration for answer generation operations from environment variables.
+
+        Falls back to memory LLM config if answer-specific config not set.
+        """
+        # Check if answer-specific config exists, otherwise fall back to memory config
+        provider = os.getenv("HINDSIGHT_API_ANSWER_LLM_PROVIDER", os.getenv("HINDSIGHT_API_LLM_PROVIDER", "groq"))
+        api_key = os.getenv("HINDSIGHT_API_ANSWER_LLM_API_KEY", os.getenv("HINDSIGHT_API_LLM_API_KEY"))
+        base_url = os.getenv("HINDSIGHT_API_ANSWER_LLM_BASE_URL", os.getenv("HINDSIGHT_API_LLM_BASE_URL"))
+        model = os.getenv("HINDSIGHT_API_ANSWER_LLM_MODEL", os.getenv("HINDSIGHT_API_LLM_MODEL", "openai/gpt-oss-120b"))
 
         # Set default base URL if not provided
         if not base_url:
