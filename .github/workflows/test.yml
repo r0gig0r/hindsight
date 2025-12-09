@@ -126,7 +126,7 @@ jobs:
     - name: Install pg0
       run: |
         mkdir -p ~/.local/bin
-        curl -fsSL https://github.com/nicoloboschi/pg0/releases/latest/download/pg0-linux-amd64 -o ~/.local/bin/pg0
+        curl -fsSL https://github.com/vectorize-io/pg0/releases/latest/download/pg0-linux-amd64 -o ~/.local/bin/pg0
         chmod +x ~/.local/bin/pg0
         echo "$HOME/.local/bin" >> $GITHUB_PATH
 
@@ -168,7 +168,7 @@ jobs:
     - name: Install pg0
       run: |
         mkdir -p ~/.local/bin
-        curl -fsSL https://github.com/nicoloboschi/pg0/releases/latest/download/pg0-linux-amd64 -o ~/.local/bin/pg0
+        curl -fsSL https://github.com/vectorize-io/pg0/releases/latest/download/pg0-linux-amd64 -o ~/.local/bin/pg0
         chmod +x ~/.local/bin/pg0
         echo "$HOME/.local/bin" >> $GITHUB_PATH
 
@@ -254,7 +254,7 @@ jobs:
     - name: Install pg0
       run: |
         mkdir -p ~/.local/bin
-        curl -fsSL https://github.com/nicoloboschi/pg0/releases/latest/download/pg0-linux-amd64 -o ~/.local/bin/pg0
+        curl -fsSL https://github.com/vectorize-io/pg0/releases/latest/download/pg0-linux-amd64 -o ~/.local/bin/pg0
         chmod +x ~/.local/bin/pg0
         echo "$HOME/.local/bin" >> $GITHUB_PATH
 
@@ -347,7 +347,7 @@ jobs:
     - name: Install pg0
       run: |
         mkdir -p ~/.local/bin
-        curl -fsSL https://github.com/nicoloboschi/pg0/releases/latest/download/pg0-linux-amd64 -o ~/.local/bin/pg0
+        curl -fsSL https://github.com/vectorize-io/pg0/releases/latest/download/pg0-linux-amd64 -o ~/.local/bin/pg0
         chmod +x ~/.local/bin/pg0
         echo "$HOME/.local/bin" >> $GITHUB_PATH
 

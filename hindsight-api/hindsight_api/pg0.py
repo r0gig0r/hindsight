@@ -162,8 +162,8 @@ class EmbeddedPostgres:
 
         raise RuntimeError(
             "pg0 is not installed. Please install it manually:\n"
-            "  curl -fsSL https://github.com/nicoloboschi/pg0/releases/latest/download/pg0-linux-amd64 -o ~/.local/bin/pg0 && chmod +x ~/.local/bin/pg0\n"
-            "Or visit: https://github.com/nicoloboschi/pg0/releases"
+            "  curl -fsSL https://github.com/vectorize-io/pg0/releases/latest/download/pg0-linux-amd64 -o ~/.local/bin/pg0 && chmod +x ~/.local/bin/pg0\n"
+            "Or visit: https://github.com/vectorize-io/pg0/releases"
         )
 
     def _run_command(self, *args: str, capture_output: bool = True) -> subprocess.CompletedProcess:
