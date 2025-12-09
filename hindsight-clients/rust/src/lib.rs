@@ -85,7 +85,6 @@ mod tests {
             max_tokens: 4096,
             trace: false,
             budget: None,
-            filters: None,
             include: None,
             query_timestamp: None,
             types: None,
@@ -102,7 +101,6 @@ mod tests {
             query: "What do you know about Alice?".to_string(),
             budget: None,
             context: None,
-            filters: None,
             include: None,
         };
         let reflect_response = client

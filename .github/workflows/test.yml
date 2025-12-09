@@ -124,11 +124,7 @@ jobs:
         python-version-file: ".python-version"
 
     - name: Install pg0
-      run: |
-        mkdir -p ~/.local/bin
-        curl -fsSL https://github.com/vectorize-io/pg0/releases/latest/download/pg0-linux-amd64 -o ~/.local/bin/pg0
-        chmod +x ~/.local/bin/pg0
-        echo "$HOME/.local/bin" >> $GITHUB_PATH
+      uses: ./.github/actions/setup-pg0
 
     - name: Build API
       working-directory: ./hindsight-api
@@ -166,11 +162,7 @@ jobs:
         python-version-file: ".python-version"
 
     - name: Install pg0
-      run: |
-        mkdir -p ~/.local/bin
-        curl -fsSL https://github.com/vectorize-io/pg0/releases/latest/download/pg0-linux-amd64 -o ~/.local/bin/pg0
-        chmod +x ~/.local/bin/pg0
-        echo "$HOME/.local/bin" >> $GITHUB_PATH
+      uses: ./.github/actions/setup-pg0
 
     - name: Build API
       working-directory: ./hindsight-api
@@ -252,11 +244,7 @@ jobs:
         node-version: '20'
 
     - name: Install pg0
-      run: |
-        mkdir -p ~/.local/bin
-        curl -fsSL https://github.com/vectorize-io/pg0/releases/latest/download/pg0-linux-amd64 -o ~/.local/bin/pg0
-        chmod +x ~/.local/bin/pg0
-        echo "$HOME/.local/bin" >> $GITHUB_PATH
+      uses: ./.github/actions/setup-pg0
 
     - name: Build API
       working-directory: ./hindsight-api
@@ -345,11 +333,7 @@ jobs:
         key: ${{ runner.os }}-cargo-client-${{ hashFiles('hindsight-clients/rust/Cargo.lock') }}
 
     - name: Install pg0
-      run: |
-        mkdir -p ~/.local/bin
-        curl -fsSL https://github.com/vectorize-io/pg0/releases/latest/download/pg0-linux-amd64 -o ~/.local/bin/pg0
-        chmod +x ~/.local/bin/pg0
-        echo "$HOME/.local/bin" >> $GITHUB_PATH
+      uses: ./.github/actions/setup-pg0
 
     - name: Build API
       working-directory: ./hindsight-api
