@@ -183,8 +183,18 @@ jobs:
     - name: Start API server
       run: |
         ./scripts/dev/start-api.sh &
-        sleep 30
-        curl -f http://localhost:8888/health || exit 1
+        echo "Waiting for API server to be ready..."
+        for i in {1..60}; do
+          if curl -sf http://localhost:8888/health > /dev/null 2>&1; then
+            echo "API server is ready after ${i}s"
+            break
+          fi
+          if [ $i -eq 60 ]; then
+            echo "API server failed to start after 60s"
+            exit 1
+          fi
+          sleep 1
+        done
 
     - name: Run Python client tests
       working-directory: ./hindsight-clients/python
@@ -244,8 +254,18 @@ jobs:
     - name: Start API server
       run: |
         ./scripts/dev/start-api.sh &
-        sleep 30
-        curl -f http://localhost:8888/health || exit 1
+        echo "Waiting for API server to be ready..."
+        for i in {1..60}; do
+          if curl -sf http://localhost:8888/health > /dev/null 2>&1; then
+            echo "API server is ready after ${i}s"
+            break
+          fi
+          if [ $i -eq 60 ]; then
+            echo "API server failed to start after 60s"
+            exit 1
+          fi
+          sleep 1
+        done
 
     - name: Run TypeScript client tests
       working-directory: ./hindsight-clients/typescript
@@ -304,8 +324,18 @@ jobs:
     - name: Start API server
       run: |
         ./scripts/dev/start-api.sh &
-        sleep 30
-        curl -f http://localhost:8888/health || exit 1
+        echo "Waiting for API server to be ready..."
+        for i in {1..60}; do
+          if curl -sf http://localhost:8888/health > /dev/null 2>&1; then
+            echo "API server is ready after ${i}s"
+            break
+          fi
+          if [ $i -eq 60 ]; then
+            echo "API server failed to start after 60s"
+            exit 1
+          fi
+          sleep 1
+        done
 
     - name: Run Rust client tests
       working-directory: ./hindsight-clients/rust
