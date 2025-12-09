@@ -84,7 +84,12 @@ class SentenceTransformersEmbeddings(Embeddings):
             )
 
         logger.info(f"Loading embedding model: {self.model_name}...")
-        self._model = SentenceTransformer(self.model_name)
+        # Disable lazy loading (meta tensors) which causes issues with newer transformers/accelerate
+        # Setting low_cpu_mem_usage=False ensures tensors are fully materialized on load
+        self._model = SentenceTransformer(
+            self.model_name,
+            model_kwargs={"low_cpu_mem_usage": False},
+        )
 
         # Validate dimension matches database schema
         model_dim = self._model.get_sentence_embedding_dimension()
