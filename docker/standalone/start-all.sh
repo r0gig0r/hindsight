@@ -1,9 +1,6 @@
 #!/bin/bash
 set -e
 
-echo "🚀 Starting Hindsight..."
-echo ""
-
 # Service flags (default to true if not set)
 ENABLE_API="${HINDSIGHT_ENABLE_API:-true}"
 ENABLE_CP="${HINDSIGHT_ENABLE_CP:-true}"
@@ -26,32 +23,30 @@ PIDS=()
 # Start API if enabled
 if [ "$ENABLE_API" = "true" ]; then
     cd /app/api
-    hindsight-api 2>&1 | sed 's/^/[api] /' &
+    hindsight-api 2>&1 | sed -u 's/^/[api] /' &
     API_PID=$!
     PIDS+=($API_PID)
 
     # Wait for API to be ready
-    echo "⏳ Waiting for API..."
     for i in {1..60}; do
         if curl -sf http://localhost:8888/health &>/dev/null; then
-            echo "✅ API is ready"
             break
         fi
         sleep 1
     done
 else
-    echo "⏭️  API disabled (HINDSIGHT_ENABLE_API=false)"
+    echo "API disabled (HINDSIGHT_ENABLE_API=false)"
 fi
 
 # Start Control Plane if enabled
 if [ "$ENABLE_CP" = "true" ]; then
     echo "🎛️  Starting Control Plane..."
     cd /app/control-plane
-    PORT=9999 node server.js 2>&1 | grep -v -E "^[[:space:]]*(▲|✓|-|$)" | sed 's/^/[control-plane] /' &
+    PORT=9999 node server.js 2>&1 | grep -v -E "^[[:space:]]*(▲|✓|-|$)" | sed -u 's/^/[control-plane] /' &
     CP_PID=$!
     PIDS+=($CP_PID)
 else
-    echo "⏭️  Control Plane disabled (HINDSIGHT_ENABLE_CP=false)"
+    echo "Control Plane disabled (HINDSIGHT_ENABLE_CP=false)"
 fi
 
 # Print status

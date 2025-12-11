@@ -1,16 +1,16 @@
 <div align="center">
 
-# Hindsight
-
-**Agent Memory that Works Like Human Memory**
-
-[![CI](https://github.com/vectorize-io/hindsight/actions/workflows/test.yml/badge.svg)](https://github.com/vectorize-io/hindsight/actions/workflows/test.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![PyPI - hindsight-client](https://img.shields.io/pypi/v/hindsight-client?label=hindsight-client)](https://pypi.org/project/hindsight-client/)
-[![npm](https://img.shields.io/npm/v/@vectorize-io/hindsight-client)](https://www.npmjs.com/package/@vectorize-io/hindsight-client)
-[![Slack Community](https://img.shields.io/badge/Slack-Join%20Community-4A154B?logo=slack)](https://join.slack.com/t/hindsight-space/shared_invite/zt-3klo21kua-VUCC_zHP5rIcXFB1_5yw6A)
+![Hindsight Banner](./hindsight-docs/static/img/banner.webp)
 
 [Documentation](https://vectorize-io.github.io/hindsight) • [Paper](#coming-soon) • [Examples](https://github.com/vectorize-io/hindsight-cookbook)
+
+[![CI](https://github.com/vectorize-io/hindsight/actions/workflows/release.yml/badge.svg)](https://github.com/vectorize-io/hindsight/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![PyPI - hindsight-api](https://img.shields.io/pypi/v/hindsight-api?label=hindsight-api)](https://pypi.org/project/hindsight-api/)
+[![PyPI - hindsight-client](https://img.shields.io/pypi/v/hindsight-client?label=hindsight-client)](https://pypi.org/project/hindsight-client/)
+[![npm - @vectorize-io/hindsight-client](https://img.shields.io/npm/v/@vectorize-io/hindsight-client)](https://www.npmjs.com/package/@vectorize-io/hindsight-client)
+[![Slack Community](https://img.shields.io/badge/Slack-Join%20Community-4A154B?logo=slack)](https://join.slack.com/t/hindsight-space/shared_invite/zt-3klo21kua-VUCC_zHP5rIcXFB1_5yw6A)
+
 
 </div>
 
@@ -54,12 +54,11 @@ Memories in Hindsight are stored in banks (e.g. memory banks). When memories are
 ```bash
 export OPENAI_API_KEY=your-key
 
-docker run -p 8888:8888 -p 9999:9999 \
-  -e HINDSIGHT_API_LLM_PROVIDER=openai \
+docker run --rm -it --pull always -p 8888:8888 -p 9999:9999 \
   -e HINDSIGHT_API_LLM_API_KEY=$OPENAI_API_KEY \
-  -e HINDSIGHT_API_LLM_MODEL=gpt-4o-mini \
+  -e HINDSIGHT_API_LLM_MODEL=o3-mini \
   -v $HOME/.hindsight-docker:/home/hindsight/.pg0 \
-  ghcr.io/vectorize-io/hindsight
+  ghcr.io/vectorize-io/hindsight:latest
 ```
 
 API: http://localhost:8888  
@@ -68,7 +67,7 @@ UI: http://localhost:9999
 Install client:
 
 ```bash
-pip install hindsight-client
+pip install hindsight-client -U
 # or
 npm install @vectorize-io/hindsight-client
 ```
@@ -76,25 +75,24 @@ npm install @vectorize-io/hindsight-client
 Python example:
 
 ```python
-from hindsight import HindsightClient
+from hindsight_client import Hindsight
 
-client = HindsightClient(base_url="http://localhost:8888")
+client = Hindsight(base_url="http://localhost:8888")
 
-# Store
-client.retain(bank_id="my-agent", content="Alice works at Google as a software engineer")
+# Retain: Store information
+client.retain(bank_id="my-bank", content="Alice works at Google as a software engineer")
 
-# Query
-results = client.recall(bank_id="my-agent", query="What does Alice do?")
+# Recall: Search memories
+client.recall(bank_id="my-bank", query="What does Alice do?")
 
-# Reflect
-response = client.reflect(bank_id="my-agent", query="Tell me about Alice")
-print(response.text)
+# Reflect: Generate disposition-aware response
+client.reflect(bank_id="my-bank", query="Tell me about Alice")
 ```
 
 ### Python (embedded, no Docker)
 
 ```bash
-pip install hindsight-all
+pip install hindsight-all -U
 ```
 
 ```python
@@ -103,27 +101,27 @@ from hindsight import HindsightServer, HindsightClient
 
 with HindsightServer(
     llm_provider="openai",
-    llm_model="gpt-4o-mini", 
+    llm_model="gpt-5-mini", 
     llm_api_key=os.environ["OPENAI_API_KEY"]
 ) as server:
     client = HindsightClient(base_url=server.url)
-    client.retain(bank_id="my-agent", content="Alice works at Google")
-    results = client.recall(bank_id="my-agent", query="Where does Alice work?")
+    client.retain(bank_id="my-bank", content="Alice works at Google")
+    results = client.recall(bank_id="my-bank", query="Where does Alice work?")
 ```
 
-### TypeScript
+### Node.js / TypeScript
 
 ```bash
 npm install @vectorize-io/hindsight-client
 ```
 
-```typescript
-import { HindsightClient } from '@vectorize-io/hindsight-client';
+```javascript
+const { HindsightClient } = require('@vectorize-io/hindsight-client');
 
 const client = new HindsightClient({ baseUrl: 'http://localhost:8888' });
 
-await client.retain('my-agent', 'Alice loves hiking in Yosemite');
-const response = await client.recall('my-agent', 'What does Alice like?');
+await client.retain('my-bank', 'Alice loves hiking in Yosemite');
+await client.recall('my-bank', 'What does Alice like?');
 ```
 
 ---
@@ -171,9 +169,7 @@ client = Hindsight(base_url="http://localhost:8888")
 client.recall(bank_id="my-bank", query="What does Alice do?")
 
 # Temporal
-results = client.recall(bank_id="my-bank", query="What happened in June?")
-
-
+client.recall(bank_id="my-bank", query="What happened in June?")
 ```
 
 Recall performs 4 retrieval strategies in parallel:
@@ -210,29 +206,18 @@ client.reflect(bank_id="my-bank", query="What should I know about Alice?")
 
 ![Retain Operation](hindsight-docs/static/img/reflect-operation.webp)
 
-## Integrations
-
-### Examples
-
-[Examples Repo]([./examples](https://github.com/vectorize-io/hindsight-cookbook)) includes:
-
-- Basic usage
-- Multi-session conversations
-- Temporal queries
-- Entity reasoning
-- Opinion tracking
-- Production setup (Docker Compose + monitoring)
-
 ---
 
 ## Resources
 
-**Documentation:** [vectorize-io.github.io/hindsight](https://vectorize-io.github.io/hindsight)
+**Documentation:** 
+- [https://hindsight.vectorize.io](https://hindsight.vectorize.io)
 
 **Clients:**
 - [Python](http://hindsight.vectorize.io/sdks/python)
 - [Node.js](http://hindsight.vectorize.io/sdks/nodejs)
-- [REST API](http://hindsight.vectorize.io/api-reference)
+- [REST API](https://hindsight.vectorize.io/api-reference)
+- [CLI](https://hindsight.vectorize.io/sdks/cli)
 
 **Community:**
 - [Slack](https://join.slack.com/t/hindsight-space/shared_invite/zt-3klo21kua-VUCC_zHP5rIcXFB1_5yw6A)
