@@ -319,7 +319,7 @@ def extract_code_blocks(file_path: str) -> list[CodeExample]:
     return examples
 
 
-def analyze_example_with_llm(client: OpenAI, example: CodeExample, hindsight_url: str, repo_root: str, cli_available: bool = True) -> dict:
+def analyze_example_with_llm(client: OpenAI, example: CodeExample, hindsight_url: str, repo_root: str, cli_available: bool = True, model: str = "gpt-4o") -> dict:
     """Use LLM to analyze a code example and determine how to test it."""
 
     cli_status = "AVAILABLE" if cli_available else "NOT INSTALLED - mark CLI examples as NOT testable"
@@ -577,7 +577,7 @@ Respond with JSON:
 If not testable, set test_script to null."""
 
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model=model,
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
         temperature=0
@@ -676,13 +676,13 @@ def safe_print(*args, **kwargs):
         sys.stdout.flush()
 
 
-def test_example(openai_client: OpenAI, example: CodeExample, hindsight_url: str, repo_root: str, cli_available: bool = True, debug: bool = False) -> TestResult:
+def test_example(openai_client: OpenAI, example: CodeExample, hindsight_url: str, repo_root: str, cli_available: bool = True, debug: bool = False, model: str = "gpt-4o") -> TestResult:
     """Test a single code example."""
     safe_print(f"  Testing {example.file_path}:{example.line_number} ({example.language})")
 
     try:
         # Analyze with LLM
-        analysis = analyze_example_with_llm(openai_client, example, hindsight_url, repo_root, cli_available)
+        analysis = analyze_example_with_llm(openai_client, example, hindsight_url, repo_root, cli_available, model=model)
 
         if debug and analysis.get("test_script"):
             safe_print(f"    [DEBUG] Generated script:\n{analysis.get('test_script')}")
@@ -816,7 +816,7 @@ def print_report(report: TestReport):
     print("=" * 70)
 
 
-def write_github_summary(report: TestReport, output_path: str, openai_client: OpenAI = None):
+def write_github_summary(report: TestReport, output_path: str, openai_client: OpenAI = None, model: str = "gpt-4o"):
     """Write a GitHub Actions compatible markdown summary."""
     lines = []
 
@@ -836,73 +836,67 @@ def write_github_summary(report: TestReport, output_path: str, openai_client: Op
     lines.append(f"| ⏭️ Skipped | {report.skipped} |")
     lines.append("")
 
-    # If there are failures, use LLM to summarize the raw logs
-    if report.failed > 0 and openai_client:
-        # Collect raw failure logs
-        failure_logs = []
+    # If there are failures, generate the list programmatically (NOT via LLM to avoid hallucinations)
+    if report.failed > 0:
+        # Collect actual failures from results
+        failures_by_file = {}
+        failure_errors = []
         for result in report.results:
             if not result.success and result.error and "SKIPPED" not in result.error:
                 file_path = result.example.file_path
                 if "/hindsight/" in file_path:
                     file_path = file_path.split("/hindsight/", 1)[-1]
-                failure_logs.append(f"""
---- FAILURE ---
-File: {file_path}
-Line: {result.example.line_number}
-Language: {result.example.language}
-Code:
-{result.example.code[:500]}
-Error:
-{result.error[:1000] if result.error else 'Unknown'}
-""")
 
-        # Truncate if too long (keep under ~100k tokens)
-        all_logs = "\n".join(failure_logs)
-        if len(all_logs) > 80000:
-            all_logs = all_logs[:80000] + "\n\n... (truncated)"
+                if file_path not in failures_by_file:
+                    failures_by_file[file_path] = []
 
-        prompt = f"""Analyze these {report.failed} documentation test failures and create a markdown summary.
+                # Extract brief error description
+                error_brief = result.error[:150].replace("\n", " ") if result.error else "Unknown error"
+                failures_by_file[file_path].append({
+                    "line": result.example.line_number,
+                    "language": result.example.language,
+                    "error": error_brief
+                })
+                failure_errors.append(error_brief)
 
-{all_logs}
-
-Create a markdown summary with:
-1. **Failed Tests** - List EVERY failure grouped by file, showing:
-   - File path and line number
-   - Brief description of what went wrong (e.g., "AttributeError: no .success attribute", "command not found: hindsight", "module not found")
-
-2. **Categories** - At the end, group the failures into categories like:
-   - CLI commands don't exist (count)
-   - Wrong attribute names in Python (count)
-   - TypeScript package not found (count)
-   - etc.
-
-Format each failure like:
-### `filename.md`
-- **Line X** (language): brief error description
-
-Output raw markdown directly. Do NOT wrap in code blocks."""
-
-        try:
-            response = openai_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                max_tokens=8000
-            )
-            llm_summary = response.choices[0].message.content
-            lines.append(llm_summary)
-        except Exception as e:
-            # Fallback to simple list
-            lines.append("## Failed Tests")
+        # Generate failure list programmatically
+        lines.append("## Failed Tests")
+        lines.append("")
+        for file_path in sorted(failures_by_file.keys()):
+            lines.append(f"### `{file_path}`")
+            for failure in sorted(failures_by_file[file_path], key=lambda x: x["line"]):
+                lines.append(f"- **Line {failure['line']}** ({failure['language']}): {failure['error']}")
             lines.append("")
-            lines.append(f"*LLM summary failed: {e}*")
-            lines.append("")
-            for result in report.results:
-                if not result.success and result.error and "SKIPPED" not in result.error:
-                    file_path = result.example.file_path
-                    if "/hindsight/" in file_path:
-                        file_path = file_path.split("/hindsight/", 1)[-1]
-                    lines.append(f"- `{file_path}:{result.example.line_number}` ({result.example.language})")
+
+        # Use LLM only to categorize errors (not to list them)
+        if openai_client and failure_errors:
+            error_list = "\n".join(f"- {e}" for e in failure_errors[:100])  # Limit to avoid token overflow
+            prompt = f"""Categorize these {len(failure_errors)} error messages into groups.
+
+Errors:
+{error_list}
+
+Output a markdown section with categories like:
+## Categories
+- **CLI commands don't exist**: X
+- **Wrong attribute names in Python**: X
+- **TypeScript errors**: X
+etc.
+
+Just output the categories section, nothing else. Be brief."""
+
+            try:
+                response = openai_client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    max_tokens=1000
+                )
+                categories = response.choices[0].message.content
+                lines.append(categories)
+            except Exception as e:
+                lines.append(f"## Categories")
+                lines.append(f"*Categorization failed: {e}*")
 
     # Write to file
     with open(output_path, "w") as f:
@@ -948,6 +942,10 @@ def main():
     # Initialize OpenAI client
     client = OpenAI(api_key=openai_api_key)
 
+    # Model configuration - use DOC_TEST_MODEL env var or default to gpt-4o
+    model = os.environ.get("DOC_TEST_MODEL", "gpt-4o")
+    print(f"Using model: {model}")
+
     # Find all markdown files
     md_files = find_markdown_files(repo_root)
     print(f"\nFound {len(md_files)} markdown files")
@@ -972,7 +970,7 @@ def main():
     def run_test(args):
         idx, example = args
         safe_print(f"\n[{idx}/{len(all_examples)}] Testing example...")
-        return test_example(client, example, hindsight_url, repo_root, cli_available=cli_available, debug=debug)
+        return test_example(client, example, hindsight_url, repo_root, cli_available=cli_available, debug=debug, model=model)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks
@@ -991,7 +989,7 @@ def main():
 
     # Write summary to file for CI (pass OpenAI client for LLM-powered summary)
     summary_path = "/tmp/doc-test-summary.md"
-    write_github_summary(report, summary_path, openai_client=client)
+    write_github_summary(report, summary_path, openai_client=client, model=model)
     print(f"Summary written to {summary_path}")
 
     # Exit with appropriate code

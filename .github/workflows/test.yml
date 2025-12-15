@@ -483,6 +483,8 @@ jobs:
       HINDSIGHT_API_URL: http://localhost:8888
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Model for test generation and analysis (options: gpt-4o, o3-mini, o1, etc.)
+      DOC_TEST_MODEL: o3-mini
       # Prefer CPU-only PyTorch in CI (but keep PyPI for everything else)
       UV_INDEX: pytorch=https://download.pytorch.org/whl/cpu
 
