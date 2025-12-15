@@ -320,14 +320,14 @@ async def reflect(
         disposition = DispositionTraits(skepticism=3, literalism=3, empathy=3)
 
     # Convert string lists to MemoryFact format for formatting
-    def to_memory_facts(facts: List[str]) -> List[MemoryFact]:
+    def to_memory_facts(facts: List[str], fact_type: str) -> List[MemoryFact]:
         if not facts:
             return []
-        return [MemoryFact(text=f, fact_type="world", score=1.0) for f in facts]
+        return [MemoryFact(id=f"test-{i}", text=f, fact_type=fact_type) for i, f in enumerate(facts)]
 
-    agent_results = to_memory_facts(experience_facts or [])
-    world_results = to_memory_facts(world_facts or [])
-    opinion_results = to_memory_facts(opinion_facts or [])
+    agent_results = to_memory_facts(experience_facts or [], "experience")
+    world_results = to_memory_facts(world_facts or [], "world")
+    opinion_results = to_memory_facts(opinion_facts or [], "opinion")
 
     # Format facts for prompt
     agent_facts_text = format_facts_for_prompt(agent_results)
