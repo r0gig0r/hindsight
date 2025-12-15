@@ -33,6 +33,156 @@ from openai import OpenAI
 print_lock = threading.Lock()
 
 
+def discover_and_install_dependencies(repo_root: str) -> dict:
+    """Scan documentation for dependencies and install them."""
+    print("\n=== Discovering and installing dependencies ===")
+
+    results = {
+        "python_packages": set(),
+        "npm_packages": set(),
+        "local_packages": [],
+        "cli_available": False
+    }
+
+    # Find all markdown files
+    md_files = []
+    for pattern in ["**/*.md"]:
+        md_files.extend(glob.glob(os.path.join(repo_root, pattern), recursive=True))
+
+    # Patterns to find installation commands
+    pip_pattern = re.compile(r'pip install\s+([^\s`\n]+)')
+    npm_pattern = re.compile(r'npm install\s+([^\s`\n]+)')
+
+    for md_file in md_files:
+        # Skip symlinks to avoid circular references
+        if os.path.islink(md_file):
+            continue
+        try:
+            with open(md_file, 'r') as f:
+                content = f.read()
+
+            # Find pip install commands
+            for match in pip_pattern.finditer(content):
+                pkg = match.group(1).strip()
+                if pkg and not pkg.startswith('-') and not pkg.startswith('.'):
+                    results["python_packages"].add(pkg)
+
+            # Find npm install commands
+            for match in npm_pattern.finditer(content):
+                pkg = match.group(1).strip()
+                if pkg and not pkg.startswith('-') and not pkg.startswith('.'):
+                    results["npm_packages"].add(pkg)
+        except Exception:
+            pass
+
+    # Always include core local packages
+    local_python_packages = [
+        ("hindsight-clients/python", "hindsight_client"),
+        ("hindsight-integrations/litellm", "hindsight_litellm"),
+        ("hindsight-integrations/openai", "hindsight_openai"),
+    ]
+
+    # Install local Python packages
+    print("\nInstalling local Python packages...")
+    for pkg_path, pkg_name in local_python_packages:
+        full_path = os.path.join(repo_root, pkg_path)
+        if os.path.exists(full_path):
+            try:
+                subprocess.run(
+                    ["uv", "pip", "install", "-e", full_path],
+                    capture_output=True,
+                    timeout=120
+                )
+                print(f"  Installed {pkg_name}")
+                results["local_packages"].append(pkg_name)
+            except Exception as e:
+                print(f"  Failed to install {pkg_name}: {e}")
+
+    # Install discovered Python packages (filter out local ones and known problematic ones)
+    skip_packages = {"hindsight-client", "hindsight_client", "hindsight-litellm", "hindsight-openai",
+                     "hindsight", ".", "..", "-e", "-r", "--upgrade"}
+    external_packages = results["python_packages"] - skip_packages
+
+    if external_packages:
+        print(f"\nInstalling external Python packages: {external_packages}")
+        for pkg in external_packages:
+            try:
+                subprocess.run(
+                    ["uv", "pip", "install", pkg],
+                    capture_output=True,
+                    timeout=60
+                )
+            except Exception:
+                pass
+
+    # Build TypeScript client and set up symlink
+    ts_client_path = os.path.join(repo_root, "hindsight-clients/typescript")
+    if os.path.exists(ts_client_path):
+        print("\nBuilding TypeScript client...")
+        try:
+            # Install npm dependencies
+            subprocess.run(["npm", "ci"], cwd=ts_client_path, capture_output=True, timeout=120)
+            # Build
+            subprocess.run(["npm", "run", "build"], cwd=ts_client_path, capture_output=True, timeout=60)
+            # Create symlink in /tmp for ESM module resolution
+            os.makedirs("/tmp/node_modules/@vectorize-io", exist_ok=True)
+            symlink_path = "/tmp/node_modules/@vectorize-io/hindsight-client"
+            if os.path.islink(symlink_path):
+                os.unlink(symlink_path)
+            os.symlink(ts_client_path, symlink_path)
+            print("  TypeScript client built and symlinked")
+        except Exception as e:
+            print(f"  Failed to build TypeScript client: {e}")
+
+    # Try to build hindsight CLI if Rust is available
+    cli_path = os.path.join(repo_root, "hindsight-cli")
+    if os.path.exists(cli_path):
+        print("\nChecking for Rust toolchain...")
+        try:
+            cargo_result = subprocess.run(["cargo", "--version"], capture_output=True, timeout=5)
+            if cargo_result.returncode == 0:
+                print("  Rust found, building hindsight CLI...")
+                build_result = subprocess.run(
+                    ["cargo", "build", "--release"],
+                    cwd=cli_path,
+                    capture_output=True,
+                    timeout=300
+                )
+                if build_result.returncode == 0:
+                    # Try to install to PATH
+                    cli_binary = os.path.join(cli_path, "target/release/hindsight")
+                    if os.path.exists(cli_binary):
+                        # Copy to /usr/local/bin or ~/.local/bin
+                        local_bin = os.path.expanduser("~/.local/bin")
+                        os.makedirs(local_bin, exist_ok=True)
+                        import shutil
+                        shutil.copy2(cli_binary, os.path.join(local_bin, "hindsight"))
+                        os.environ["PATH"] = f"{local_bin}:{os.environ.get('PATH', '')}"
+                        results["cli_available"] = True
+                        print("  CLI built and installed")
+                else:
+                    print(f"  CLI build failed")
+            else:
+                print("  Rust not available, skipping CLI build")
+        except FileNotFoundError:
+            print("  Rust not installed, skipping CLI build")
+        except Exception as e:
+            print(f"  CLI build error: {e}")
+
+    # Check if CLI is available (might be pre-installed)
+    if not results["cli_available"]:
+        try:
+            result = subprocess.run(["hindsight", "--version"], capture_output=True, timeout=5)
+            results["cli_available"] = result.returncode == 0
+            if results["cli_available"]:
+                print("  CLI already available in PATH")
+        except Exception:
+            pass
+
+    print("\n=== Dependency installation complete ===\n")
+    return results
+
+
 @dataclass
 class CodeExample:
     """Represents a code example extracted from documentation."""
@@ -94,6 +244,16 @@ def find_markdown_files(repo_root: str) -> list[str]:
     ]
     for pattern in ["*.md", "**/*.md"]:
         for f in glob.glob(os.path.join(repo_root, pattern), recursive=True):
+            # Skip symlinks to avoid circular references
+            if os.path.islink(f):
+                continue
+            # Check if any parent directory is a symlink (circular reference protection)
+            try:
+                real_path = os.path.realpath(f)
+                if not real_path.startswith(os.path.realpath(repo_root)):
+                    continue
+            except Exception:
+                continue
             if any(skip in f for skip in skip_patterns):
                 continue
             md_files.append(f)
@@ -134,8 +294,10 @@ def extract_code_blocks(file_path: str) -> list[CodeExample]:
     return examples
 
 
-def analyze_example_with_llm(client: OpenAI, example: CodeExample, hindsight_url: str, repo_root: str) -> dict:
+def analyze_example_with_llm(client: OpenAI, example: CodeExample, hindsight_url: str, repo_root: str, cli_available: bool = True) -> dict:
     """Use LLM to analyze a code example and determine how to test it."""
+
+    cli_status = "AVAILABLE" if cli_available else "NOT INSTALLED - mark CLI examples as NOT testable"
 
     prompt = f"""Analyze this code example from documentation and determine how to test it.
 
@@ -143,6 +305,7 @@ File: {example.file_path}
 Language: {example.language}
 Line: {example.line_number}
 Repository root: {repo_root}
+Hindsight CLI status: {cli_status}
 
 Context around the code:
 {example.context}
@@ -273,7 +436,7 @@ await fetch(`{hindsight_url}/v1/default/banks/${{bankId}}`, {{ method: 'DELETE' 
 
 BASH/CLI RULES:
 - The CLI command is 'hindsight'
-- Make sure the hindsight CLI is available before testing CLI examples
+- Check the "Hindsight CLI status" above - if it says "NOT INSTALLED", mark ALL examples that use the 'hindsight' CLI command as NOT testable (reason: "CLI not installed")
 - Mark 'cargo build' and 'cargo test' as NOT testable (reason: "Build command - too slow for CI")
 
 Respond with JSON:
@@ -387,13 +550,13 @@ def safe_print(*args, **kwargs):
         sys.stdout.flush()
 
 
-def test_example(openai_client: OpenAI, example: CodeExample, hindsight_url: str, repo_root: str, debug: bool = False) -> TestResult:
+def test_example(openai_client: OpenAI, example: CodeExample, hindsight_url: str, repo_root: str, cli_available: bool = True, debug: bool = False) -> TestResult:
     """Test a single code example."""
     safe_print(f"  Testing {example.file_path}:{example.line_number} ({example.language})")
 
     try:
         # Analyze with LLM
-        analysis = analyze_example_with_llm(openai_client, example, hindsight_url, repo_root)
+        analysis = analyze_example_with_llm(openai_client, example, hindsight_url, repo_root, cli_available)
 
         if debug and analysis.get("test_script"):
             safe_print(f"    [DEBUG] Generated script:\n{analysis.get('test_script')}")
@@ -632,6 +795,18 @@ def main():
 
     hindsight_url = os.environ.get("HINDSIGHT_API_URL", "http://localhost:8888")
 
+    # Find repo root (handle both script execution and exec())
+    if '__file__' in globals():
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    else:
+        # Fallback: use current directory or REPO_ROOT env var
+        repo_root = os.environ.get("REPO_ROOT", os.getcwd())
+    print(f"Repository root: {repo_root}")
+
+    # Discover and install dependencies
+    dep_results = discover_and_install_dependencies(repo_root)
+    cli_available = dep_results["cli_available"]
+
     # Check if Hindsight is running
     try:
         import urllib.request
@@ -641,16 +816,11 @@ def main():
         print(f"WARNING: Could not connect to Hindsight at {hindsight_url}: {e}")
         print("Some tests may fail if they require a running server")
 
+    if not cli_available:
+        print("WARNING: hindsight CLI not available - CLI examples will be skipped")
+
     # Initialize OpenAI client
     client = OpenAI(api_key=openai_api_key)
-
-    # Find repo root (handle both script execution and exec())
-    if '__file__' in globals():
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    else:
-        # Fallback: use current directory or REPO_ROOT env var
-        repo_root = os.environ.get("REPO_ROOT", os.getcwd())
-    print(f"Repository root: {repo_root}")
 
     # Find all markdown files
     md_files = find_markdown_files(repo_root)
@@ -676,7 +846,7 @@ def main():
     def run_test(args):
         idx, example = args
         safe_print(f"\n[{idx}/{len(all_examples)}] Testing example...")
-        return test_example(client, example, hindsight_url, repo_root, debug=debug)
+        return test_example(client, example, hindsight_url, repo_root, cli_available=cli_available, debug=debug)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks
