@@ -3,7 +3,7 @@
 > Agent Memory that Works Like Human Memory
 
 This file contains the complete Hindsight documentation for LLM consumption.
-Generated: 2025-12-16T11:21:49.491Z
+Generated: 2025-12-16T12:07:57.097982+00:00
 
 ---
 
@@ -143,36 +143,8 @@ Get up and running with Hindsight in 60 seconds.
 
 ## Start the API Server
 
-<Tabs>
-<TabItem value="pip" label="pip (API only)">
 
-```bash
-pip install hindsight-api
-export OPENAI_API_KEY=sk-xxx
-export HINDSIGHT_API_LLM_API_KEY=$OPENAI_API_KEY
 
-hindsight-api
-```
-
-API available at [http://localhost:8888](http://localhost:8888/docs)
-
-</TabItem>
-<TabItem value="docker" label="Docker (Full Experience)">
-
-```bash
-
-export OPENAI_API_KEY=sk-xxx
-
-docker run --rm -it --pull always -p 8888:8888 -p 9999:9999 \
-  -e HINDSIGHT_API_LLM_API_KEY=$OPENAI_API_KEY \
-  -v $HOME/.hindsight-docker:/home/hindsight/.pg0 \
-  ghcr.io/vectorize-io/hindsight:latest
-```
-
-- **API**: http://localhost:8888
-- **Control Plane** (Web UI): http://localhost:9999
-
-</TabItem>
 </Tabs>
 
 :::tip LLM Provider
@@ -184,69 +156,9 @@ See [LLM Providers](/developer/models#llm) for more details.
 
 ## Use the Client
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```bash
-pip install hindsight-client
-```
 
-```python
-from hindsight_client import Hindsight
 
-client = Hindsight(base_url="http://localhost:8888")
-
-# Retain: Store information
-client.retain(bank_id="my-bank", content="Alice works at Google as a software engineer")
-
-# Recall: Search memories
-client.recall(bank_id="my-bank", query="What does Alice do?")
-
-# Reflect: Generate disposition-aware response
-client.reflect(bank_id="my-bank", query="Tell me about Alice")
-```
-
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```bash
-npm install @vectorize-io/hindsight-client
-```
-
-```javascript
-const { HindsightClient } = require('@vectorize-io/hindsight-client');
-
-const client = new HindsightClient({ baseUrl: 'http://localhost:8888' });
-
-// Retain: Store information
-await client.retain('my-bank', 'Alice works at Google as a software engineer');
-
-// Recall: Search memories
-await client.recall('my-bank', 'What does Alice do?');
-
-// Reflect: Generate response
-await client.reflect('my-bank', 'Tell me about Alice');
-```
-
-</TabItem>
-<TabItem value="cli" label="CLI">
-
-```bash
-curl -fsSL https://hindsight.vectorize.io/get-cli | bash
-```
-
-```bash
-# Retain: Store information
-hindsight memory retain my-bank "Alice works at Google as a software engineer"
-
-# Recall: Search memories
-hindsight memory recall my-bank "What does Alice do?"
-
-# Reflect: Generate response
-hindsight memory reflect my-bank "Tell me about Alice"
-```
-
-</TabItem>
 </Tabs>
 
 ---
@@ -290,89 +202,9 @@ Make sure you've [installed Hindsight](../installation) and completed the [Quick
 
 Store conversations, documents, and facts into a memory bank.
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-# Store a single fact
-client.retain(
-    bank_id="my-bank",
-    content="Alice joined Google in March 2024 as a Senior ML Engineer"
-)
 
-# Store a conversation
-conversation = """
-User: What did you work on today?
-Assistant: I reviewed the new ML pipeline architecture.
-User: How did it look?
-Assistant: Promising, but needs better error handling.
-"""
 
-client.retain(
-    bank_id="my-bank",
-    content=conversation,
-    context="Daily standup conversation"
-)
-
-# Batch retain multiple items
-client.retain_batch(
-    bank_id="my-bank",
-    contents=[
-        {"content": "Bob prefers Python for data science"},
-        {"content": "Alice recommends using pytest for testing"},
-        {"content": "The team uses GitHub for code reviews"}
-    ]
-)
-```
-
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```javascript
-// Store a single fact
-await client.retain({
-    bankId: 'my-bank',
-    content: 'Alice joined Google in March 2024 as a Senior ML Engineer'
-});
-
-// Store a conversation
-await client.retain({
-    bankId: 'my-bank',
-    content: `
-User: What did you work on today?
-Assistant: I reviewed the new ML pipeline architecture.
-User: How did it look?
-Assistant: Promising, but needs better error handling.
-    `,
-    context: 'Daily standup conversation'
-});
-
-// Batch retain
-await client.retainBatch({
-    bankId: 'my-bank',
-    contents: [
-        { content: 'Bob prefers Python for data science' },
-        { content: 'Alice recommends using pytest for testing' },
-        { content: 'The team uses GitHub for code reviews' }
-    ]
-});
-```
-
-</TabItem>
-<TabItem value="cli" label="CLI">
-
-```bash
-# Store a single fact
-hindsight retain my-bank "Alice joined Google in March 2024 as a Senior ML Engineer"
-
-# Store from a file
-hindsight retain my-bank --file conversation.txt --context "Daily standup"
-
-# Store multiple files
-hindsight retain my-bank --files docs/*.md
-```
-
-</TabItem>
 </Tabs>
 
 **What happens:** Content is processed by an LLM to extract rich facts, identify entities, and build connections in a knowledge graph.
@@ -385,92 +217,9 @@ hindsight retain my-bank --files docs/*.md
 
 Search for relevant memories using multi-strategy retrieval.
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-# Basic search
-results = client.recall(
-    bank_id="my-bank",
-    query="What does Alice do at Google?"
-)
 
-for result in results:
-    print(f"[{result['weight']:.2f}] {result['text']}")
 
-# Search with options
-results = client.recall(
-    bank_id="my-bank",
-    query="What happened last spring?",
-    budget="high",  # More thorough graph traversal
-    max_tokens=8192,  # Return more context
-    fact_type="world"  # Only world facts
-)
-
-# Include entity information
-results = client.recall(
-    bank_id="my-bank",
-    query="Tell me about Alice",
-    include_entities=True,
-    max_entity_tokens=500
-)
-
-# Check entity details
-for entity in results["entities"]:
-    print(f"Entity: {entity['name']}")
-    print(f"Observations: {entity['observations']}")
-```
-
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```javascript
-// Basic search
-const results = await client.recall({
-    bankId: 'my-bank',
-    query: 'What does Alice do at Google?'
-});
-
-results.forEach(r => {
-    console.log(`[${r.weight.toFixed(2)}] ${r.text}`);
-});
-
-// Search with options
-const detailedResults = await client.recall({
-    bankId: 'my-bank',
-    query: 'What happened last spring?',
-    budget: 'high',
-    maxTokens: 8192,
-    factType: 'world'
-});
-
-// Include entity information
-const withEntities = await client.recall({
-    bankId: 'my-bank',
-    query: 'Tell me about Alice',
-    includeEntities: true,
-    maxEntityTokens: 500
-});
-```
-
-</TabItem>
-<TabItem value="cli" label="CLI">
-
-```bash
-# Basic search
-hindsight recall my-bank "What does Alice do at Google?"
-
-# Search with options
-hindsight recall my-bank "What happened last spring?" \
-    --budget high \
-    --max-tokens 8192 \
-    --fact-type world
-
-# Verbose output (shows weights and sources)
-hindsight recall my-bank "Tell me about Alice" -v
-```
-
-</TabItem>
 </Tabs>
 
 **What happens:** Four search strategies (semantic, keyword, graph, temporal) run in parallel, results are fused and reranked.
@@ -483,82 +232,9 @@ hindsight recall my-bank "Tell me about Alice" -v
 
 Generate disposition-aware responses that form opinions based on evidence.
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-# Basic reflect
-response = client.reflect(
-    bank_id="my-bank",
-    query="Should we adopt TypeScript for our backend?"
-)
 
-print(response["text"])
-print("\nBased on:", len(response["based_on"]["world"]), "facts")
-print("New opinions:", len(response["new_opinions"]))
 
-# Reflect with options
-response = client.reflect(
-    bank_id="my-bank",
-    query="What are Alice's strengths for the team lead role?",
-    budget="high",  # More thorough reasoning
-    include_entities=True
-)
-
-# Access formed opinions
-for opinion in response["new_opinions"]:
-    print(f"Opinion: {opinion['text']}")
-    print(f"Confidence: {opinion['confidence']}")
-
-# See which facts influenced the response
-for fact in response["based_on"]["world"]:
-    print(f"[{fact['weight']:.2f}] {fact['text']}")
-```
-
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```javascript
-// Basic reflect
-const response = await client.reflect({
-    bankId: 'my-bank',
-    query: 'Should we adopt TypeScript for our backend?'
-});
-
-console.log(response.text);
-console.log(`\nBased on: ${response.basedOn.world.length} facts`);
-console.log(`New opinions: ${response.newOpinions.length}`);
-
-// Reflect with options
-const detailed = await client.reflect({
-    bankId: 'my-bank',
-    query: "What are Alice's strengths for the team lead role?",
-    budget: 'high',
-    includeEntities: true
-});
-
-// Access formed opinions
-detailed.newOpinions.forEach(op => {
-    console.log(`Opinion: ${op.text}`);
-    console.log(`Confidence: ${op.confidence}`);
-});
-```
-
-</TabItem>
-<TabItem value="cli" label="CLI">
-
-```bash
-# Basic reflect
-hindsight reflect my-bank "Should we adopt TypeScript for our backend?"
-
-# Verbose output (shows sources and opinions)
-hindsight reflect my-bank "What are Alice's strengths for the team lead role?" -v
-
-# With higher reasoning budget
-hindsight reflect my-bank "Analyze our tech stack" --budget high
-```
-
-</TabItem>
 </Tabs>
 
 **What happens:** Memories are recalled, bank disposition is loaded, LLM reasons through evidence, new opinions are formed and stored.
@@ -1230,39 +906,9 @@ Make sure you've completed the [Quick Start](./quickstart) to install the client
 
 ## Store a Single Memory
 
-<Tabs>
-<TabItem value="python" label="Python">
-
-```python
-from hindsight_client import Hindsight
-
-client = Hindsight(base_url="http://localhost:8888")
-
-client.retain(
-    bank_id="my-bank",
-    content="Alice works at Google as a software engineer"
-)
-```
-
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```typescript
 
 
-const client = new HindsightClient({ baseUrl: 'http://localhost:8888' });
 
-await client.retain('my-bank', 'Alice works at Google as a software engineer');
-```
-
-</TabItem>
-<TabItem value="cli" label="CLI">
-
-```bash
-hindsight memory put my-bank "Alice works at Google as a software engineer"
-```
-
-</TabItem>
 </Tabs>
 
 ## The Importance of Context
@@ -1278,38 +924,9 @@ The `context` parameter is crucial for guiding how Hindsight extracts memories f
 
 Always provide context and event dates for optimal memory extraction:
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-client.retain(
-    bank_id="my-bank",
-    content="Alice got promoted to senior engineer",
-    context="career update",
-    timestamp="2024-03-15T10:00:00Z"
-)
-```
 
-</TabItem>
-<TabItem value="node" label="Node.js">
 
-```typescript
-await client.retain('my-bank', 'Alice got promoted to senior engineer', {
-    context: 'career update',
-    timestamp: '2024-03-15T10:00:00Z'
-});
-```
-
-</TabItem>
-<TabItem value="cli" label="CLI">
-
-```bash
-hindsight memory put my-bank "Alice got promoted" \
-    --context "career update" \
-    --event-date "2024-03-15"
-```
-
-</TabItem>
 </Tabs>
 
 The `timestamp` defaults to the current time if not specified. Providing explicit timestamps enables temporal queries like "What happened last spring?"
@@ -1318,54 +935,15 @@ The `timestamp` defaults to the current time if not specified. Providing explici
 
 Store multiple items in a single request. **Batch ingestion is the recommended approach** as it significantly improves performance by reducing network overhead and allowing Hindsight to optimize the memory extraction process across related content.
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-client.retain_batch(
-    bank_id="my-bank",
-    items=[
-        {"content": "Alice works at Google", "context": "career"},
-        {"content": "Bob is a data scientist at Meta", "context": "career"},
-        {"content": "Alice and Bob are friends", "context": "relationship"}
-    ],
-    document_id="conversation_001"
-)
-```
 
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```typescript
-await client.retainBatch('my-bank', [
-    { content: 'Alice works at Google', context: 'career' },
-    { content: 'Bob is a data scientist at Meta', context: 'career' },
-    { content: 'Alice and Bob are friends', context: 'relationship' }
-], { documentId: 'conversation_001' });
-```
-
-</TabItem>
 </Tabs>
 
 The `document_id` groups related memories for later management.
 
 ## Store from Files
 
-<Tabs>
-<TabItem value="cli" label="CLI">
 
-```bash
-# Single file
-hindsight memory put-files my-bank document.txt
-
-# Multiple files
-hindsight memory put-files my-bank doc1.txt doc2.md notes.txt
-
-# With document ID
-hindsight memory put-files my-bank report.pdf --document-id "q4-report"
-```
-
-</TabItem>
 </Tabs>
 
 
@@ -1373,36 +951,8 @@ hindsight memory put-files my-bank report.pdf --document-id "q4-report"
 
 For large batches, use async ingestion to avoid blocking:
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-# Start async ingestion (returns immediately)
-result = client.retain_batch(
-    bank_id="my-bank",
-    items=[...large batch...],
-    document_id="large-doc",
-    retain_async=True
-)
 
-# Check if it was processed asynchronously
-print(result.var_async)  # True
-```
-
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```typescript
-// Start async ingestion (returns immediately)
-const result = await client.retainBatch('my-bank', largeItems, {
-    documentId: 'large-doc',
-    async: true
-});
-
-console.log(result.async);  // true
-```
-
-</TabItem>
 </Tabs>
 
 
@@ -1429,41 +979,9 @@ Make sure you've completed the [Quick Start](./quickstart) to install the client
 
 ## Basic Recall
 
-<Tabs>
-<TabItem value="python" label="Python">
-
-```python
-from hindsight_client import Hindsight
-
-client = Hindsight(base_url="http://localhost:8888")
-
-response = client.recall(bank_id="my-bank", query="What does Alice do?")
-for r in response.results:
-    print(f"{r.text} (score: {r.weight:.2f})")
-```
-
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```typescript
 
 
-const client = new HindsightClient({ baseUrl: 'http://localhost:8888' });
 
-const response = await client.recall('my-bank', 'What does Alice do?');
-for (const r of response.results) {
-    console.log(`${r.text} (score: ${r.weight})`);
-}
-```
-
-</TabItem>
-<TabItem value="cli" label="CLI">
-
-```bash
-hindsight recall my-bank "What does Alice do?"
-```
-
-</TabItem>
 </Tabs>
 
 ## Recall Parameters
@@ -1478,97 +996,16 @@ hindsight recall my-bank "What does Alice do?"
 | `include_entities` | bool | false | Include entity observations |
 | `max_entity_tokens` | int | 500 | Token budget for entity observations |
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-response = client.recall(
-    bank_id="my-bank",
-    query="What does Alice do?",
-    types=["world", "experience"],
-    budget="high",
-    max_tokens=8000,
-    trace=True,
-    include_entities=True,
-    max_entity_tokens=500
-)
 
-# Access results
-for r in response.results:
-    print(f"{r.text} (score: {r.weight:.2f})")
-
-# Access entity observations (if include_entities=True)
-if response.entities:
-    for entity in response.entities:
-        print(f"Entity: {entity.name}")
-```
-
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```typescript
-const response = await client.recall('my-bank', 'What does Alice do?', {
-    types: ['world', 'experience'],
-    budget: 'high',
-    maxTokens: 8000,
-    trace: true
-});
-
-// Access results
-for (const r of response.results) {
-    console.log(`${r.text} (score: ${r.weight})`);
-}
-```
-
-</TabItem>
 </Tabs>
 
 ## Filter by Fact Type
 
 Recall specific memory types:
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-# Only world facts (objective information)
-world_facts = client.recall(
-    bank_id="my-bank",
-    query="Where does Alice work?",
-    types=["world"]
-)
 
-# Only experience (conversations and events)
-experience = client.recall(
-    bank_id="my-bank",
-    query="What have I recommended?",
-    types=["experience"]
-)
-
-# Only opinions (formed beliefs)
-opinions = client.recall(
-    bank_id="my-bank",
-    query="What do I think about Python?",
-    types=["opinion"]
-)
-
-# World facts and experience (exclude opinions)
-facts = client.recall(
-    bank_id="my-bank",
-    query="What happened?",
-    types=["world", "experience"]
-)
-```
-
-</TabItem>
-<TabItem value="cli" label="CLI">
-
-```bash
-hindsight recall my-bank "Python" --fact-type opinion
-hindsight recall my-bank "Alice" --fact-type world,experience
-```
-
-</TabItem>
 </Tabs>
 
 :::warning About Opinions
@@ -1626,29 +1063,8 @@ The `budget` parameter controls graph traversal depth:
 - **"mid"**: Balanced — default for most queries
 - **"high"**: Deep exploration — finds indirect connections
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-# Quick lookup
-results = client.recall(bank_id="my-bank", query="Alice's email", budget="low")
 
-# Deep exploration
-results = client.recall(bank_id="my-bank", query="How are Alice and Bob connected?", budget="high")
-```
-
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```typescript
-// Quick lookup
-const results = await client.recall('my-bank', "Alice's email", { budget: 'low' });
-
-// Deep exploration
-const deep = await client.recall('my-bank', 'How are Alice and Bob connected?', { budget: 'high' });
-```
-
-</TabItem>
 </Tabs>
 
 
@@ -1682,36 +1098,9 @@ Make sure you've completed the [Quick Start](./quickstart) to install the client
 
 ## Basic Usage
 
-<Tabs>
-<TabItem value="python" label="Python">
-
-```python
-from hindsight_client import Hindsight
-
-client = Hindsight(base_url="http://localhost:8888")
-
-client.reflect(bank_id="my-bank", query="What should I know about Alice?")
-```
-
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```typescript
 
 
-const client = new HindsightClient({ baseUrl: 'http://localhost:8888' });
 
-await client.reflect('my-bank', 'What should I know about Alice?');
-```
-
-</TabItem>
-<TabItem value="cli" label="CLI">
-
-```bash
-hindsight memory think my-bank "What should I know about Alice?"
-```
-
-</TabItem>
 </Tabs>
 
 ## Parameters
@@ -1722,29 +1111,8 @@ hindsight memory think my-bank "What should I know about Alice?"
 | `budget` | string | "low" | Budget level: "low", "mid", "high" |
 | `context` | string | None | Additional context for the query |
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-response = client.reflect(
-    bank_id="my-bank",
-    query="What do you think about remote work?",
-    budget="mid",
-    context="We're considering a hybrid work policy"
-)
-```
 
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```typescript
-const response = await client.reflect('my-bank', 'What do you think about remote work?', {
-    budget: 'mid',
-    context: "We're considering a hybrid work policy"
-});
-```
-
-</TabItem>
 </Tabs>
 
 ## The Role of Context
@@ -1756,29 +1124,8 @@ The `context` parameter steers how the reflection is performed without impacting
 - **Disambiguates intent**: Clarifies what aspect of the query matters most
 - **Does not affect recall**: The same memories are retrieved regardless of context
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-# Context is passed to the LLM to help it understand the situation
-response = client.reflect(
-    bank_id="my-bank",
-    query="What do you think about the proposal?",
-    context="We're in a budget review meeting discussing Q4 spending"
-)
-```
 
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```typescript
-// Context helps the LLM understand the current situation
-const response = await client.reflect('my-bank', 'What do you think about the proposal?', {
-    context: "We're in a budget review meeting discussing Q4 spending"
-});
-```
-
-</TabItem>
 </Tabs>
 
 ## Opinion Formation
@@ -1802,80 +1149,16 @@ The bank's disposition affects reflect responses:
 | **Literalism** | Flexible interpretation | Exact, literal interpretation |
 | **Empathy** | Detached, fact-focused | Considers emotional context |
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-# Create a bank with specific disposition
-client.create_bank(
-    bank_id="cautious-advisor",
-    background="I am a risk-aware financial advisor",
-    disposition={
-        "skepticism": 5,   # Very skeptical of claims
-        "literalism": 4,   # Focuses on exact requirements
-        "empathy": 2       # Prioritizes facts over feelings
-    }
-)
 
-# Reflect responses will reflect this disposition
-response = client.reflect(
-    bank_id="cautious-advisor",
-    query="Should I invest in crypto?"
-)
-# Response will likely emphasize risks and caution
-```
-
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```typescript
-// Create a bank with specific disposition
-await client.createBank('cautious-advisor', {
-    background: 'I am a risk-aware financial advisor',
-    disposition: {
-        skepticism: 5,
-        literalism: 4,
-        empathy: 2
-    }
-});
-
-// Reflect responses will reflect this disposition
-const response = await client.reflect('cautious-advisor', 'Should I invest in crypto?');
-```
-
-</TabItem>
 </Tabs>
 
 ## Using Sources
 
 The `based_on` field shows which memories informed the response:
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-response = client.reflect(bank_id="my-bank", query="Tell me about Alice")
 
-print("Response:", response.text)
-print("\nBased on:")
-for fact in response.based_on or []:
-    print(f"  - [{fact.type}] {fact.text}")
-```
-
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```typescript
-const response = await client.reflect('my-bank', 'Tell me about Alice');
-
-console.log('Response:', response.text);
-console.log('\nBased on:');
-for (const fact of response.based_on || []) {
-    console.log(`  - [${fact.type}] ${fact.text}`);
-}
-```
-
-</TabItem>
 </Tabs>
 
 This enables:
@@ -1915,60 +1198,9 @@ Make sure you've completed the [Quick Start](./quickstart) to install the client
 
 ## Creating a Memory Bank
 
-<Tabs>
-<TabItem value="python" label="Python">
-
-```python
-from hindsight_client import Hindsight
-
-client = Hindsight(base_url="http://localhost:8888")
-
-client.create_bank(
-    bank_id="my-bank",
-    name="Research Assistant",
-    background="I am a research assistant specializing in machine learning",
-    disposition={
-        "skepticism": 4,
-        "literalism": 3,
-        "empathy": 3
-    }
-)
-```
-
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```typescript
 
 
-const client = new HindsightClient({ baseUrl: 'http://localhost:8888' });
 
-await client.createBank('my-bank', {
-    name: 'Research Assistant',
-    background: 'I am a research assistant specializing in machine learning',
-    disposition: {
-        skepticism: 4,
-        literalism: 3,
-        empathy: 3
-    }
-});
-```
-
-</TabItem>
-<TabItem value="cli" label="CLI">
-
-```bash
-# Set background
-hindsight bank background my-bank "I am a research assistant specializing in ML"
-
-# Set disposition
-hindsight bank disposition my-bank \
-    --skepticism 4 \
-    --literalism 3 \
-    --empathy 3
-```
-
-</TabItem>
 </Tabs>
 
 ## Background and Disposition
@@ -1983,30 +1215,8 @@ Background and disposition only affect the `reflect` operation (opinion formatio
 
 The background is a first-person narrative providing context for opinion formation:
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-client.create_bank(
-    bank_id="financial-advisor",
-    background="""I am a conservative financial advisor with 20 years of experience.
-    I prioritize capital preservation over aggressive growth.
-    I have seen multiple market crashes and believe in diversification."""
-)
-```
 
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```typescript
-await client.createBank('financial-advisor', {
-    background: `I am a conservative financial advisor with 20 years of experience.
-    I prioritize capital preservation over aggressive growth.
-    I have seen multiple market crashes and believe in diversification.`
-});
-```
-
-</TabItem>
 </Tabs>
 
 ### Disposition Traits
@@ -2176,183 +1386,27 @@ Use `include_chunks=True` in your recall calls to get the original text chunks a
 
 Associate retained content with a document:
 
-<Tabs>
-<TabItem value="python" label="Python">
-
-```python
-from hindsight_client import Hindsight
-
-client = Hindsight(base_url="http://localhost:8888")
-
-# Retain with document ID
-client.retain(
-    bank_id="my-bank",
-    content="Alice presented the Q4 roadmap...",
-    document_id="meeting-2024-03-15"
-)
-
-# Batch retain for a document
-client.retain_batch(
-    bank_id="my-bank",
-    items=[
-        {"content": "Item 1: Product launch delayed to Q2"},
-        {"content": "Item 2: New hiring targets announced"},
-        {"content": "Item 3: Budget approved for ML team"}
-    ],
-    document_id="meeting-2024-03-15"
-)
-
-# From file
-with open("notes.txt") as f:
-    client.retain(
-        bank_id="my-bank",
-        content=f.read(),
-        document_id="notes-2024-03-15"
-    )
-```
-
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```typescript
 
 
-const client = new HindsightClient({ baseUrl: 'http://localhost:8888' });
 
-// Retain with document ID
-await client.retain('my-bank', 'Alice presented the Q4 roadmap...', {
-    document_id: 'meeting-2024-03-15'
-});
-
-// Batch retain
-await client.retainBatch('my-bank', [
-    { content: 'Item 1: Product launch delayed to Q2' },
-    { content: 'Item 2: New hiring targets announced' },
-    { content: 'Item 3: Budget approved for ML team' }
-], { documentId: 'meeting-2024-03-15' });
-```
-
-</TabItem>
-<TabItem value="cli" label="CLI">
-
-```bash
-# Retain file with document ID
-hindsight retain my-bank --file notes.txt --document-id notes-2024-03-15
-
-# Batch retain directory
-hindsight retain my-bank --files docs/*.md --document-id project-docs
-```
-
-</TabItem>
 </Tabs>
 
 ## Update Documents
 
 Re-retaining with the same document_id **replaces** the old content:
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-# Original
-client.retain(
-    bank_id="my-bank",
-    content="Project deadline: March 31",
-    document_id="project-plan"
-)
 
-# Update (deletes old facts, creates new ones)
-client.retain(
-    bank_id="my-bank",
-    content="Project deadline: April 15 (extended)",
-    document_id="project-plan"
-)
-```
 
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```typescript
-// Original
-await client.retain('my-bank', 'Project deadline: March 31', {
-    document_id: 'project-plan'
-});
-
-// Update
-await client.retain('my-bank', 'Project deadline: April 15 (extended)', {
-    document_id: 'project-plan'
-});
-```
-
-</TabItem>
-<TabItem value="cli" label="CLI">
-
-```bash
-# Original
-hindsight retain my-bank "Project deadline: March 31" --document-id project-plan
-
-# Update
-hindsight retain my-bank "Project deadline: April 15 (extended)" --document-id project-plan
-```
-
-</TabItem>
 </Tabs>
 
 ## Get Document
 
 Retrieve a document's original text and metadata. This is useful for expanding document context after a recall operation returns memories with document references.
 
-<Tabs>
-<TabItem value="python" label="Python">
-
-```python
-from hindsight_client_api import ApiClient, Configuration
-from hindsight_client_api.api import DefaultApi
-
-config = Configuration(host="http://localhost:8888")
-api_client = ApiClient(config)
-api = DefaultApi(api_client)
-
-# Get document to expand context from recall results
-doc = api.get_document(
-    bank_id="my-bank",
-    document_id="meeting-2024-03-15"
-)
-
-print(f"Document: {doc.id}")
-print(f"Original text: {doc.original_text}")
-print(f"Memory count: {doc.memory_unit_count}")
-print(f"Created: {doc.created_at}")
-```
-
-</TabItem>
-<TabItem value="node" label="Node.js">
-
-```typescript
 
 
-const apiClient = createClient(createConfig({ baseUrl: 'http://localhost:8888' }));
 
-// Get document to expand context from recall results
-const { data: doc } = await sdk.getDocument({
-    client: apiClient,
-    path: { bank_id: 'my-bank', document_id: 'meeting-2024-03-15' }
-});
-
-console.log(`Document: ${doc.id}`);
-console.log(`Original text: ${doc.original_text}`);
-console.log(`Memory count: ${doc.memory_unit_count}`);
-console.log(`Created: ${doc.created_at}`);
-```
-
-</TabItem>
-<TabItem value="cli" label="CLI">
-
-```bash
-hindsight documents get my-bank meeting-2024-03-15
-```
-
-</TabItem>
 </Tabs>
 
 ## Document Response Format
@@ -2987,78 +2041,14 @@ Official Python client for the Hindsight API.
 
 ## Installation
 
-<Tabs>
-<TabItem value="all-in-one" label="All-in-One (Recommended)">
 
-The `hindsight-all` package includes embedded PostgreSQL, HTTP API server, and client:
 
-```bash
-pip install hindsight-all
-```
-
-</TabItem>
-<TabItem value="client-only" label="Client Only">
-
-If you already have a Hindsight server running:
-
-```bash
-pip install hindsight-client
-```
-
-</TabItem>
 </Tabs>
 
 ## Quick Start
 
-<Tabs>
-<TabItem value="all-in-one" label="All-in-One">
 
-```python
 
-from hindsight import HindsightServer, HindsightClient
-
-with HindsightServer(
-    llm_provider="openai",
-    llm_model="gpt-4.1-mini",
-    llm_api_key=os.environ["OPENAI_API_KEY"]
-) as server:
-    client = HindsightClient(base_url=server.url)
-
-    # Retain a memory
-    client.retain(bank_id="my-bank", content="Alice works at Google")
-
-    # Recall memories
-    results = client.recall(bank_id="my-bank", query="What does Alice do?")
-    for r in results:
-        print(r.text)
-
-    # Reflect - generate response with disposition
-    answer = client.reflect(bank_id="my-bank", query="Tell me about Alice")
-    print(answer.text)
-```
-
-</TabItem>
-<TabItem value="client-only" label="Client Only">
-
-```python
-from hindsight_client import Hindsight
-
-client = Hindsight(base_url="http://localhost:8888")
-
-# Retain a memory
-client.retain(bank_id="my-bank", content="Alice works at Google")
-
-# Recall memories
-results = client.recall(bank_id="my-bank", query="What does Alice do?")
-for r in results:
-    print(r.text)
-
-# Reflect - generate response with disposition
-answer = client.reflect(bank_id="my-bank", query="Tell me about Alice")
-print(answer.text)
-```
-
-</TabItem>
 </Tabs>
 
 ## Client Initialization
@@ -3603,36 +2593,14 @@ hindsight bank profile demo
 ---
 
 
-## File: cookbook/index.md
+## File: cookbook/index.mdx
 
 # Cookbook
 
 Practical patterns, recipes, and complete applications for building with Hindsight.
 
-## Recipes
-
-Step-by-step tutorials and use cases as interactive Jupyter notebooks.
-
-### [Hindsight Quickstart](/cookbook/recipes/quickstart)
-
-This notebook covers the basics of using Hindsight: - **Retain**: Store information in memory - **Recall**: Retrieve memories matching a query - **Reflect**: Generate insights from memories Make sure 
-
-### [Per-User Memory](/cookbook/recipes/per-user-memory)
-
-The simplest pattern: give your agent persistent memory for each user. The agent remembers past conversations, user preferences, and context across sessions.
-
-### [Support Agent with Shared Knowledge](/cookbook/recipes/support-agent-shared-knowledge)
-
-This pattern shows how to build a support agent that combines **per-user memory** with **shared product knowledge** (RAG), giving users personalized support while leveraging a single source of truth f
 
 
-## Applications
-
-Complete, production-ready applications you can run and learn from.
-
-### [OpenAI Agent + Hindsight Memory Integration](/cookbook/applications/openai-fitness-coach)
-
-A complete, runnable application demonstrating Hindsight integration.
 
 
 
@@ -4731,6 +3699,571 @@ For full release details, see [GitHub Releases](https://github.com/vectorize-io/
 ---
 
 
+## File: cookbook/recipes/litellm-memory-demo.md
+
+# Hindsight Memory Demo with LiteLLM
+
+
+:::tip Run this notebook
+This recipe is available as an interactive Jupyter notebook.
+[**Open in GitHub →**](https://github.com/vectorize-io/hindsight-cookbook/blob/main/notebooks/04-litellm-memory-demo.ipynb)
+:::
+
+
+This notebook demonstrates how to add persistent memory to any LLM app using the `hindsight-litellm` package. Memory storage and injection happen automatically via LiteLLM callbacks - no manual memory management needed!
+
+**Key features demonstrated:**
+1. `configure()` + `enable()` - Set up automatic memory integration
+2. Automatic storage - Conversations are stored after each LLM call
+3. Automatic injection - Relevant memories are injected into prompts
+
+The `hindsight-litellm` package hooks into LiteLLM's callback system to:
+- Store each conversation after successful LLM responses
+- Inject relevant memories into the system prompt before LLM calls
+
+## Prerequisites
+
+Make sure you have Hindsight running:
+
+```bash
+export OPENAI_API_KEY=your-key
+
+docker run --rm -it --pull always -p 8888:8888 -p 9999:9999 \
+  -e HINDSIGHT_API_LLM_API_KEY=$OPENAI_API_KEY \
+  -e HINDSIGHT_API_LLM_MODEL=o3-mini \
+  -v $HOME/.hindsight-docker:/home/hindsight/.pg0 \
+  ghcr.io/vectorize-io/hindsight:latest
+```
+
+- API: http://localhost:8888
+- UI: http://localhost:9999
+
+## Installation
+
+
+```python
+!pip install hindsight-litellm litellm nest_asyncio python-dotenv -U -q
+```
+
+## Setup
+
+
+```python
+
+
+
+
+
+from dotenv import load_dotenv
+
+# Apply nest_asyncio for Jupyter compatibility
+nest_asyncio.apply()
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+logging.getLogger("LiteLLM Router").setLevel(logging.WARNING)
+logging.getLogger("LiteLLM Proxy").setLevel(logging.WARNING)
+
+# Import hindsight_litellm
+
+
+# Configuration
+HINDSIGHT_API_URL = os.getenv("HINDSIGHT_API_URL", "http://localhost:8888")
+
+# Check for API key
+if not os.getenv("OPENAI_API_KEY"):
+    print("Warning: OPENAI_API_KEY not set")
+```
+
+## Configure and Enable Automatic Memory
+
+This is all you need! After this, all LiteLLM calls will automatically:
+- Have relevant memories injected into the prompt
+- Store conversations to Hindsight after the response
+
+
+```python
+# Generate a unique bank_id for this demo session
+bank_id = f"demo-{uuid.uuid4().hex[:8]}"
+print(f"Using bank_id: {bank_id}")
+
+# Configure and enable hindsight
+hindsight_litellm.configure(
+    hindsight_api_url=HINDSIGHT_API_URL,
+    bank_id=bank_id,
+    store_conversations=True,  # Automatically store conversations
+    inject_memories=True,       # Automatically inject relevant memories
+    verbose=True,               # Enable logging to debug memory operations
+)
+hindsight_litellm.enable()
+
+print("Hindsight memory integration enabled!")
+```
+
+## Conversation 1: User Introduces Themselves
+
+In this first conversation, the user shares some information about themselves. This will be automatically stored to Hindsight memory.
+
+
+```python
+user_message_1 = "Hi! I'm Alex and I work at Google as a software engineer. I love Python and machine learning."
+print(f"User: {user_message_1}\n")
+
+# Use hindsight_litellm.completion() directly
+response_1 = hindsight_litellm.completion(
+    model="gpt-4o-mini",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": user_message_1}
+    ],
+)
+
+assistant_response_1 = response_1.choices[0].message.content
+print(f"Assistant: {assistant_response_1}")
+print("\n(Conversation automatically stored to Hindsight)")
+```
+
+## Wait for Memory Processing
+
+Hindsight needs a few seconds to process and extract facts from the conversation.
+
+
+```python
+print("Waiting 12 seconds for memory processing...")
+time.sleep(12)
+print("Done!")
+```
+
+## Conversation 2: Test Memory-Augmented Response
+
+Now we start a fresh conversation and ask what the assistant remembers. The memories from the previous conversation will be automatically injected into the prompt!
+
+
+```python
+user_message_2 = "What do you know about me? What programming language should I use for my next project?"
+print(f"User: {user_message_2}\n")
+
+# Memories are automatically injected before this call!
+response_2 = hindsight_litellm.completion(
+    model="gpt-4o-mini",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": user_message_2}
+    ],
+)
+
+print(f"Assistant: {response_2.choices[0].message.content}")
+```
+
+## Summary
+
+The assistant should have remembered that Alex:
+- Works at Google as a software engineer
+- Loves Python and machine learning
+
+And it should have recommended Python based on that knowledge!
+
+
+```python
+print(f"Memories stored in bank: {bank_id}")
+print(f"View in UI: http://localhost:9999/banks/{bank_id}")
+```
+
+## Cleanup
+
+
+```python
+hindsight_litellm.cleanup()
+
+# Optional: delete the bank
+
+response = requests.delete(f"{HINDSIGHT_API_URL}/v1/default/banks/{bank_id}")
+print(f"Deleted bank: {response.json()}")
+```
+
+
+---
+
+
+## File: cookbook/recipes/tool-learning-demo.md
+
+# Hindsight Tool Learning Demo
+
+
+:::tip Run this notebook
+This recipe is available as an interactive Jupyter notebook.
+[**Open in GitHub →**](https://github.com/vectorize-io/hindsight-cookbook/blob/main/notebooks/05-tool-learning-demo.ipynb)
+:::
+
+
+This notebook demonstrates how Hindsight helps an LLM learn which tool to use when tool names are ambiguous. Without memory, the LLM might randomly select between similarly-named tools. With Hindsight, it learns from past interactions and consistently makes the correct choice.
+
+## The Scenario
+
+We have a task routing system with two tools:
+- `route_to_channel_alpha` - Routes to processing channel Alpha
+- `route_to_channel_omega` - Routes to processing channel Omega
+
+The tool names and descriptions are **intentionally vague**. In reality:
+- Channel Alpha handles **FINANCIAL/PAYMENT** tasks (refunds, billing, etc.)
+- Channel Omega handles **TECHNICAL/SUPPORT** tasks (bugs, features, etc.)
+
+**Without Hindsight:** The LLM guesses randomly based on vague descriptions  
+**With Hindsight:** The LLM learns from feedback which channel handles what
+
+## Prerequisites
+
+Make sure you have Hindsight running:
+
+```bash
+export OPENAI_API_KEY=your-key
+
+docker run --rm -it --pull always -p 8888:8888 -p 9999:9999 \
+  -e HINDSIGHT_API_LLM_API_KEY=$OPENAI_API_KEY \
+  -e HINDSIGHT_API_LLM_MODEL=o3-mini \
+  -v $HOME/.hindsight-docker:/home/hindsight/.pg0 \
+  ghcr.io/vectorize-io/hindsight:latest
+```
+
+## Installation
+
+
+```python
+!pip install hindsight-litellm hindsight-client litellm nest_asyncio python-dotenv -U -q
+```
+
+## Setup
+
+
+```python
+
+
+
+
+
+
+from typing import Optional
+from dotenv import load_dotenv
+
+nest_asyncio.apply()
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+logging.getLogger("LiteLLM Router").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+
+from hindsight_client import Hindsight
+
+HINDSIGHT_API_URL = os.getenv("HINDSIGHT_API_URL", "http://localhost:8888")
+
+if not os.getenv("OPENAI_API_KEY"):
+    print("Warning: OPENAI_API_KEY not set")
+```
+
+## Define Tools
+
+These tool definitions are **intentionally ambiguous** - the descriptions don't reveal which channel handles what type of request.
+
+
+```python
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "route_to_channel_alpha",
+            "description": "Routes the customer request to processing channel Alpha. Use this channel for appropriate request types.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "request_summary": {
+                        "type": "string",
+                        "description": "A brief summary of the customer's request"
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "description": "Priority level of the request"
+                    }
+                },
+                "required": ["request_summary"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "route_to_channel_omega",
+            "description": "Routes the customer request to processing channel Omega. Use this channel for appropriate request types.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "request_summary": {
+                        "type": "string",
+                        "description": "A brief summary of the customer's request"
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "description": "Priority level of the request"
+                    }
+                },
+                "required": ["request_summary"]
+            }
+        }
+    }
+]
+```
+
+## Test Scenarios
+
+A mix of financial and technical requests to test routing accuracy.
+
+
+```python
+TEST_SCENARIOS = [
+    {
+        "type": "financial",
+        "request": "I was charged twice for my subscription last month. I need a refund for the duplicate charge.",
+        "correct_tool": "route_to_channel_alpha"
+    },
+    {
+        "type": "technical",
+        "request": "The app keeps crashing when I try to upload a file larger than 10MB. This bug is blocking my work.",
+        "correct_tool": "route_to_channel_omega"
+    },
+    {
+        "type": "financial",
+        "request": "My invoice shows an incorrect amount. The billing department needs to fix this.",
+        "correct_tool": "route_to_channel_alpha"
+    },
+    {
+        "type": "technical",
+        "request": "I'd like to request a new feature: the ability to export reports as PDF.",
+        "correct_tool": "route_to_channel_omega"
+    },
+    {
+        "type": "financial",
+        "request": "I need to update my payment method and understand why my last payment failed.",
+        "correct_tool": "route_to_channel_alpha"
+    },
+]
+```
+
+## Helper Functions
+
+
+```python
+SYSTEM_PROMPT = """You are a customer service routing agent. Your job is to route customer requests to the appropriate processing channel.
+
+You have access to two routing channels:
+- route_to_channel_alpha: Routes to channel Alpha
+- route_to_channel_omega: Routes to channel Omega
+
+Analyze the customer's request and route it to the most appropriate channel. You must call one of the routing functions to process the request.
+
+Important: Base your routing decision on what you know about each channel's purpose. If you have learned from previous interactions which channel handles specific types of requests, use that knowledge."""
+
+
+def make_routing_request(user_request: str, use_hindsight: bool, bank_id: Optional[str] = None):
+    """Make a routing request and return the tool called."""
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Customer Request: {user_request}"}
+    ]
+
+    if use_hindsight and bank_id:
+        response = hindsight_litellm.completion(
+            model="gpt-4o-mini",
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="required",
+            temperature=0.0,
+        )
+    else:
+        response = litellm.completion(
+            model="gpt-4o-mini",
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="required",
+            temperature=0.7,
+        )
+
+    if response.choices[0].message.tool_calls:
+        tool_call = response.choices[0].message.tool_calls[0]
+        return tool_call.function.name
+    return None
+
+
+def store_feedback(bank_id: str, request: str, correct_tool: str, request_type: str):
+    """Store feedback about which tool was correct for a request type."""
+    client = Hindsight(base_url=HINDSIGHT_API_URL, timeout=60.0)
+
+    feedback_content = f"""ROUTING FEEDBACK:
+Request type: {request_type}
+Customer request: "{request}"
+Correct routing: {correct_tool}
+
+LEARNED RULE: {request_type.upper()} requests (like refunds, billing, payments, charges, invoices) should ALWAYS be routed to {correct_tool}.
+This is important institutional knowledge for routing decisions."""
+
+    client.retain(
+        bank_id=bank_id,
+        content=feedback_content,
+        context=f"routing:feedback:{request_type}",
+        metadata={"request_type": request_type, "correct_tool": correct_tool}
+    )
+```
+
+## Phase 1: Without Hindsight (No Memory)
+
+The LLM has no prior knowledge about which channel handles what. With ambiguous tool descriptions, it may route incorrectly.
+
+
+```python
+print("=" * 60)
+print("PHASE 1: WITHOUT HINDSIGHT (No Memory)")
+print("=" * 60)
+
+phase1_results = []
+for i, scenario in enumerate(TEST_SCENARIOS[:3], 1):
+    print(f"\n--- Test {i}: {scenario['type'].upper()} Request ---")
+    print(f"Request: \"{scenario['request'][:60]}...\"")
+
+    tool_name = make_routing_request(scenario['request'], use_hindsight=False)
+
+    is_correct = tool_name == scenario['correct_tool']
+    phase1_results.append(is_correct)
+
+    print(f"LLM chose: {tool_name}")
+    print(f"Correct tool: {scenario['correct_tool']}")
+    print(f"Result: {'✓ CORRECT' if is_correct else '✗ INCORRECT'}")
+
+phase1_accuracy = sum(phase1_results) / len(phase1_results) * 100
+print(f"\n>>> Phase 1 Accuracy: {phase1_accuracy:.0f}% ({sum(phase1_results)}/{len(phase1_results)})")
+```
+
+## Phase 2: Teaching Phase
+
+Now we provide feedback about correct routing to build memory. This simulates a human supervisor correcting the AI's routing decisions.
+
+
+```python
+bank_id = f"tool-learning-{uuid.uuid4().hex[:8]}"
+print(f"Using bank_id: {bank_id}")
+
+# Configure and enable Hindsight
+hindsight_litellm.configure(
+    hindsight_api_url=HINDSIGHT_API_URL,
+    bank_id=bank_id,
+    store_conversations=True,
+    inject_memories=True,
+    max_memories=10,
+    recall_budget="high",
+    verbose=False,
+)
+hindsight_litellm.enable()
+
+print("\nStoring routing feedback...")
+
+feedback_examples = [
+    ("I need a refund for an incorrect charge on my account.", "route_to_channel_alpha", "financial"),
+    ("There's a bug in the system causing data loss.", "route_to_channel_omega", "technical"),
+    ("My billing statement has errors that need correction.", "route_to_channel_alpha", "financial"),
+    ("I want to request a new feature for the dashboard.", "route_to_channel_omega", "technical"),
+]
+
+for request, correct_tool, req_type in feedback_examples:
+    print(f"  Storing: {req_type.upper()} → {correct_tool}")
+    store_feedback(bank_id, request, correct_tool, req_type)
+
+print("\nWaiting 15 seconds for Hindsight to process memories...")
+time.sleep(15)
+print("Done!")
+```
+
+## Phase 3: With Hindsight (Memory-Augmented)
+
+The LLM now has access to learned routing knowledge via Hindsight. It should route requests correctly based on past feedback.
+
+
+```python
+print("=" * 60)
+print("PHASE 3: WITH HINDSIGHT (Memory-Augmented)")
+print("=" * 60)
+
+phase3_results = []
+for i, scenario in enumerate(TEST_SCENARIOS, 1):
+    print(f"\n--- Test {i}: {scenario['type'].upper()} Request ---")
+    print(f"Request: \"{scenario['request'][:60]}...\"")
+
+    tool_name = make_routing_request(
+        scenario['request'],
+        use_hindsight=True,
+        bank_id=bank_id
+    )
+
+    is_correct = tool_name == scenario['correct_tool']
+    phase3_results.append(is_correct)
+
+    print(f"LLM chose: {tool_name}")
+    print(f"Correct tool: {scenario['correct_tool']}")
+    print(f"Result: {'✓ CORRECT' if is_correct else '✗ INCORRECT'}")
+
+phase3_accuracy = sum(phase3_results) / len(phase3_results) * 100
+print(f"\n>>> Phase 3 Accuracy: {phase3_accuracy:.0f}% ({sum(phase3_results)}/{len(phase3_results)})")
+```
+
+## Summary
+
+
+```python
+print("=" * 60)
+print("SUMMARY")
+print("=" * 60)
+print(f"\nPhase 1 (No Memory):      {phase1_accuracy:.0f}% accuracy")
+print(f"Phase 3 (With Hindsight): {phase3_accuracy:.0f}% accuracy")
+
+improvement = phase3_accuracy - phase1_accuracy
+if improvement > 0:
+    print(f"\n🎉 Improvement: +{improvement:.0f}% accuracy with Hindsight!")
+elif improvement == 0:
+    print(f"\nNote: Results may vary. Run again to see learning effect.")
+else:
+    print(f"\nNote: Phase 1 got lucky! Run again to see typical behavior.")
+
+print(f"\nMemories stored in bank: {bank_id}")
+print(f"View in UI: http://localhost:9999/banks/{bank_id}")
+
+print("\n" + "=" * 60)
+print("KEY INSIGHT")
+print("=" * 60)
+print("Hindsight allows the LLM to learn from experience which tool")
+print("to use, even when tool names/descriptions are ambiguous.")
+```
+
+## Cleanup
+
+
+```python
+hindsight_litellm.cleanup()
+
+# Optional: delete the bank
+
+response = requests.delete(f"{HINDSIGHT_API_URL}/v1/default/banks/{bank_id}")
+print(f"Deleted bank: {response.json()}")
+```
+
+
+---
+
+
 ## File: developer/api/opinions.md
 
 # Opinions
@@ -4770,50 +4303,13 @@ graph LR
     O --> S[(Store)]
 ```
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-# Ask a question that might form an opinion
-answer = client.reflect(
-    bank_id="my-bank",
-    query="What do you think about functional programming?"
-)
-
-# Check if new opinions were formed
-for opinion in answer.get("new_opinions", []):
-    print(f"New opinion: {opinion['text']}")
-    print(f"Confidence: {opinion['confidence']}")
-```
-
-</TabItem>
 </Tabs>
 
 ## Searching Opinions
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-# Search only opinions
-opinions = client.recall(
-    bank_id="my-bank",
-    query="programming languages",
-    types=["opinion"]
-)
 
-for op in opinions:
-    print(f"{op['text']} (confidence: {op['confidence_score']:.2f})")
-```
-
-</TabItem>
-<TabItem value="cli" label="CLI">
-
-```bash
-hindsight recall my-bank "programming" --types opinion
-```
-
-</TabItem>
 </Tabs>
 
 ## Opinion Evolution
@@ -4842,42 +4338,7 @@ t=3: "Python is best for data science" (0.82)
 
 Different dispositions form different opinions from the same facts:
 
-<Tabs>
-<TabItem value="python" label="Python">
 
-```python
-# Create two memory banks with different dispositions
-client.create_bank(
-    bank_id="open-minded",
-    disposition={"skepticism": 2, "literalism": 2, "empathy": 4}
-)
-
-client.create_bank(
-    bank_id="conservative",
-    disposition={"skepticism": 5, "literalism": 5, "empathy": 2}
-)
-
-# Store the same facts to both
-facts = [
-    "Rust has better memory safety than C++",
-    "C++ has a larger ecosystem and more libraries",
-    "Rust compile times are longer than C++"
-]
-for fact in facts:
-    client.retain(bank_id="open-minded", content=fact)
-    client.retain(bank_id="conservative", content=fact)
-
-# Ask both the same question
-q = "Should we rewrite our C++ codebase in Rust?"
-
-answer1 = client.reflect(bank_id="open-minded", query=q)
-# Likely: "Yes, Rust's safety benefits outweigh migration costs"
-
-answer2 = client.reflect(bank_id="conservative", query=q)
-# Likely: "No, C++'s ecosystem and our team's expertise make it the safer choice"
-```
-
-</TabItem>
 </Tabs>
 
 ## Opinions in Reflect Responses

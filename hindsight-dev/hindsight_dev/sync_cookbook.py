@@ -385,49 +385,84 @@ def update_sidebars(recipes: list[dict], apps: list[dict], sidebars_file: Path):
     print("\nUpdated sidebars.ts")
 
 
+def clean_description(desc: str) -> str:
+    """Clean description for display in carousel cards."""
+    if not desc:
+        return ""
+    # Remove markdown formatting
+    desc = re.sub(r"\*\*([^*]+)\*\*", r"\1", desc)  # Bold
+    desc = re.sub(r"\*([^*]+)\*", r"\1", desc)  # Italic
+    desc = re.sub(r"`([^`]+)`", r"\1", desc)  # Code
+    desc = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", desc)  # Links
+    desc = re.sub(r"^[-*]\s+", "", desc)  # List items
+    desc = re.sub(r"\s+", " ", desc).strip()  # Normalize whitespace
+    # Truncate at sentence boundary or max length
+    if len(desc) > 120:
+        # Try to cut at sentence
+        period_idx = desc.rfind(".", 0, 120)
+        if period_idx > 60:
+            desc = desc[: period_idx + 1]
+        else:
+            desc = desc[:117] + "..."
+    return desc
+
+
 def update_cookbook_index(
     recipes: list[dict], apps: list[dict], docs_dir: Path
 ):
-    """Update cookbook/index.md with recipe and app listings."""
-    recipe_entries = []
+    """Update cookbook/index.mdx with recipe and app carousels."""
+    # Build recipe items for the carousel
+    recipe_items = []
     for r in recipes:
-        desc = r.get("description") or ""
-        recipe_entries.append(
-            f"### [{r['title']}](/cookbook/recipes/{r['slug']})\n\n{desc}\n"
+        title = r["title"].replace('"', '\\"')
+        recipe_items.append(
+            f'    {{ title: "{title}", href: "/cookbook/recipes/{r["slug"]}" }}'
         )
-    recipes_list = "\n".join(recipe_entries)
+    recipes_json = ",\n".join(recipe_items)
 
-    app_entries = []
+    # Build app items for the carousel
+    app_items = []
     for a in apps:
-        app_entries.append(
-            f"### [{a['title']}](/cookbook/applications/{a['slug']})\n\nA complete, runnable application demonstrating Hindsight integration.\n"
+        title = a["title"].replace('"', '\\"')
+        app_items.append(
+            f'    {{ title: "{title}", href: "/cookbook/applications/{a["slug"]}" }}'
         )
-    apps_list = "\n".join(app_entries)
+    apps_json = ",\n".join(app_items)
 
     content = f"""---
 sidebar_position: 1
 ---
 
+import RecipeCarousel from '@site/src/components/RecipeCarousel';
+
 # Cookbook
 
 Practical patterns, recipes, and complete applications for building with Hindsight.
 
-## Recipes
+<RecipeCarousel
+  title="Recipes"
+  items={{[
+{recipes_json}
+  ]}}
+/>
 
-Step-by-step tutorials and use cases as interactive Jupyter notebooks.
-
-{recipes_list}
-
-## Applications
-
-Complete, production-ready applications you can run and learn from.
-
-{apps_list}
+<RecipeCarousel
+  title="Applications"
+  items={{[
+{apps_json}
+  ]}}
+/>
 """
 
-    index_path = docs_dir / "index.md"
+    index_path = docs_dir / "index.mdx"
     index_path.write_text(content)
-    print("Updated cookbook/index.md")
+
+    # Remove old .md if exists
+    old_index = docs_dir / "index.md"
+    if old_index.exists():
+        old_index.unlink()
+
+    print("Updated cookbook/index.mdx")
 
 
 def main():
