@@ -426,3 +426,82 @@ async def test_document_deletion(api_client):
         f"/v1/default/banks/{test_bank_id}/documents/sales-report-q1-2024"
     )
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_async_retain(api_client):
+    """Test asynchronous retain functionality.
+
+    When async=true is passed, the retain endpoint should:
+    1. Return immediately with success and async_=true
+    2. Process the content in the background
+    3. Eventually store the memories
+    """
+    import asyncio
+
+    test_bank_id = f"async_retain_test_{datetime.now().timestamp()}"
+
+    # Store memory with async=true
+    response = await api_client.post(
+        f"/v1/default/banks/{test_bank_id}/memories",
+        json={
+            "async": True,
+            "items": [
+                {
+                    "content": "Alice is a senior engineer at TechCorp. She has been working on the authentication system for 5 years.",
+                    "context": "team introduction"
+                }
+            ]
+        }
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["success"] is True
+    assert result["async_"] is True, "Response should indicate async processing"
+    assert result["items_count"] == 1
+
+    # Check operations endpoint to see the pending operation
+    response = await api_client.get(f"/v1/default/banks/{test_bank_id}/operations")
+    assert response.status_code == 200
+    ops_result = response.json()
+    assert "operations" in ops_result
+
+    # Wait for async processing to complete (poll with timeout)
+    max_wait_seconds = 30
+    poll_interval = 0.5
+    elapsed = 0
+    memories_found = False
+
+    while elapsed < max_wait_seconds:
+        # Check if memories are stored
+        response = await api_client.get(
+            f"/v1/default/banks/{test_bank_id}/memories/list",
+            params={"limit": 10}
+        )
+        assert response.status_code == 200
+        items = response.json()["items"]
+
+        if len(items) > 0:
+            memories_found = True
+            break
+
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+
+    assert memories_found, f"Async retain did not complete within {max_wait_seconds} seconds"
+
+    # Verify we can recall the stored memory
+    response = await api_client.post(
+        f"/v1/default/banks/{test_bank_id}/memories/recall",
+        json={
+            "query": "Who works at TechCorp?",
+            "thinking_budget": 30
+        }
+    )
+    assert response.status_code == 200
+    search_results = response.json()
+    assert len(search_results["results"]) > 0, "Should find the asynchronously stored memory"
+
+    # Verify Alice is mentioned
+    found_alice = any("Alice" in r["text"] for r in search_results["results"])
+    assert found_alice, "Should find Alice in search results"

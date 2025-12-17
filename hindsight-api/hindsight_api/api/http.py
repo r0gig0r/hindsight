@@ -1499,7 +1499,7 @@ def _register_routes(app: FastAPI):
             async with acquire_with_retry(pool) as conn:
                 # Check if operation exists and belongs to this memory bank
                 result = await conn.fetchrow(
-                    "SELECT bank_id FROM async_operations WHERE id = $1 AND bank_id = $2", op_uuid, bank_id
+                    "SELECT bank_id FROM async_operations WHERE operation_id = $1 AND bank_id = $2", op_uuid, bank_id
                 )
 
                 if not result:
@@ -1508,7 +1508,7 @@ def _register_routes(app: FastAPI):
                     )
 
                 # Delete the operation
-                await conn.execute("DELETE FROM async_operations WHERE id = $1", op_uuid)
+                await conn.execute("DELETE FROM async_operations WHERE operation_id = $1", op_uuid)
 
                 return {
                     "success": True,
@@ -1769,13 +1769,13 @@ def _register_routes(app: FastAPI):
                 async with acquire_with_retry(pool) as conn:
                     await conn.execute(
                         """
-                        INSERT INTO async_operations (id, bank_id, task_type, items_count)
+                        INSERT INTO async_operations (operation_id, bank_id, operation_type, result_metadata)
                         VALUES ($1, $2, $3, $4)
                         """,
                         operation_id,
                         bank_id,
                         "retain",
-                        len(contents),
+                        {"items_count": len(contents)},
                     )
 
                 # Submit task to background queue
