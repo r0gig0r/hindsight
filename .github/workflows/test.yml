@@ -534,10 +534,9 @@ jobs:
         uv build
         uv sync --no-install-project --index-strategy unsafe-best-match
 
-    - name: Build and install Python client
-      run: |
-        (cd hindsight-clients/python && uv build)
-        uv pip install "$(ls dist/hindsight_client-*.whl)"
+    - name: Install Python client dependencies
+      working-directory: ./hindsight-clients/python
+      run: uv sync --extra test --index-strategy unsafe-best-match
 
     - name: Install TypeScript client
       run: |
@@ -570,10 +569,11 @@ jobs:
         done
 
     - name: Run Python doc examples
+      working-directory: ./hindsight-clients/python
       run: |
-        for f in hindsight-docs/examples/api/*.py; do
+        for f in ../../hindsight-docs/examples/api/*.py; do
           echo "Running $f..."
-          python "$f"
+          uv run python "$f"
         done
 
     - name: Run Node.js doc examples
