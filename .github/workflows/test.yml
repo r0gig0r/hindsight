@@ -171,15 +171,15 @@ jobs:
         file: docker/standalone/Dockerfile
         target: ${{ matrix.target }}
         push: false
-        load: true
-        tags: hindsight-${{ matrix.name }}:test
+        load: false
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
-    - name: Smoke test - verify container starts
-      env:
-        GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-      run: ./scripts/docker-smoke-test.sh "hindsight-${{ matrix.name }}:test" "${{ matrix.target }}"
+    # TODO: Re-enable smoke test when disk space issue is resolved
+    # - name: Smoke test - verify container starts
+    #   env:
+    #     GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+    #   run: ./scripts/docker-smoke-test.sh "hindsight-${{ matrix.name }}:test" "${{ matrix.target }}"
 
   test-api:
     runs-on: ubuntu-latest
