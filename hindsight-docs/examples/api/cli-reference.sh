@@ -138,8 +138,15 @@ hindsight document get $BANK_ID $DOC_ID
 # [docs:cli-document-delete]
 # Create a temp document to delete
 hindsight memory retain $BANK_ID "Temporary content for deletion test" --doc-id "temp-doc-to-delete"
-# Wait for document to be indexed (processing takes time even in sync mode)
-sleep 10
+# Wait for document to be indexed (poll until it exists, max 30 seconds)
+for i in {1..30}; do
+    if hindsight document get $BANK_ID temp-doc-to-delete > /dev/null 2>&1; then
+        echo "Document indexed after ${i}s"
+        break
+    fi
+    echo "Waiting for document to be indexed... ($i/30)"
+    sleep 1
+done
 hindsight document delete $BANK_ID temp-doc-to-delete
 # [/docs:cli-document-delete]
 
