@@ -96,9 +96,9 @@ hindsight bank list
 # [/docs:cli-bank-list]
 
 
-# [docs:cli-bank-profile]
-hindsight bank profile $BANK_ID
-# [/docs:cli-bank-profile]
+# [docs:cli-bank-disposition]
+hindsight bank disposition $BANK_ID
+# [/docs:cli-bank-disposition]
 
 
 # [docs:cli-bank-stats]
