@@ -3280,7 +3280,10 @@ Guidelines:
         # Call LLM with structured output - the wrapper handles schema injection
         result = await self._llm_config.call(
             messages=[
-                {"role": "user", "content": f"Based on the following answer to the query \"{query}\", extract the relevant information:\n\n{answer_text}"},
+                {
+                    "role": "user",
+                    "content": f'Based on the following answer to the query "{query}", extract the relevant information:\n\n{answer_text}',
+                },
             ],
             response_format=schema_wrapper,
             scope="memory_reflect_structured",
