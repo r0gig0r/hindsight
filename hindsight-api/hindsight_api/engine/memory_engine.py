@@ -3204,7 +3204,9 @@ Guidelines:
             max_completion_tokens=max_tokens,
             response_format=response_format,
             skip_validation=True if response_format else False,
-            strict_schema=True if response_format else False,
+            # Don't enforce strict_schema - not all providers support it and may retry forever
+            # Soft enforcement (schema in prompt + json_object mode) is sufficient
+            strict_schema=False,
         )
         llm_time = time.time() - llm_start
 
