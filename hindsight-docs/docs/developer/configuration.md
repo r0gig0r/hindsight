@@ -143,7 +143,7 @@ curl -H "Authorization: Bearer your-secret-api-key" \
 Requests without a valid API key receive a `401 Unauthorized` response.
 
 :::tip Custom Authentication
-For advanced authentication (JWT, OAuth, multi-tenant schemas), implement a custom `TenantExtension`. See the [Extensions documentation](/docs/developer/extensions) for details.
+For advanced authentication (JWT, OAuth, multi-tenant schemas), implement a custom `TenantExtension`. See the [Extensions documentation](./extensions.md) for details.
 :::
 
 ### Retrieval
