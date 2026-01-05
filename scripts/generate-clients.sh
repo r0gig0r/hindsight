@@ -105,7 +105,9 @@ echo "Generating new client with openapi-generator..."
 cd "$PYTHON_CLIENT_DIR"
 
 # Run openapi-generator via Docker (pinned version for reproducibility)
+# Use --user to match current user's UID/GID so generated files are writable
 docker run --rm \
+    --user "$(id -u):$(id -g)" \
     -v "$OPENAPI_SPEC:/local/openapi.json" \
     -v "$PYTHON_CLIENT_DIR:/local/out" \
     -v "$PYTHON_CLIENT_DIR/openapi-generator-config.yaml:/local/config.yaml" \
