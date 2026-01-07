@@ -42,6 +42,9 @@ ENV_MCP_INSTRUCTIONS = "HINDSIGHT_API_MCP_INSTRUCTIONS"
 ENV_OBSERVATION_MIN_FACTS = "HINDSIGHT_API_OBSERVATION_MIN_FACTS"
 ENV_OBSERVATION_TOP_ENTITIES = "HINDSIGHT_API_OBSERVATION_TOP_ENTITIES"
 
+# Retain settings
+ENV_RETAIN_MAX_COMPLETION_TOKENS = "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS"
+
 # Optimization flags
 ENV_SKIP_LLM_VERIFICATION = "HINDSIGHT_API_SKIP_LLM_VERIFICATION"
 ENV_LAZY_RERANKER = "HINDSIGHT_API_LAZY_RERANKER"
@@ -71,6 +74,9 @@ DEFAULT_MCP_LOCAL_BANK_ID = "mcp"
 # Observation thresholds
 DEFAULT_OBSERVATION_MIN_FACTS = 5  # Min facts required to generate entity observations
 DEFAULT_OBSERVATION_TOP_ENTITIES = 5  # Max entities to process per retain batch
+
+# Retain settings
+DEFAULT_RETAIN_MAX_COMPLETION_TOKENS = 64000  # Max tokens for fact extraction LLM call
 
 # Default MCP tool descriptions (can be customized via env vars)
 DEFAULT_MCP_RETAIN_DESCRIPTION = """Store important information to long-term memory.
@@ -134,6 +140,9 @@ class HindsightConfig:
     observation_min_facts: int
     observation_top_entities: int
 
+    # Retain settings
+    retain_max_completion_tokens: int
+
     # Optimization flags
     skip_llm_verification: bool
     lazy_reranker: bool
@@ -173,6 +182,10 @@ class HindsightConfig:
             observation_min_facts=int(os.getenv(ENV_OBSERVATION_MIN_FACTS, str(DEFAULT_OBSERVATION_MIN_FACTS))),
             observation_top_entities=int(
                 os.getenv(ENV_OBSERVATION_TOP_ENTITIES, str(DEFAULT_OBSERVATION_TOP_ENTITIES))
+            ),
+            # Retain settings
+            retain_max_completion_tokens=int(
+                os.getenv(ENV_RETAIN_MAX_COMPLETION_TOKENS, str(DEFAULT_RETAIN_MAX_COMPLETION_TOKENS))
             ),
         )
 

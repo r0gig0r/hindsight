@@ -14,6 +14,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ...config import get_config
 from ..llm_wrapper import LLMConfig, OutputTooLongError
 
 
@@ -603,12 +604,13 @@ Text:
 
     for attempt in range(max_retries):
         try:
+            config = get_config()
             extraction_response_json = await llm_config.call(
                 messages=[{"role": "system", "content": prompt}, {"role": "user", "content": user_message}],
                 response_format=FactExtractionResponse,
                 scope="memory_extract_facts",
                 temperature=0.1,
-                max_completion_tokens=65000,
+                max_completion_tokens=config.retain_max_completion_tokens,
                 skip_validation=True,  # Get raw JSON, we'll validate leniently
             )
 
