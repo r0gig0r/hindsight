@@ -39,7 +39,7 @@ I ran into my neighbor Sarah who mentioned she's planning a trip to Italy next m
         context = "Personal diary entry"
         llm_config = LLMConfig.for_memory()
 
-        facts, _ = await extract_facts_from_text(
+        facts, _, _ = await extract_facts_from_text(
             text=text,
             event_date=datetime(2024, 6, 15),
             context=context,
@@ -83,7 +83,7 @@ User: Perfect, I'll make a reservation for Saturday at 7pm.
         context = "Restaurant recommendation conversation"
         llm_config = LLMConfig.for_memory()
 
-        facts, _ = await extract_facts_from_text(
+        facts, _, _ = await extract_facts_from_text(
             text=text,
             event_date=datetime(2024, 6, 15),
             context=context,
@@ -139,7 +139,7 @@ I edited about 20 photos from my recent trip to the mountains.
         context = "Personal blog post"
         llm_config = LLMConfig.for_memory()
 
-        facts, _ = await extract_facts_from_text(
+        facts, _, _ = await extract_facts_from_text(
             text=text,
             event_date=datetime(2024, 4, 15),
             context=context,
@@ -203,7 +203,7 @@ I edited about 20 photos from my recent trip to the mountains.
         context = f"Conversation between {data['conversation']['speaker_a']} and {data['conversation']['speaker_b']}"
         llm_config = LLMConfig.for_memory()
 
-        facts, _ = await extract_facts_from_text(
+        facts, _, _ = await extract_facts_from_text(
             text=text,
             event_date=datetime(2023, 5, 8),  # Date from locomo dataset
             context=context,
@@ -264,7 +264,7 @@ I'm planning to visit Japan next year.
         context = "Personal info"
         llm_config = LLMConfig.for_memory()
 
-        facts, _ = await extract_facts_from_text(
+        facts, _, _ = await extract_facts_from_text(
             text=text,
             event_date=datetime(2024, 6, 15),
             context=context,

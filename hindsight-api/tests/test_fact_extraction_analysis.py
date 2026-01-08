@@ -2,9 +2,7 @@
 Test to analyze fact extraction token usage and identify optimization opportunities.
 """
 import asyncio
-import json
 import logging
-import os
 import time
 from datetime import datetime
 
@@ -16,17 +14,6 @@ from hindsight_api.engine.retain.fact_extraction import extract_facts_from_text
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-# Path to the test content
-TEST_CONTENT_PATH = "/Users/nicoloboschi/dev/hindsight-evals/src/hindsight_evals/ai_pm/scenarios/assign_kubernetes_certified_lead.json"
-
-
-def load_test_content() -> str:
-    """Load the test content from the JSON file."""
-    with open(TEST_CONTENT_PATH) as f:
-        data = json.load(f)
-        return data["context"][0]["content"]
 
 
 @pytest.fixture
@@ -43,16 +30,23 @@ def llm_config():
 
 
 @pytest.mark.asyncio
-async def test_fact_extraction_token_analysis(llm_config):
+async def test_fact_extraction_basic_analysis(llm_config):
     """
-    Test fact extraction and analyze token usage.
+    Test fact extraction and analyze token usage with sample content.
 
     This test helps identify:
     1. How many facts are extracted
     2. Token usage (input/output ratio)
     3. Types of facts being extracted
     """
-    content = load_test_content()
+    content = """
+    Alice is a senior software engineer at TechCorp with 8 years of experience.
+    She has a Kubernetes certification (CKA) and leads the platform team.
+    Bob is her colleague who works on the frontend. He's been at the company for 3 years.
+    They're working on a new microservices migration project together.
+    The deadline for the first milestone is end of Q2.
+    Alice prefers to use Go for backend services while Bob advocates for TypeScript.
+    """
 
     logger.info(f"Content length: {len(content)} chars (~{len(content) // 4} tokens)")
 
@@ -105,21 +99,5 @@ async def test_fact_extraction_token_analysis(llm_config):
         logger.info(f"\n'{term}' ({len(matching)} facts):")
         for fact in matching[:3]:
             logger.info(f"  - {fact.fact[:200]}...")
-
-    # Identify trivial facts (short facts about mundane topics)
-    trivial_keywords = ["coffee", "snack", "plant", "ping-pong", "weather", "lunch", "mug", "desk"]
-    trivial_facts = []
-    for fact in facts:
-        if any(kw in fact.fact.lower() for kw in trivial_keywords):
-            trivial_facts.append(fact)
-
-    logger.info(f"\n{'='*60}")
-    logger.info(f"TRIVIAL FACTS ANALYSIS")
-    logger.info(f"{'='*60}")
-    logger.info(f"Trivial facts count: {len(trivial_facts)} / {len(facts)} ({100*len(trivial_facts)/max(1,len(facts)):.1f}%)")
-
-    logger.info(f"\nSample trivial facts:")
-    for fact in trivial_facts[:5]:
-        logger.info(f"  - {fact.fact[:150]}...")
 
     assert len(facts) > 0, "Should extract at least one fact"
