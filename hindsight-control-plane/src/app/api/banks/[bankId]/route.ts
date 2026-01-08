@@ -1,7 +1,10 @@
 import { NextResponse } from "next/server";
 import { sdk, lowLevelClient } from "@/lib/hindsight-client";
 
-export async function DELETE(request: Request, { params }: { params: Promise<{ bankId: string }> }) {
+export async function DELETE(
+  request: Request,
+  { params }: { params: Promise<{ bankId: string }> }
+) {
   try {
     const { bankId } = await params;
 

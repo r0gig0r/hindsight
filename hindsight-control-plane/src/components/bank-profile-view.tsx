@@ -331,11 +331,7 @@ export function BankProfileView() {
               <Button onClick={() => setEditMode(true)} size="sm">
                 Edit Profile
               </Button>
-              <Button
-                onClick={() => setShowDeleteDialog(true)}
-                variant="destructive"
-                size="sm"
-              >
+              <Button onClick={() => setShowDeleteDialog(true)} variant="destructive" size="sm">
                 <Trash2 className="w-4 h-4 mr-2" />
                 Delete Bank
               </Button>
@@ -603,8 +599,8 @@ export function BankProfileView() {
                   <span className="font-semibold text-foreground">{currentBank}</span>?
                 </p>
                 <p className="text-red-600 dark:text-red-400 font-medium">
-                  This action cannot be undone. All memories, entities, documents, and the
-                  bank profile will be permanently deleted.
+                  This action cannot be undone. All memories, entities, documents, and the bank
+                  profile will be permanently deleted.
                 </p>
                 {stats && (
                   <p>
