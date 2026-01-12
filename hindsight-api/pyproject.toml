@@ -100,8 +100,6 @@ dev = [
     "filelock>=3.0.0",
     "ruff>=0.8.0",
     "ty>=0.0.1",
-    "py-spy>=0.4.1",
-    "pyinstrument>=5.1.2",
 ]
 
 [tool.ruff]
