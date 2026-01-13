@@ -195,6 +195,7 @@ def main():
             reranker_tei_batch_size=config.reranker_tei_batch_size,
             reranker_tei_max_concurrent=config.reranker_tei_max_concurrent,
             reranker_max_candidates=config.reranker_max_candidates,
+            reranker_cohere_base_url=config.reranker_cohere_base_url,
             host=args.host,
             port=args.port,
             log_level=args.log_level,

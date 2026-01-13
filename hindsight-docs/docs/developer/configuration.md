@@ -208,6 +208,7 @@ Supported OpenAI embedding dimensions:
 | `HINDSIGHT_API_RERANKER_TEI_BATCH_SIZE` | Batch size for TEI reranking | `128` |
 | `HINDSIGHT_API_RERANKER_TEI_MAX_CONCURRENT` | Max concurrent TEI reranking requests | `8` |
 | `HINDSIGHT_API_RERANKER_COHERE_MODEL` | Cohere rerank model | `rerank-english-v3.0` |
+| `HINDSIGHT_API_RERANKER_COHERE_BASE_URL` | Custom base URL for Cohere-compatible API (e.g., Azure-hosted) | - |
 
 ```bash
 # Local (default) - uses SentenceTransformers CrossEncoder
@@ -222,6 +223,12 @@ export HINDSIGHT_API_RERANKER_TEI_URL=http://localhost:8081
 export HINDSIGHT_API_RERANKER_PROVIDER=cohere
 export HINDSIGHT_API_COHERE_API_KEY=your-api-key  # shared with embeddings
 export HINDSIGHT_API_RERANKER_COHERE_MODEL=rerank-english-v3.0
+
+# Azure-hosted Cohere - reranking via custom endpoint
+export HINDSIGHT_API_RERANKER_PROVIDER=cohere
+export HINDSIGHT_API_COHERE_API_KEY=your-azure-api-key
+export HINDSIGHT_API_RERANKER_COHERE_MODEL=rerank-english-v3.0
+export HINDSIGHT_API_RERANKER_COHERE_BASE_URL=https://your-azure-cohere-endpoint.com
 ```
 
 ### Authentication
