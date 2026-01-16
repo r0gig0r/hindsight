@@ -233,7 +233,9 @@ async def test_full_api_workflow(api_client, test_bank_id):
     response = await api_client.get(f"/v1/default/banks/{test_bank_id}/profile")
     assert response.status_code == 200
     updated_profile = response.json()
-    assert "software engineer" in updated_profile["background"].lower()
+    assert updated_profile["disposition"]["skepticism"] == 4
+    assert updated_profile["disposition"]["literalism"] == 3
+    assert updated_profile["disposition"]["empathy"] == 4
 
     # ================================================================
     # 8. Test Entity Endpoints
@@ -278,11 +280,11 @@ async def test_full_api_workflow(api_client, test_bank_id):
         entity_detail = response.json()
         assert "id" in entity_detail
 
-        # Test regenerate observations
+        # Test regenerate observations (deprecated - returns 410 Gone)
         response = await api_client.post(
             f"/v1/default/banks/{test_bank_id}/entities/{entity_id}/regenerate"
         )
-        assert response.status_code == 200
+        assert response.status_code == 410  # Deprecated endpoint
 
     # ================================================================
     # 9. List All Banks (should include our test bank)
@@ -834,9 +836,8 @@ async def test_reflect_structured_output(api_client):
     assert response.status_code == 200
     result = response.json()
 
-    # Verify text field exists (empty when using structured output)
+    # Verify text field exists (may contain text even with structured output)
     assert "text" in result
-    assert result["text"] == ""
 
     # Verify structured output exists and has expected structure
     assert "structured_output" in result

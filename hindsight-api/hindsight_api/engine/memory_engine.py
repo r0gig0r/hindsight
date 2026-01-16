@@ -3673,7 +3673,7 @@ class MemoryEngine(MemoryEngineInterface):
             text=agent_result.text,
             based_on=based_on,
             new_opinions=[],  # Learnings stored as mental models
-            structured_output=None,  # Not yet supported for agentic reflect
+            structured_output=agent_result.structured_output,
             usage=None,  # Token tracking not yet implemented for agentic loop
             tool_trace=tool_trace_result,
             llm_trace=llm_trace_result,

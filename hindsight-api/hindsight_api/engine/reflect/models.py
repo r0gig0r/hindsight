@@ -2,7 +2,7 @@
 Pydantic models for the reflect agent.
 """
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -101,6 +101,9 @@ class ReflectAgentResult(BaseModel):
     text: str = Field(description="Final answer text")
     observations: list[Observation] = Field(
         default_factory=list, description="Structured observations (when output_mode=observations)"
+    )
+    structured_output: dict[str, Any] | None = Field(
+        default=None, description="Structured output parsed according to provided response_schema"
     )
     iterations: int = Field(default=0, description="Number of iterations taken")
     tools_called: int = Field(default=0, description="Total number of tool calls made")

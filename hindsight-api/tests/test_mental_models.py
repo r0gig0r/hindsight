@@ -398,24 +398,22 @@ class TestMentalModelRefresh:
         assert result is None
 
 
-class TestResearch:
-    """Test research endpoint."""
+class TestReflect:
+    """Test reflect endpoint with mental models."""
 
-    async def test_research_basic(self, memory_with_mission, request_context):
-        """Test basic research query - research works even without mental models."""
+    async def test_reflect_basic(self, memory_with_mission, request_context):
+        """Test basic reflect query - reflect works even without mental models."""
         memory, bank_id = memory_with_mission
 
-        # Run a research query directly (without full refresh to keep test fast)
-        # Research should work even without mental models, using supplementary facts
-        result = await memory.research(
+        # Run a reflect query
+        result = await memory.reflect_async(
             bank_id=bank_id,
             query="Who are the team members?",
             request_context=request_context,
         )
 
-        assert "answer" in result
-        assert "mental_models_used" in result
-        assert "question_type" in result
+        assert result.text is not None
+        assert len(result.text) > 0
 
 
 class TestMentalModelLearnTool:
@@ -730,8 +728,8 @@ class TestMentalModelTags:
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
 
-    async def test_research_with_tags_filter(self, memory_with_mission_and_tags, request_context):
-        """Test that research filters mental models by tags."""
+    async def test_reflect_with_tags_filter(self, memory_with_mission_and_tags, request_context):
+        """Test that reflect filters memories by tags."""
         memory, bank_id = memory_with_mission_and_tags
 
         # Create mental models with tags
@@ -742,25 +740,26 @@ class TestMentalModelTags:
         )
         await memory.wait_for_background_tasks()
 
-        # Research with matching tags - should use the mental models
-        result = await memory.research(
+        # Reflect with matching tags
+        result = await memory.reflect_async(
             bank_id=bank_id,
             query="Who are the engineers?",
             tags=["project-x"],
             request_context=request_context,
         )
 
-        assert "answer" in result
+        assert result.text is not None
+        assert len(result.text) > 0
 
-        # Research with non-matching tags - should still work (uses untagged models)
-        result2 = await memory.research(
+        # Reflect with non-matching tags - should still work
+        result2 = await memory.reflect_async(
             bank_id=bank_id,
             query="Who are the engineers?",
             tags=["different-project"],
             request_context=request_context,
         )
 
-        assert "answer" in result2
+        assert result2.text is not None
 
     async def test_mental_model_response_includes_tags(self, memory_with_mission_and_tags, request_context):
         """Test that mental model responses include the tags field."""

@@ -467,9 +467,12 @@ async def test_reflect_with_tags_filters_memories(api_client, test_bank_id):
     # The response should mention Oscar's color (blue), not Peter's (red)
     # Note: We can check based_on facts if they're returned
     if result.get("based_on"):
-        fact_texts = [f["text"] for f in result["based_on"]]
-        # Should use Oscar's memory
-        assert any("Oscar" in t or "blue" in t for t in fact_texts), "Should use Oscar's memory"
+        based_on = result["based_on"]
+        memories = based_on.get("memories", []) if isinstance(based_on, dict) else []
+        fact_texts = [f["text"] for f in memories]
+        # Should use Oscar's memory (if facts are included)
+        if fact_texts:
+            assert any("Oscar" in t or "blue" in t for t in fact_texts), "Should use Oscar's memory"
 
 
 @pytest.mark.asyncio

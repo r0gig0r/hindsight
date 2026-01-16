@@ -21,6 +21,108 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_ITERATIONS = 10
 
 
+async def _generate_structured_output(
+    answer: str,
+    response_schema: dict,
+    llm_config: "LLMProvider",
+    reflect_id: str,
+) -> dict[str, Any] | None:
+    """Generate structured output from an answer using the provided JSON schema.
+
+    Args:
+        answer: The text answer to extract structured data from
+        response_schema: JSON Schema for the expected output structure
+        llm_config: LLM provider for making the extraction call
+        reflect_id: Reflect ID for logging
+
+    Returns:
+        Structured output dict if successful, None otherwise
+    """
+    try:
+        from typing import Any as TypingAny
+
+        from pydantic import create_model
+
+        def _json_schema_type_to_python(field_schema: dict) -> type:
+            """Map JSON schema type to Python type for better LLM guidance."""
+            json_type = field_schema.get("type", "string")
+            if json_type == "array":
+                return list
+            elif json_type == "object":
+                return dict
+            elif json_type == "integer":
+                return int
+            elif json_type == "number":
+                return float
+            elif json_type == "boolean":
+                return bool
+            else:
+                return str
+
+        # Build fields from JSON schema properties
+        schema_props = response_schema.get("properties", {})
+        required_fields = set(response_schema.get("required", []))
+        fields: dict[str, TypingAny] = {}
+        for field_name, field_schema in schema_props.items():
+            field_type = _json_schema_type_to_python(field_schema)
+            default = ... if field_name in required_fields else None
+            fields[field_name] = (field_type, default)
+
+        if not fields:
+            return None
+
+        DynamicModel = create_model("StructuredResponse", **fields)
+
+        # Include the full schema in the prompt for better LLM guidance
+        schema_str = json.dumps(response_schema, indent=2)
+
+        # Call LLM with the answer to extract structured data
+        structured_prompt = f"""Based on this answer, extract the information into the requested structured format.
+
+Answer: {answer}
+
+JSON Schema to follow:
+```json
+{schema_str}
+```
+
+Return ONLY a valid JSON object that matches this exact schema. Pay special attention to field types:
+- "type": "array" means the value must be a JSON array/list, NOT a string
+- "type": "string" means the value must be a string
+- "type": "object" means the value must be a JSON object
+
+Do not include any explanation, only the JSON object."""
+
+        structured_result = await llm_config.call(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Extract structured data from the given answer. Return only valid JSON matching the provided schema exactly.",
+                },
+                {"role": "user", "content": structured_prompt},
+            ],
+            response_format=DynamicModel,
+            scope="reflect_structured",
+            skip_validation=True,  # We'll handle the dict ourselves
+        )
+
+        # Convert to dict
+        if hasattr(structured_result, "model_dump"):
+            structured_output = structured_result.model_dump()
+        elif isinstance(structured_result, dict):
+            structured_output = structured_result
+        else:
+            # Try to parse as JSON
+            structured_output = json.loads(str(structured_result))
+
+        logger.info(f"[REFLECT {reflect_id}] Generated structured output with {len(structured_output)} fields")
+        return structured_output
+
+    except Exception as e:
+        logger.warning(f"[REFLECT {reflect_id}] Failed to generate structured output: {e}")
+        return None
+
+
 async def run_reflect_agent(
     llm_config: "LLMProvider",
     bank_id: str,
@@ -171,9 +273,16 @@ async def run_reflect_agent(
             )
             llm_trace.append({"scope": "final", "duration_ms": int((time.time() - llm_start) * 1000)})
             answer = response.strip()
+
+            # Generate structured output if schema provided
+            structured_output = None
+            if response_schema and answer:
+                structured_output = await _generate_structured_output(answer, response_schema, llm_config, reflect_id)
+
             _log_completion(answer, iteration + 1, forced=True)
             return ReflectAgentResult(
                 text=answer,
+                structured_output=structured_output,
                 iterations=iteration + 1,
                 tools_called=total_tools_called,
                 mental_models_created=mental_models_created,
@@ -214,9 +323,16 @@ async def run_reflect_agent(
             )
             llm_trace.append({"scope": "final", "duration_ms": int((time.time() - llm_start) * 1000)})
             answer = response.strip()
+
+            # Generate structured output if schema provided
+            structured_output = None
+            if response_schema and answer:
+                structured_output = await _generate_structured_output(answer, response_schema, llm_config, reflect_id)
+
             _log_completion(answer, iteration + 1, forced=True)
             return ReflectAgentResult(
                 text=answer,
+                structured_output=structured_output,
                 iterations=iteration + 1,
                 tools_called=total_tools_called,
                 mental_models_created=mental_models_created,
@@ -228,9 +344,18 @@ async def run_reflect_agent(
         if not result.tool_calls:
             if result.content:
                 answer = result.content.strip()
+
+                # Generate structured output if schema provided
+                structured_output = None
+                if response_schema and answer:
+                    structured_output = await _generate_structured_output(
+                        answer, response_schema, llm_config, reflect_id
+                    )
+
                 _log_completion(answer, iteration + 1)
                 return ReflectAgentResult(
                     text=answer,
+                    structured_output=structured_output,
                     iterations=iteration + 1,
                     tools_called=total_tools_called,
                     mental_models_created=mental_models_created,
@@ -250,9 +375,16 @@ async def run_reflect_agent(
             )
             llm_trace.append({"scope": "final", "duration_ms": int((time.time() - llm_start) * 1000)})
             answer = response.strip()
+
+            # Generate structured output if schema provided
+            structured_output = None
+            if response_schema and answer:
+                structured_output = await _generate_structured_output(answer, response_schema, llm_config, reflect_id)
+
             _log_completion(answer, iteration + 1, forced=True)
             return ReflectAgentResult(
                 text=answer,
+                structured_output=structured_output,
                 iterations=iteration + 1,
                 tools_called=total_tools_called,
                 mental_models_created=mental_models_created,
@@ -287,7 +419,7 @@ async def run_reflect_agent(
                 continue
 
             # Process done tool
-            return _process_done_tool(
+            return await _process_done_tool(
                 done_call,
                 output_mode,
                 available_memory_ids,
@@ -299,6 +431,8 @@ async def run_reflect_agent(
                 _get_llm_trace(),
                 _log_completion,
                 reflect_id,
+                llm_config=llm_config,
+                response_schema=response_schema,
             )
 
         # Execute other tools in parallel
@@ -415,7 +549,7 @@ def _tool_call_to_dict(tc: "LLMToolCall") -> dict[str, Any]:
     }
 
 
-def _process_done_tool(
+async def _process_done_tool(
     done_call: "LLMToolCall",
     output_mode: str,
     available_memory_ids: set[str],
@@ -427,6 +561,8 @@ def _process_done_tool(
     llm_trace: list[LLMCall],
     log_completion: Callable,
     reflect_id: str,
+    llm_config: "LLMProvider | None" = None,
+    response_schema: dict | None = None,
 ) -> ReflectAgentResult:
     """Process the done tool call and return the result."""
     args = done_call.arguments
@@ -487,9 +623,15 @@ def _process_done_tool(
     used_memory_ids = [mid for mid in args.get("memory_ids", []) if mid in available_memory_ids]
     used_model_ids = [mid for mid in args.get("model_ids", []) if mid in available_model_ids]
 
+    # Generate structured output if schema provided
+    structured_output = None
+    if response_schema and llm_config and answer:
+        structured_output = await _generate_structured_output(answer, response_schema, llm_config, reflect_id)
+
     log_completion(answer, iterations)
     return ReflectAgentResult(
         text=answer,
+        structured_output=structured_output,
         iterations=iterations,
         tools_called=total_tools_called,
         mental_models_created=mental_models_created,
