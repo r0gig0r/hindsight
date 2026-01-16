@@ -102,6 +102,8 @@ export class HindsightClient {
             documentId?: string;
             async?: boolean;
             entities?: EntityInput[];
+            /** Optional list of tags for this memory */
+            tags?: string[];
         }
     ): Promise<RetainResponse> {
         const item: {
@@ -111,6 +113,7 @@ export class HindsightClient {
             metadata?: Record<string, string>;
             document_id?: string;
             entities?: EntityInput[];
+            tags?: string[];
         } = { content };
         if (options?.timestamp) {
             item.timestamp =
@@ -129,6 +132,9 @@ export class HindsightClient {
         }
         if (options?.entities) {
             item.entities = options.entities;
+        }
+        if (options?.tags) {
+            item.tags = options.tags;
         }
 
         const response = await sdk.retainMemories({

@@ -115,6 +115,7 @@ class Hindsight:
         document_id: Optional[str] = None,
         metadata: Optional[Dict[str, str]] = None,
         entities: Optional[List[Dict[str, str]]] = None,
+        tags: Optional[List[str]] = None,
     ) -> RetainResponse:
         """
         Store a single memory (simplified interface).
@@ -127,13 +128,14 @@ class Hindsight:
             document_id: Optional document ID for grouping
             metadata: Optional user-defined metadata
             entities: Optional list of entities [{"text": "...", "type": "..."}]
+            tags: Optional list of tags for this memory
 
         Returns:
             RetainResponse with success status
         """
         return self.retain_batch(
             bank_id=bank_id,
-            items=[{"content": content, "timestamp": timestamp, "context": context, "metadata": metadata, "entities": entities}],
+            items=[{"content": content, "timestamp": timestamp, "context": context, "metadata": metadata, "entities": entities, "tags": tags}],
             document_id=document_id,
         )
 
@@ -143,15 +145,17 @@ class Hindsight:
         items: List[Dict[str, Any]],
         document_id: Optional[str] = None,
         retain_async: bool = False,
+        document_tags: Optional[List[str]] = None,
     ) -> RetainResponse:
         """
         Store multiple memories in batch.
 
         Args:
             bank_id: The memory bank ID
-            items: List of memory items with 'content' and optional 'timestamp', 'context', 'metadata', 'document_id', 'entities'
+            items: List of memory items with 'content' and optional 'timestamp', 'context', 'metadata', 'document_id', 'entities', 'tags'
             document_id: Optional document ID for grouping memories (applied to items that don't have their own)
             retain_async: If True, process asynchronously in background (default: False)
+            document_tags: Optional list of tags to apply to all memories in this batch
 
         Returns:
             RetainResponse with success status and item count
@@ -175,12 +179,14 @@ class Hindsight:
                     # Use item's document_id if provided, otherwise fall back to batch-level document_id
                     document_id=item.get("document_id") or document_id,
                     entities=entities,
+                    tags=item.get("tags"),
                 )
             )
 
         request_obj = retain_request.RetainRequest(
             items=memory_items,
             async_=retain_async,
+            document_tags=document_tags,
         )
 
         return _run_async(self._memory_api.retain_memories(bank_id, request_obj))
