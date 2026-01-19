@@ -255,10 +255,10 @@ List mental models matching specific tags:
 
 | Option | Description |
 |--------|-------------|
-| `any` | Match models with any of the specified tags, including untagged models |
-| `all` | Match models with all of the specified tags, including untagged models |
-| `any_strict` | Match models with any of the specified tags, excluding untagged models |
-| `all_strict` | Match models with all of the specified tags, excluding untagged models |
+| `any` | OR match: model has no tags OR model has at least one overlapping tag |
+| `all` | AND match: model has no tags OR model has all the specified tags |
+| `any_strict` | OR match: model must have at least one overlapping tag (excludes untagged) |
+| `all_strict` | AND match: model must have all the specified tags (excludes untagged) |
 
 ---
 

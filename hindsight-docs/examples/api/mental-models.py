@@ -12,6 +12,14 @@ client.set_mission(
 # [/docs:mm-set-mission]
 
 
+# [docs:mm-set-mission-alt]
+client.set_mission(
+    bank_id="pm-agent",
+    mission="Be a PM for the engineering team, tracking sprint progress, team capacity, and technical decisions"
+)
+# [/docs:mm-set-mission-alt]
+
+
 # [docs:mm-list]
 # List all mental models
 models = client.list_mental_models(bank_id="my-agent")
@@ -74,6 +82,28 @@ directive = client.create_mental_model(
 # [/docs:mm-create]
 
 
+# [docs:mm-pinned]
+client.create_mental_model(
+    bank_id="my-agent",
+    name="Product Roadmap",
+    description="Track product priorities and feature decisions"
+)
+# [/docs:mm-pinned]
+
+
+# [docs:mm-directive]
+client.create_mental_model(
+    bank_id="support-agent",
+    name="Response Guidelines",
+    subtype="directive",
+    observations=[
+        {"title": "Always respond in French", "content": "All responses must be in French"},
+        {"title": "Never mention competitors", "content": "Do not reference competitor products"}
+    ]
+)
+# [/docs:mm-directive]
+
+
 # [docs:mm-delete]
 client.delete_mental_model(bank_id="my-agent", model_id="old-model")
 # [/docs:mm-delete]
@@ -95,6 +125,18 @@ client.refresh_mental_models(bank_id="my-agent", tags=["user_alice"])
 # [/docs:mm-refresh]
 
 
+# [docs:mm-refresh-simple]
+# Refresh all mental models
+client.refresh_mental_models(bank_id="my-agent")
+
+# Refresh only structural models
+client.refresh_mental_models(bank_id="my-agent", subtype="structural")
+
+# Refresh a single mental model
+client.refresh_mental_model(bank_id="my-agent", model_id="alice")
+# [/docs:mm-refresh-simple]
+
+
 # [docs:mm-refresh-single]
 result = client.refresh_mental_model(bank_id="my-agent", model_id="alice")
 print(f"Operation ID: {result.operation_id}")
@@ -111,6 +153,18 @@ if not model.freshness.is_up_to_date:
     # Trigger refresh
     client.refresh_mental_model(bank_id="my-agent", model_id="alice")
 # [/docs:mm-freshness]
+
+
+# [docs:mm-freshness-check]
+model = client.get_mental_model(bank_id="my-agent", model_id="alice")
+print(model.freshness)
+# {
+#   "is_up_to_date": false,
+#   "last_refresh_at": "2025-12-01T10:30:00Z",
+#   "memories_since_refresh": 47,
+#   "reasons": ["new_memories", "mission_changed"]
+# }
+# [/docs:mm-freshness-check]
 
 
 # [docs:mm-versions]
@@ -132,6 +186,15 @@ v2 = client.get_mental_model_version(
 
 print(f"Observations at v2: {len(v2.observations)}")
 # [/docs:mm-versions]
+
+
+# [docs:mm-versions-simple]
+# List all versions
+versions = client.list_mental_model_versions(bank_id="my-agent", model_id="alice")
+
+# Get specific historical version
+v2 = client.get_mental_model_version(bank_id="my-agent", model_id="alice", version=2)
+# [/docs:mm-versions-simple]
 
 
 # [docs:mm-tags-refresh]
@@ -182,3 +245,25 @@ response = client.reflect(
     tags_match="any"
 )
 # [/docs:mm-reflect]
+
+
+# [docs:mm-tags-scoping]
+# Create models for a specific user
+client.refresh_mental_models(bank_id="my-agent", tags=["user_alice"])
+
+# Create a directive scoped to a user
+client.create_mental_model(
+    bank_id="my-agent",
+    name="Alice's Guidelines",
+    subtype="directive",
+    tags=["user_alice"],
+    observations=[{"title": "Prefer detailed explanations", "content": "Alice prefers thorough explanations"}]
+)
+
+# Reflect using only Alice's context
+response = client.reflect(
+    bank_id="my-agent",
+    query="What should I focus on?",
+    tags=["user_alice"]
+)
+# [/docs:mm-tags-scoping]
