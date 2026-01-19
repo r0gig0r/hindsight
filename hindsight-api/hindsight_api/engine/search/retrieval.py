@@ -446,15 +446,16 @@ async def retrieve_temporal_combined(
             visited.add(unit_id)
 
             # Calculate temporal proximity
+            # Priority: mentioned_at (user-provided) > occurred_start/end (LLM-extracted)
             best_date = None
-            if ep["occurred_start"] is not None and ep["occurred_end"] is not None:
+            if ep["mentioned_at"] is not None:
+                best_date = ep["mentioned_at"]
+            elif ep["occurred_start"] is not None and ep["occurred_end"] is not None:
                 best_date = ep["occurred_start"] + (ep["occurred_end"] - ep["occurred_start"]) / 2
             elif ep["occurred_start"] is not None:
                 best_date = ep["occurred_start"]
             elif ep["occurred_end"] is not None:
                 best_date = ep["occurred_end"]
-            elif ep["mentioned_at"] is not None:
-                best_date = ep["mentioned_at"]
 
             if best_date:
                 days_from_mid = abs((best_date - mid_date).total_seconds() / 86400)
@@ -515,15 +516,16 @@ async def retrieve_temporal_combined(
                 parent_id = str(n["from_unit_id"])
                 _, parent_temporal_score = node_scores.get(parent_id, (0.5, 0.5))
 
+                # Priority: mentioned_at (user-provided) > occurred_start/end (LLM-extracted)
                 neighbor_best_date = None
-                if n["occurred_start"] is not None and n["occurred_end"] is not None:
+                if n["mentioned_at"] is not None:
+                    neighbor_best_date = n["mentioned_at"]
+                elif n["occurred_start"] is not None and n["occurred_end"] is not None:
                     neighbor_best_date = n["occurred_start"] + (n["occurred_end"] - n["occurred_start"]) / 2
                 elif n["occurred_start"] is not None:
                     neighbor_best_date = n["occurred_start"]
                 elif n["occurred_end"] is not None:
                     neighbor_best_date = n["occurred_end"]
-                elif n["mentioned_at"] is not None:
-                    neighbor_best_date = n["mentioned_at"]
 
                 if neighbor_best_date:
                     days_from_mid = abs((neighbor_best_date - mid_date).total_seconds() / 86400)
@@ -651,17 +653,17 @@ async def retrieve_temporal(
         visited.add(unit_id)
 
         # Calculate temporal proximity using the most relevant date
-        # Priority: occurred_start/end (event time) > mentioned_at (mention time)
+        # Priority: mentioned_at (user-provided) > occurred_start/end (LLM-extracted)
         best_date = None
-        if ep["occurred_start"] is not None and ep["occurred_end"] is not None:
+        if ep["mentioned_at"] is not None:
+            best_date = ep["mentioned_at"]
+        elif ep["occurred_start"] is not None and ep["occurred_end"] is not None:
             # Use midpoint of occurred range
             best_date = ep["occurred_start"] + (ep["occurred_end"] - ep["occurred_start"]) / 2
         elif ep["occurred_start"] is not None:
             best_date = ep["occurred_start"]
         elif ep["occurred_end"] is not None:
             best_date = ep["occurred_end"]
-        elif ep["mentioned_at"] is not None:
-            best_date = ep["mentioned_at"]
 
         # Temporal proximity score (closer to range center = higher score)
         if best_date:
@@ -725,15 +727,16 @@ async def retrieve_temporal(
             _, parent_temporal_score = node_scores.get(parent_id, (0.5, 0.5))
 
             # Calculate temporal score for neighbor using best available date
+            # Priority: mentioned_at (user-provided) > occurred_start/end (LLM-extracted)
             neighbor_best_date = None
-            if n["occurred_start"] is not None and n["occurred_end"] is not None:
+            if n["mentioned_at"] is not None:
+                neighbor_best_date = n["mentioned_at"]
+            elif n["occurred_start"] is not None and n["occurred_end"] is not None:
                 neighbor_best_date = n["occurred_start"] + (n["occurred_end"] - n["occurred_start"]) / 2
             elif n["occurred_start"] is not None:
                 neighbor_best_date = n["occurred_start"]
             elif n["occurred_end"] is not None:
                 neighbor_best_date = n["occurred_end"]
-            elif n["mentioned_at"] is not None:
-                neighbor_best_date = n["mentioned_at"]
 
             if neighbor_best_date:
                 days_from_mid = abs((neighbor_best_date - mid_date).total_seconds() / 86400)
@@ -1058,15 +1061,16 @@ async def _get_temporal_entry_points(
         result = RetrievalResult.from_db_row(dict(row))
 
         # Calculate temporal proximity score
+        # Priority: mentioned_at (user-provided) > occurred_start/end (LLM-extracted)
         best_date = None
-        if row["occurred_start"] and row["occurred_end"]:
+        if row["mentioned_at"]:
+            best_date = row["mentioned_at"]
+        elif row["occurred_start"] and row["occurred_end"]:
             best_date = row["occurred_start"] + (row["occurred_end"] - row["occurred_start"]) / 2
         elif row["occurred_start"]:
             best_date = row["occurred_start"]
         elif row["occurred_end"]:
             best_date = row["occurred_end"]
-        elif row["mentioned_at"]:
-            best_date = row["mentioned_at"]
 
         if best_date:
             days_from_mid = abs((best_date - mid_date).total_seconds() / 86400)
