@@ -428,6 +428,9 @@ describe('TestMentalModels', () => {
 
     test('create pinned mental model', async () => {
         const bankId = randomBankId();
+        // Create bank first (required for mental models)
+        await client.createBank(bankId, {});
+
         const response = await client.createMentalModel(bankId, {
             name: 'Product Roadmap',
             description: 'Track product priorities and feature decisions',
@@ -443,6 +446,9 @@ describe('TestMentalModels', () => {
 
     test('create directive mental model', async () => {
         const bankId = randomBankId();
+        // Create bank first (required for mental models)
+        await client.createBank(bankId, {});
+
         const response = await client.createMentalModel(bankId, {
             name: 'Response Guidelines',
             description: 'Rules for responding to users',
@@ -463,6 +469,8 @@ describe('TestMentalModels', () => {
 
     test('list mental models', async () => {
         const bankId = randomBankId();
+        // Create bank first (required for mental models)
+        await client.createBank(bankId, {});
 
         // Create a model first
         await client.createMentalModel(bankId, {
@@ -480,6 +488,8 @@ describe('TestMentalModels', () => {
 
     test('get mental model', async () => {
         const bankId = randomBankId();
+        // Create bank first (required for mental models)
+        await client.createBank(bankId, {});
 
         // Create a model first
         const created = await client.createMentalModel(bankId, {
@@ -497,6 +507,8 @@ describe('TestMentalModels', () => {
 
     test('update mental model', async () => {
         const bankId = randomBankId();
+        // Create bank first (required for mental models)
+        await client.createBank(bankId, {});
 
         // Create a model first
         const created = await client.createMentalModel(bankId, {
@@ -517,6 +529,8 @@ describe('TestMentalModels', () => {
 
     test('delete mental model', async () => {
         const bankId = randomBankId();
+        // Create bank first (required for mental models)
+        await client.createBank(bankId, {});
 
         // Create a model first
         const created = await client.createMentalModel(bankId, {
@@ -532,7 +546,7 @@ describe('TestMentalModels', () => {
     test('refresh mental models', async () => {
         const bankId = randomBankId();
 
-        // Set mission first (required for refresh)
+        // Set mission first (required for refresh) - this also creates the bank
         await client.setMission(bankId, 'Track team progress and decisions');
 
         const response = await client.refreshMentalModels(bankId, {
@@ -541,11 +555,13 @@ describe('TestMentalModels', () => {
 
         expect(response).not.toBeNull();
         expect(response.operation_id).toBeDefined();
-        expect(response.status).toBe('pending');
+        expect(response.status).toBe('queued');
     });
 
     test('refresh mental model', async () => {
         const bankId = randomBankId();
+        // Create bank first (required for mental models)
+        await client.createBank(bankId, {});
 
         // Create a model first
         const created = await client.createMentalModel(bankId, {
@@ -558,11 +574,13 @@ describe('TestMentalModels', () => {
 
         expect(response).not.toBeNull();
         expect(response.operation_id).toBeDefined();
-        expect(response.status).toBe('pending');
+        expect(response.status).toBe('queued');
     });
 
     test('list mental model versions', async () => {
         const bankId = randomBankId();
+        // Create bank first (required for mental models)
+        await client.createBank(bankId, {});
 
         // Create a model first
         const created = await client.createMentalModel(bankId, {

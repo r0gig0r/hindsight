@@ -391,7 +391,7 @@ export class HindsightClient {
     }
 
     /**
-     * Update a mental model's name, description, or observations.
+     * Update a mental model's name and/or description.
      */
     async updateMentalModel(
         bankId: string,
@@ -399,7 +399,6 @@ export class HindsightClient {
         options: {
             name?: string;
             description?: string;
-            observations?: Array<{ title: string; content: string }>;
         }
     ): Promise<MentalModelResponse> {
         const response = await sdk.updateMentalModel({
@@ -408,7 +407,6 @@ export class HindsightClient {
             body: {
                 name: options.name,
                 description: options.description,
-                observations: options.observations,
             },
         });
 

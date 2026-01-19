@@ -450,32 +450,24 @@ class Hindsight:
         model_id: str,
         name: Optional[str] = None,
         description: Optional[str] = None,
-        observations: Optional[List[Dict[str, str]]] = None,
     ) -> MentalModelResponse:
         """
-        Update a mental model's name, description, or observations.
+        Update a mental model's name and/or description.
 
         Args:
             bank_id: The memory bank ID
             model_id: The mental model ID
             name: Optional new name
             description: Optional new description
-            observations: Optional new observations (for directives)
 
         Returns:
             MentalModelResponse with updated mental model
         """
         from hindsight_client_api.models.update_mental_model_request import UpdateMentalModelRequest
-        from hindsight_client_api.models.observation_input import ObservationInput
-
-        obs_list = None
-        if observations is not None:
-            obs_list = [ObservationInput(title=o.get("title", ""), content=o.get("content", "")) for o in observations]
 
         request_obj = UpdateMentalModelRequest(
             name=name,
             description=description,
-            observations=obs_list,
         )
         return _run_async(self._mental_models_api.update_mental_model(
             bank_id=bank_id,

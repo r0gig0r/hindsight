@@ -562,6 +562,9 @@ class TestMentalModels:
 
     def test_create_pinned_mental_model(self, client, bank_id):
         """Test creating a pinned mental model."""
+        # Create bank first (required for mental models)
+        client.create_bank(bank_id=bank_id)
+
         response = client.create_mental_model(
             bank_id=bank_id,
             name="Product Roadmap",
@@ -577,6 +580,9 @@ class TestMentalModels:
 
     def test_create_directive_mental_model(self, client, bank_id):
         """Test creating a directive mental model with observations."""
+        # Create bank first (required for mental models)
+        client.create_bank(bank_id=bank_id)
+
         response = client.create_mental_model(
             bank_id=bank_id,
             name="Response Guidelines",
@@ -597,6 +603,9 @@ class TestMentalModels:
 
     def test_list_mental_models(self, client, bank_id):
         """Test listing mental models."""
+        # Create bank first (required for mental models)
+        client.create_bank(bank_id=bank_id)
+
         # Create a model first
         client.create_mental_model(
             bank_id=bank_id,
@@ -613,6 +622,9 @@ class TestMentalModels:
 
     def test_get_mental_model(self, client, bank_id):
         """Test getting a specific mental model."""
+        # Create bank first (required for mental models)
+        client.create_bank(bank_id=bank_id)
+
         # Create a model first
         created = client.create_mental_model(
             bank_id=bank_id,
@@ -632,6 +644,9 @@ class TestMentalModels:
 
     def test_update_mental_model(self, client, bank_id):
         """Test updating a mental model."""
+        # Create bank first (required for mental models)
+        client.create_bank(bank_id=bank_id)
+
         # Create a model first
         created = client.create_mental_model(
             bank_id=bank_id,
@@ -653,6 +668,9 @@ class TestMentalModels:
 
     def test_delete_mental_model(self, client, bank_id):
         """Test deleting a mental model."""
+        # Create bank first (required for mental models)
+        client.create_bank(bank_id=bank_id)
+
         # Create a model first
         created = client.create_mental_model(
             bank_id=bank_id,
@@ -671,7 +689,7 @@ class TestMentalModels:
 
     def test_refresh_mental_models(self, client, bank_id):
         """Test refreshing all mental models (async operation)."""
-        # Set mission first (required for refresh)
+        # Set mission first (required for refresh) - this also creates the bank
         client.set_mission(
             bank_id=bank_id,
             mission="Track team progress and decisions",
@@ -684,10 +702,13 @@ class TestMentalModels:
 
         assert response is not None
         assert response.operation_id is not None
-        assert response.status == "pending"
+        assert response.status == "queued"
 
     def test_refresh_mental_model(self, client, bank_id):
         """Test refreshing a single mental model (async operation)."""
+        # Create bank first (required for mental models)
+        client.create_bank(bank_id=bank_id)
+
         # Create a model first
         created = client.create_mental_model(
             bank_id=bank_id,
@@ -703,10 +724,13 @@ class TestMentalModels:
 
         assert response is not None
         assert response.operation_id is not None
-        assert response.status == "pending"
+        assert response.status == "queued"
 
     def test_list_mental_model_versions(self, client, bank_id):
         """Test listing mental model versions."""
+        # Create bank first (required for mental models)
+        client.create_bank(bank_id=bank_id)
+
         # Create a model first
         created = client.create_mental_model(
             bank_id=bank_id,
