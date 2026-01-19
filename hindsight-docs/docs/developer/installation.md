@@ -36,8 +36,6 @@ See [Models](./models) for detailed comparison and configuration.
 
 **Best for**: Quick start, development, small deployments
 
-### Single Container (Quickest)
-
 Run everything in one container with embedded PostgreSQL:
 
 ```bash
@@ -85,54 +83,17 @@ helm upgrade hindsight oci://ghcr.io/vectorize-io/charts/hindsight
 
 ### Distributed Workers
 
-For high-throughput deployments, you can scale task processing independently from the API using dedicated worker pods. Workers poll PostgreSQL for pending tasks using `FOR UPDATE SKIP LOCKED` for safe concurrent claiming.
+For high-throughput deployments, enable dedicated worker pods to scale task processing independently:
 
 ```bash
-# Enable distributed workers (disables internal worker in API)
 helm install hindsight oci://ghcr.io/vectorize-io/charts/hindsight \
   --set worker.enabled=true \
   --set worker.replicaCount=3
 ```
 
-**Architecture**:
-- **Standalone mode** (default): API handles everything (requests + task processing)
-- **Distributed mode**: API only handles requests, dedicated workers process tasks
+See [Services - Worker Service](./services#worker-service) for configuration details and architecture.
 
-When `worker.enabled=true`:
-- Workers are deployed as a StatefulSet (stable pod names used as worker IDs)
-- API automatically has `HINDSIGHT_API_WORKER_ENABLED=false`
-- Workers inherit LLM config from `api.env` and `api.secrets`
-- Each worker exposes `/metrics` and `/health` endpoints for monitoring
-
-**Worker Configuration**:
-
-```yaml
-worker:
-  enabled: true
-  replicaCount: 3
-  env:
-    HINDSIGHT_API_WORKER_POLL_INTERVAL_MS: "500"   # Polling interval
-    HINDSIGHT_API_WORKER_BATCH_SIZE: "10"          # Tasks per poll
-    HINDSIGHT_API_WORKER_MAX_RETRIES: "3"          # Max retries before failing
-  resources:
-    requests:
-      cpu: 500m
-      memory: 1Gi
-    limits:
-      cpu: 2000m
-      memory: 4Gi
-```
-
-**Crash Recovery**:
-
-If a worker crashes while processing tasks, those tasks remain in "processing" status. Use the admin CLI to release them:
-
-```bash
-# Release tasks from a crashed worker
-hindsight-admin decommission-worker hindsight-worker-2
-```
-
-See the [Helm chart documentation](https://github.com/vectorize-io/hindsight/tree/main/helm) for advanced configuration.
+See the [Helm chart values.yaml](https://github.com/vectorize-io/hindsight/tree/main/helm/hindsight/values.yaml) for all chart options.
 
 ---
 
