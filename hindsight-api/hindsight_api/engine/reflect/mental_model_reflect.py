@@ -423,16 +423,17 @@ async def run_mental_model_reflect(
     contradicted_observations: list[str] = []
     total_usage = PhaseTokenUsage()  # Aggregate token usage across all phases
 
-    logger.info(
-        f"[MM-REFLECT {reflect_id}] Starting diff-based reflect for mental model '{mental_model_name}' "
-        f"({len(existing_observations)} existing observations)"
-    )
+    # Log buffer for clean single-line output
+    log_buffer: list[str] = []
+    log_buffer.append(f"[MM-REFLECT {reflect_id}] model='{mental_model_name}', existing={len(existing_observations)}")
+
+    # Phase timing tracking
+    phase_timings: dict[str, int] = {}
 
     # ==========================================================================
     # PHASE 0: UPDATE EXISTING (if there are existing observations)
     # ==========================================================================
     if existing_observations:
-        logger.info(f"[MM-REFLECT {reflect_id}] Phase 0: UPDATE EXISTING - Searching for new evidence")
         phase0_start = time.time()
 
         update_result = await _run_update_existing_phase(
@@ -446,23 +447,24 @@ async def run_mental_model_reflect(
         total_usage = total_usage + update_result.token_usage
 
         phase0_duration = int((time.time() - phase0_start) * 1000)
-        logger.info(
-            f"[MM-REFLECT {reflect_id}] Phase 0 complete: "
-            f"{len(updated_existing)} observations updated, "
-            f"{len(contradicted_observations)} flagged for removal ({phase0_duration}ms)"
+        phase_timings["p0_update"] = phase0_duration
+        log_buffer.append(
+            f"p0_update={phase0_duration}ms ({len(updated_existing)} upd, {len(contradicted_observations)} contra)"
         )
         phases_completed.append("update_existing")
 
     # ==========================================================================
     # PHASE 1: SEED (with existing observations context)
     # ==========================================================================
-    logger.info(f"[MM-REFLECT {reflect_id}] Phase 1: SEED - Getting diverse memories")
     phase1_start = time.time()
 
     # Get diverse memory sample
     seed_memories = await get_diverse_memories_fn()
     if not seed_memories:
-        logger.warning(f"[MM-REFLECT {reflect_id}] No memories found for seeding")
+        total_duration = int((time.time() - start_time) * 1000)
+        log_buffer.append(f"p1_seed=EMPTY (no memories) | total={total_duration}ms")
+        logger.info(" | ".join(log_buffer))
+
         # Return updated existing observations if we have them
         if updated_existing:
             return MentalModelReflectResult(
@@ -473,14 +475,14 @@ async def run_mental_model_reflect(
                     "updated": len(updated_existing),
                 },
                 phases_completed=phases_completed + ["seed_empty"],
-                duration_ms=int((time.time() - start_time) * 1000),
+                duration_ms=total_duration,
             )
         return MentalModelReflectResult(
             observations=[_dict_to_observation(obs) for obs in existing_observations],
             version=current_version + 1,  # Always increment version when refresh runs
             changes={"note": "No memories available for analysis"},
             phases_completed=["seed_empty"],
-            duration_ms=int((time.time() - start_time) * 1000),
+            duration_ms=total_duration,
         )
 
     # Generate NEW candidate observations (pass existing to avoid rediscovering them)
@@ -496,14 +498,18 @@ async def run_mental_model_reflect(
     total_usage = total_usage + seed_result.token_usage
 
     phase1_duration = int((time.time() - phase1_start) * 1000)
-    logger.info(
-        f"[MM-REFLECT {reflect_id}] Phase 1 complete: {len(candidates)} NEW candidates from {len(seed_memories)} memories ({phase1_duration}ms)"
-    )
+    phase_timings["p1_seed"] = phase1_duration
+    log_buffer.append(f"p1_seed={phase1_duration}ms ({len(candidates)} cand from {len(seed_memories)} mem)")
     phases_completed.append("seed")
 
     # If no new candidates but we updated existing, return those
     if not candidates and updated_existing:
-        logger.info(f"[MM-REFLECT {reflect_id}] No new patterns found, returning updated existing observations")
+        total_duration = int((time.time() - start_time) * 1000)
+        log_buffer.append(
+            f"total={total_duration}ms | tokens={total_usage.total_tokens} | v{current_version}→v{current_version + 1} (no new patterns)"
+        )
+        logger.info(" | ".join(log_buffer))
+
         return MentalModelReflectResult(
             observations=[_dict_to_observation(obs) for obs in updated_existing],
             version=current_version + 1,
@@ -513,7 +519,7 @@ async def run_mental_model_reflect(
                 "contradicted": contradicted_observations,
             },
             phases_completed=phases_completed,
-            duration_ms=int((time.time() - start_time) * 1000),
+            duration_ms=total_duration,
             memories_analyzed=len(seed_memories),
             input_tokens=total_usage.input_tokens,
             output_tokens=total_usage.output_tokens,
@@ -522,13 +528,18 @@ async def run_mental_model_reflect(
 
     # If no candidates and no existing, return empty
     if not candidates:
-        logger.warning(f"[MM-REFLECT {reflect_id}] No candidates generated in seed phase")
+        total_duration = int((time.time() - start_time) * 1000)
+        log_buffer.append(
+            f"total={total_duration}ms | tokens={total_usage.total_tokens} | v{current_version}→v{current_version + 1} (no candidates)"
+        )
+        logger.info(" | ".join(log_buffer))
+
         return MentalModelReflectResult(
             observations=[_dict_to_observation(obs) for obs in existing_observations],
             version=current_version + 1,  # Always increment version when refresh runs
             changes={"note": "No candidate observations could be generated"},
             phases_completed=phases_completed,
-            duration_ms=int((time.time() - start_time) * 1000),
+            duration_ms=total_duration,
             memories_analyzed=len(seed_memories),
             input_tokens=total_usage.input_tokens,
             output_tokens=total_usage.output_tokens,
@@ -538,7 +549,6 @@ async def run_mental_model_reflect(
     # ==========================================================================
     # PHASE 2: EVIDENCE HUNT (for new candidates only)
     # ==========================================================================
-    logger.info(f"[MM-REFLECT {reflect_id}] Phase 2: EVIDENCE HUNT - Searching for evidence")
     phase2_start = time.time()
 
     candidates_with_evidence = await _run_evidence_hunt_phase(
@@ -548,15 +558,13 @@ async def run_mental_model_reflect(
     )
 
     phase2_duration = int((time.time() - phase2_start) * 1000)
-    logger.info(
-        f"[MM-REFLECT {reflect_id}] Phase 2 complete: Evidence gathered for {len(candidates_with_evidence)} candidates ({phase2_duration}ms)"
-    )
+    phase_timings["p2_evidence"] = phase2_duration
+    log_buffer.append(f"p2_evidence={phase2_duration}ms ({len(candidates_with_evidence)}/{len(candidates)} proc)")
     phases_completed.append("evidence_hunt")
 
     # ==========================================================================
     # PHASE 3: VALIDATE & REFINE (for new candidates only)
     # ==========================================================================
-    logger.info(f"[MM-REFLECT {reflect_id}] Phase 3: VALIDATE - Validating candidates")
     phase3_start = time.time()
 
     validate_result = await _run_validate_phase(
@@ -568,15 +576,13 @@ async def run_mental_model_reflect(
     total_usage = total_usage + validate_result.token_usage
 
     phase3_duration = int((time.time() - phase3_start) * 1000)
-    logger.info(
-        f"[MM-REFLECT {reflect_id}] Phase 3 complete: {len(validated_observations)} observations validated ({phase3_duration}ms)"
-    )
+    phase_timings["p3_validate"] = phase3_duration
+    log_buffer.append(f"p3_validate={phase3_duration}ms ({len(validated_observations)} valid)")
     phases_completed.append("validate")
 
     # ==========================================================================
     # PHASE 4: COMPARE & MERGE
     # ==========================================================================
-    logger.info(f"[MM-REFLECT {reflect_id}] Phase 4: COMPARE - Merging updated existing + new observations")
     phase4_start = time.time()
 
     # Use updated existing (with new evidence) instead of original existing
@@ -597,9 +603,8 @@ async def run_mental_model_reflect(
         changes["contradicted"] = contradicted_observations
 
     phase4_duration = int((time.time() - phase4_start) * 1000)
-    logger.info(
-        f"[MM-REFLECT {reflect_id}] Phase 4 complete: {len(final_observations)} final observations ({phase4_duration}ms)"
-    )
+    phase_timings["p4_compare"] = phase4_duration
+    log_buffer.append(f"p4_compare={phase4_duration}ms ({len(final_observations)} final)")
     phases_completed.append("compare")
 
     # ==========================================================================
@@ -608,12 +613,11 @@ async def run_mental_model_reflect(
     total_duration = int((time.time() - start_time) * 1000)
     new_version = current_version + 1
 
-    logger.info(
-        f"[MM-REFLECT {reflect_id}] Complete: "
-        f"v{current_version}→v{new_version}, "
-        f"{len(final_observations)} observations, "
-        f"{total_duration}ms total"
+    # Final summary
+    log_buffer.append(
+        f"total={total_duration}ms | tokens={total_usage.total_tokens} | v{current_version}→v{new_version}"
     )
+    logger.info(" | ".join(log_buffer))
 
     return MentalModelReflectResult(
         observations=final_observations,
@@ -789,7 +793,7 @@ async def _run_update_existing_phase(
     has_new_evidence = any(result.supporting_memories or result.contradicting_memories for result in valid_results)
 
     if not has_new_evidence:
-        logger.info(f"[MM-REFLECT {reflect_id}] No new evidence found for existing observations")
+        logger.debug(f"[MM-REFLECT {reflect_id}] No new evidence found for existing observations")
         return UpdateExistingResult(updated_observations=existing_observations)
 
     # Build prompt data for LLM
@@ -826,7 +830,7 @@ async def _run_update_existing_phase(
         parsed_response = _parse_update_existing_response(response, reflect_id)
 
         if not parsed_response.updated_observations:
-            logger.info(f"[MM-REFLECT {reflect_id}] No updated observations in LLM response")
+            logger.debug(f"[MM-REFLECT {reflect_id}] No updated observations in LLM response")
             return UpdateExistingResult(updated_observations=existing_observations, token_usage=usage)
 
         # Build memory content map for quote verification
@@ -853,7 +857,7 @@ async def _run_update_existing_phase(
             if updated.has_contradiction:
                 title = original_obs.get("title", f"Observation {i + 1}")
                 contradicted_titles.append(title)
-                logger.info(f"[MM-REFLECT {reflect_id}] Observation '{title}' flagged for contradiction")
+                logger.debug(f"[MM-REFLECT {reflect_id}] Observation '{title}' flagged for contradiction")
 
             # Verify and add new evidence
             existing_evidence = original_obs.get("evidence", [])
@@ -893,7 +897,7 @@ async def _run_update_existing_phase(
         for i in range(len(parsed_response.updated_observations), len(existing_observations)):
             updated_observations.append(existing_observations[i])
 
-        logger.info(
+        logger.debug(
             f"[MM-REFLECT {reflect_id}] Updated {len(updated_observations)} observations, "
             f"added {total_new_evidence} new evidence items"
         )
@@ -913,19 +917,25 @@ async def _run_evidence_hunt_phase(
     candidates: list[CandidateObservation],
     recall_fn: Callable[[str, int], Awaitable[dict[str, Any]]],
     reflect_id: str,
+    max_concurrent_recalls: int = 6,
 ) -> list[CandidateWithEvidence]:
     """Phase 2: For each candidate, search for supporting and contradicting evidence."""
-    results: list[CandidateWithEvidence] = []
+    # Semaphore to limit concurrent recalls and prevent DB connection exhaustion
+    recall_semaphore = asyncio.Semaphore(max_concurrent_recalls)
 
-    # Run evidence searches in parallel for all candidates
+    async def throttled_recall(query: str, max_tokens: int) -> dict[str, Any]:
+        async with recall_semaphore:
+            return await recall_fn(query, max_tokens)
+
+    # Run evidence searches in parallel for all candidates (with throttling)
     async def search_evidence_for_candidate(candidate: CandidateObservation) -> CandidateWithEvidence:
         # Search for supporting evidence
         supporting_query = f"evidence supporting: {candidate.content}"
         contradicting_query = f"evidence against: {candidate.content}"
 
         supporting_result, contradicting_result = await asyncio.gather(
-            recall_fn(supporting_query, 2048),
-            recall_fn(contradicting_query, 2048),
+            throttled_recall(supporting_query, 2048),
+            throttled_recall(contradicting_query, 2048),
             return_exceptions=True,
         )
 
@@ -943,14 +953,13 @@ async def _run_evidence_hunt_phase(
             contradicting_memories=contradicting_memories,
         )
 
-    # Run all searches in parallel
+    # Run all searches in parallel (throttled by semaphore)
     tasks = [search_evidence_for_candidate(c) for c in candidates]
     gather_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Filter out exceptions
     valid_results: list[CandidateWithEvidence] = [r for r in gather_results if isinstance(r, CandidateWithEvidence)]
 
-    logger.info(f"[MM-REFLECT {reflect_id}] Evidence hunt: {len(valid_results)}/{len(candidates)} candidates processed")
     return valid_results
 
 

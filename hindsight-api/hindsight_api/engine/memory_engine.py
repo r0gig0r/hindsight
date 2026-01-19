@@ -1598,6 +1598,7 @@ class MemoryEngine(MemoryEngineInterface):
         tags: list[str] | None = None,
         tags_match: TagsMatch = "any",
         _connection_budget: int | None = None,
+        _quiet: bool = False,
     ) -> RecallResultModel:
         """
         Recall memories using N*4-way parallel retrieval (N fact types × 4 retrieval methods).
@@ -1680,9 +1681,10 @@ class MemoryEngine(MemoryEngineInterface):
         effective_budget = budget if budget is not None else Budget.MID
         thinking_budget = budget_mapping[effective_budget]
 
-        # Log recall start with tags if present
-        tags_info = f", tags={tags} ({tags_match})" if tags else ""
-        logger.info(f"[RECALL {bank_id[:8]}] Starting recall for query: {query[:50]}...{tags_info}")
+        # Log recall start with tags if present (skip if quiet mode for internal operations)
+        if not _quiet:
+            tags_info = f", tags={tags} ({tags_match})" if tags else ""
+            logger.info(f"[RECALL {bank_id[:8]}] Starting recall for query: {query[:50]}...{tags_info}")
 
         # Backpressure: limit concurrent recalls to prevent overwhelming the database
         result = None
@@ -1711,6 +1713,7 @@ class MemoryEngine(MemoryEngineInterface):
                         tags=tags,
                         tags_match=tags_match,
                         connection_budget=_connection_budget,
+                        quiet=_quiet,
                     )
                     break  # Success - exit retry loop
                 except Exception as e:
@@ -1832,6 +1835,7 @@ class MemoryEngine(MemoryEngineInterface):
         tags: list[str] | None = None,
         tags_match: TagsMatch = "any",
         connection_budget: int | None = None,
+        quiet: bool = False,
     ) -> RecallResultModel:
         """
         Search implementation with modular retrieval and reranking.
@@ -2462,13 +2466,15 @@ class MemoryEngine(MemoryEngineInterface):
             log_buffer.append(
                 f"[RECALL {recall_id}] Complete: {len(top_scored)} facts ({total_tokens} tok), {num_chunks} chunks ({total_chunk_tokens} tok), {num_entities} entities ({total_entity_tokens} tok) | {fact_type_summary} | {total_time:.3f}s{wait_info}"
             )
-            logger.info("\n" + "\n".join(log_buffer))
+            if not quiet:
+                logger.info("\n" + "\n".join(log_buffer))
 
             return RecallResultModel(results=memory_facts, trace=trace_dict, entities=entities_dict, chunks=chunks_dict)
 
         except Exception as e:
             log_buffer.append(f"[RECALL {recall_id}] ERROR after {time.time() - recall_start:.3f}s: {str(e)}")
-            logger.error("\n" + "\n".join(log_buffer))
+            if not quiet:
+                logger.error("\n" + "\n".join(log_buffer))
             raise Exception(f"Failed to search memories: {str(e)}")
 
     def _filter_by_token_budget(
@@ -4257,7 +4263,7 @@ class MemoryEngine(MemoryEngineInterface):
                 return (model, None)
             return model
 
-        logger.info(
+        logger.debug(
             f"[MENTAL_MODELS] Refresh needed for '{model_id}': {', '.join(refresh_check.reasons)} "
             f"(memories: {total_memories})"
         )
@@ -4317,6 +4323,7 @@ class MemoryEngine(MemoryEngineInterface):
             return diverse_memories
 
         # Create callback for recall
+        # Use higher connection budget for mental model refresh since we run many parallel recalls
         async def recall_fn(query: str, max_tokens: int) -> dict:
             return await tool_recall(
                 self,
@@ -4326,6 +4333,7 @@ class MemoryEngine(MemoryEngineInterface):
                 max_tokens=max_tokens,
                 tags=model_tags,
                 tags_match="any" if model_tags else None,
+                connection_budget=2,  # Higher budget for parallel evidence hunting
             )
 
         with metrics.record_operation("mental_model_refresh_4phase", bank_id=bank_id, source="api"):
@@ -4633,7 +4641,7 @@ class MemoryEngine(MemoryEngineInterface):
                 except Exception as e:
                     logger.warning(f"[MENTAL_MODELS] Failed to create structural model {template.id}: {e}")
 
-        logger.info(f"[MENTAL_MODELS] Created/updated {created_count} structural models for bank {bank_id}")
+        logger.debug(f"[MENTAL_MODELS] Created/updated {created_count} structural models for bank {bank_id}")
         return models_to_remove
 
     async def _promote_entity_internal(

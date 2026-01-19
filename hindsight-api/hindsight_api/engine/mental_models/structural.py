@@ -181,7 +181,7 @@ async def derive_structural_models(
     )
 
     templates = result.templates
-    logger.info(f"[STRUCTURAL] LLM returned {len(templates)} structural models")
+    logger.debug(f"[STRUCTURAL] LLM returned {len(templates)} structural models")
 
     # Build set of existing IDs for quick lookup
     existing_ids = {m["id"] for m in existing_models} if existing_models else set()
@@ -196,7 +196,7 @@ async def derive_structural_models(
             # LLM is keeping an existing model
             kept_existing_ids.add(template.id)
             processed_templates.append(template)
-            logger.info(f"[STRUCTURAL] Keeping existing model: {template.id}")
+            logger.debug(f"[STRUCTURAL] Keeping existing model: {template.id}")
         else:
             # New model or LLM didn't return a valid ID
             # Generate ID from name
@@ -206,7 +206,7 @@ async def derive_structural_models(
             similar_id = _find_similar_existing_id(generated_id, existing_models)
             if similar_id and similar_id not in kept_existing_ids:
                 # Use the existing similar model instead of creating a new one
-                logger.info(f"[STRUCTURAL] Detected near-duplicate: '{generated_id}' matches existing '{similar_id}'")
+                logger.debug(f"[STRUCTURAL] Detected near-duplicate: '{generated_id}' matches existing '{similar_id}'")
                 template.id = similar_id
                 kept_existing_ids.add(similar_id)
             else:
@@ -219,10 +219,10 @@ async def derive_structural_models(
     if existing_models:
         for model in existing_models:
             if model["id"] not in kept_existing_ids:
-                logger.info(f"[STRUCTURAL] Marking '{model['name']}' (id={model['id']}) for removal")
+                logger.debug(f"[STRUCTURAL] Marking '{model['name']}' (id={model['id']}) for removal")
                 models_to_remove.append(model["id"])
 
     if models_to_remove:
-        logger.info(f"[STRUCTURAL] {len(models_to_remove)} existing models will be removed")
+        logger.debug(f"[STRUCTURAL] {len(models_to_remove)} existing models will be removed")
 
     return processed_templates, models_to_remove

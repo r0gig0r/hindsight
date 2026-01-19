@@ -16,7 +16,14 @@ import pydantic
 from hindsight_api.engine.llm_wrapper import LLMConfig
 from openai import AsyncOpenAI
 
-from benchmarks.common.benchmark_runner import BenchmarkDataset, BenchmarkRunner, LLMAnswerEvaluator, LLMAnswerGenerator
+from benchmarks.common.benchmark_runner import (
+    BenchmarkDataset,
+    BenchmarkRunner,
+    LLMAnswerEvaluator,
+    LLMAnswerGenerator,
+    ReflectAnswerGenerator,
+    setup_reflect_mode,
+)
 
 
 class LongMemEvalDataset(BenchmarkDataset):
@@ -332,6 +339,7 @@ The context contains memory facts extracted from previous conversations, each wi
         recall_result: Dict[str, Any],
         question_date: Optional[datetime] = None,
         question_type: Optional[str] = None,
+        bank_id: Optional[str] = None,
     ) -> Tuple[str, str, Optional[List[Dict[str, Any]]]]:
         """
         Generate answer from retrieved memories using Groq.
@@ -427,6 +435,8 @@ async def run_benchmark(
     results_filename: str = "benchmark_results.json",
     context_format: str = "json",
     source_results: str = None,
+    use_reflect: bool = False,
+    refresh_mental_models: bool = True,
 ):
     """
     Run the LongMemEval benchmark.
@@ -448,6 +458,8 @@ async def run_benchmark(
         results_filename: Filename for results (default: benchmark_results.json). Directory is fixed to results/.
         context_format: How to format context for answer generation. "json" (raw JSON) or "structured" (human-readable with facts+chunks).
         source_results: Source results file to read failed/invalid questions from (for --only-failed/--only-invalid). Defaults to benchmark_results.json.
+        use_reflect: If True, use the reflect API instead of recall+LLM for answering questions. This sets up a mission
+                     and refreshes mental models after ingestion.
     """
     from rich.console import Console
 
@@ -607,16 +619,29 @@ async def run_benchmark(
         else:
             console.print(f"[green]Found {total_found} {filter_type} items to re-evaluate[/green]")
 
-    answer_generator = LongMemEvalAnswerGenerator(context_format=context_format)
-    answer_evaluator = LLMAnswerEvaluator()
-
-    # Log context format being used
-    console.print(f"[blue]Context format: {context_format}[/blue]")
-
     # Create local memory engine
+    from hindsight_api.engine.memory_engine import Budget
+    from hindsight_api.models import RequestContext
+
     from benchmarks.common.benchmark_runner import create_memory_engine
 
     memory = await create_memory_engine()
+
+    # Select answer generator based on mode
+    if use_reflect:
+        console.print("[blue]Mode: reflect (using agentic reflect API)[/blue]")
+        # Reflect mode requires separate ingestion phase to set up mission and mental models once
+        # bank_id is passed dynamically through generate_answer, ensuring it matches the runner's agent_id
+        answer_generator = ReflectAnswerGenerator(
+            memory=memory,
+            budget=Budget.MID,
+        )
+    else:
+        answer_generator = LongMemEvalAnswerGenerator(context_format=context_format)
+        # Log context format being used
+        console.print(f"[blue]Context format: {context_format}[/blue]")
+
+    answer_evaluator = LLMAnswerEvaluator()
 
     # Filter by only_ingested: only run items whose memory bank already exists
     if only_ingested:
@@ -684,9 +709,20 @@ async def run_benchmark(
         or max_instances_per_category is not None
     )
 
+    # Reflect mode uses per-question banks (like traditional mode) to maintain isolation
+    # Each question only sees its own conversation context
+    if use_reflect:
+        separate_ingestion = False  # Process each item independently
+        clear_per_item = True  # Use unique agent_id per question
+        concurrent_questions = 4  # Reflect is more expensive, limit concurrency
+    else:
+        separate_ingestion = False
+        clear_per_item = True  # Use unique agent_id per question
+        concurrent_questions = 8
+
     results = await runner.run(
         dataset_path=dataset_path,
-        agent_id="longmemeval",  # Will be suffixed with question_id per item
+        agent_id="longmemeval",  # Will be suffixed with question_id per item (if not reflect mode)
         max_items=max_instances
         if not max_instances_per_category
         else None,  # Don't apply max_items when using per-category limit
@@ -694,15 +730,17 @@ async def run_benchmark(
         thinking_budget=thinking_budget,
         max_tokens=max_tokens,
         skip_ingestion=skip_ingestion or only_ingested,  # Auto-skip ingestion when using --only-ingested
-        max_concurrent_questions=8,
+        max_concurrent_questions=concurrent_questions,
         eval_semaphore_size=8,
-        separate_ingestion_phase=False,  # Process each question independently
-        clear_agent_per_item=True,  # Use unique agent_id per question
+        separate_ingestion_phase=separate_ingestion,  # True for reflect mode
+        clear_agent_per_item=clear_per_item,  # False for reflect mode (single agent)
         filln=filln,  # Only process questions without indexed data
         specific_item=question_id,  # Optional filter for specific question ID
         max_concurrent_items=max_concurrent_items,  # Parallel instance processing
         output_path=output_path,  # Save results incrementally
         merge_with_existing=merge_with_existing,  # Merge when using --fill, --category, --only-failed, --only-invalid flags or specific question
+        use_reflect_mode=use_reflect,  # Enable reflect mode (mission + mental models)
+        refresh_mental_models=refresh_mental_models,  # Whether to refresh mental models in reflect mode
     )
 
     # Display results (final save already happened incrementally)
@@ -953,6 +991,16 @@ if __name__ == "__main__":
         default=None,
         help="Source results file to read failed/invalid questions from (for --only-failed/--only-invalid). Defaults to benchmark_results.json if not specified.",
     )
+    parser.add_argument(
+        "--use-reflect",
+        action="store_true",
+        help="Use the reflect API instead of recall+LLM for answering questions. This sets up a mission, refreshes mental models after ingestion, and uses the agentic reflect API for answering.",
+    )
+    parser.add_argument(
+        "--no-refresh-mental-models",
+        action="store_true",
+        help="When using --use-reflect, skip mental model refresh. Only sets mission and uses reflect API without generating mental models. Faster but no synthesized knowledge.",
+    )
 
     args = parser.parse_args()
 
@@ -983,5 +1031,7 @@ if __name__ == "__main__":
             results_filename=args.results_filename,
             context_format=args.context_format,
             source_results=args.source_results,
+            use_reflect=args.use_reflect,
+            refresh_mental_models=not args.no_refresh_mental_models,
         )
     )

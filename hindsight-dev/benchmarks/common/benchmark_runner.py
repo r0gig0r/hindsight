@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pydantic
 from hindsight_api import MemoryEngine
 from hindsight_api.config import get_config
+from hindsight_api.engine.memory_engine import ReflectResult
 
 # Configure logging from environment variable
 get_config().configure_logging()
@@ -119,6 +120,105 @@ async def create_memory_engine() -> MemoryEngine:
     return memory
 
 
+# Default mission for reflect mode benchmarks
+DEFAULT_REFLECT_MISSION = """I am an AI assistant helping the user. My goal is to:
+- Understand and remember user preferences, interests, and personal information
+- Track important events, dates, and experiences the user shares
+- Learn from our conversations to provide personalized assistance
+- Remember context from previous conversations to give relevant responses
+- Notice patterns in user behavior and preferences over time"""
+
+
+async def poll_operation_until_complete(
+    memory: MemoryEngine,
+    bank_id: str,
+    operation_id: str,
+    request_context: "RequestContext",
+    poll_interval: float = 2.0,
+    timeout: float = 300.0,
+) -> Dict[str, Any]:
+    """
+    Poll an async operation until it completes or fails.
+
+    Args:
+        memory: MemoryEngine instance
+        bank_id: Bank identifier
+        operation_id: Operation ID to poll
+        request_context: Request context for authentication
+        poll_interval: Seconds between polls (default: 2.0)
+        timeout: Maximum seconds to wait (default: 300.0)
+
+    Returns:
+        Final operation status dict
+
+    Raises:
+        TimeoutError: If operation doesn't complete within timeout
+        RuntimeError: If operation fails
+    """
+    import time
+
+    start_time = time.time()
+
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed > timeout:
+            raise TimeoutError(f"Operation {operation_id} did not complete within {timeout}s")
+
+        status = await memory.get_operation_status(bank_id, operation_id, request_context=request_context)
+
+        if status["status"] == "completed":
+            return status
+        elif status["status"] == "failed":
+            error_msg = status.get("error_message", "Unknown error")
+            raise RuntimeError(f"Operation {operation_id} failed: {error_msg}")
+        elif status["status"] == "not_found":
+            raise RuntimeError(f"Operation {operation_id} not found")
+
+        # Still pending, wait and poll again
+        await asyncio.sleep(poll_interval)
+
+
+async def setup_reflect_mode(
+    memory: MemoryEngine,
+    bank_id: str,
+    request_context: "RequestContext",
+    mission: str | None = None,
+    refresh_mental_models: bool = True,
+    poll_timeout: float = 300.0,
+) -> None:
+    """
+    Set up a bank for reflect mode by setting a mission and optionally refreshing mental models.
+
+    This is used by benchmarks to prepare a bank for using reflect instead of recall.
+    The mission helps the system understand what kind of information to track and how
+    to organize mental models.
+
+    Args:
+        memory: MemoryEngine instance
+        bank_id: Bank identifier
+        request_context: Request context for authentication
+        mission: Mission text (uses DEFAULT_REFLECT_MISSION if not provided)
+        refresh_mental_models: Whether to refresh mental models after setting mission
+        poll_timeout: Timeout for mental model refresh operation (default: 300s)
+    """
+    # Set the mission
+    mission_text = mission or DEFAULT_REFLECT_MISSION
+    await memory.set_bank_mission(bank_id, mission_text, request_context=request_context)
+    console.print(f"    [green]✓[/green] Set mission for bank '{bank_id}'")
+
+    # Refresh mental models if requested
+    if refresh_mental_models:
+        console.print("    [yellow]Refreshing mental models...[/yellow]")
+        result = await memory.refresh_mental_models(bank_id, request_context=request_context)
+        operation_id = result["operation_id"]
+
+        # Poll until complete
+        await poll_operation_until_complete(
+            memory, bank_id, operation_id, request_context, poll_interval=2.0, timeout=poll_timeout
+        )
+        console.print("    [green]✓[/green] Mental models refreshed")
+
+
 class BenchmarkDataset(ABC):
     """Abstract base class for benchmark datasets."""
 
@@ -178,6 +278,7 @@ class LLMAnswerGenerator(ABC):
         recall_result: Dict[str, Any],
         question_date: Optional[datetime] = None,
         question_type: Optional[str] = None,
+        bank_id: Optional[str] = None,
     ) -> Tuple[str, str, Optional[List[Dict[str, Any]]]]:
         """
         Generate answer from retrieved memories.
@@ -187,6 +288,7 @@ class LLMAnswerGenerator(ABC):
             recall_result: Full RecallResult dict containing results, entities, chunks, and trace
             question_date: Optional date when the question was asked (for temporal context)
             question_type: Optional question category/type (e.g., 'multi-session', 'temporal-reasoning')
+            bank_id: Optional bank ID for generators that need it (e.g., ReflectAnswerGenerator)
 
         Returns:
             Tuple of (answer, reasoning, retrieved_memories_override)
@@ -197,6 +299,101 @@ class LLMAnswerGenerator(ABC):
               - List: Use these memories instead (integrated mode like think API)
         """
         pass
+
+
+class ReflectAnswerGenerator(LLMAnswerGenerator):
+    """Answer generator using the reflect API instead of recall + LLM.
+
+    This generator uses the agentic reflect API which:
+    1. Has access to mental models (synthesized knowledge)
+    2. Can search facts dynamically using tools
+    3. Can learn and update mental models
+    4. Provides a comprehensive answer based on all available information
+
+    The reflect API does its own retrieval internally, so no external search
+    is needed by the benchmark runner.
+    """
+
+    def __init__(self, memory: MemoryEngine, budget: Budget = Budget.MID):
+        """Initialize with memory instance.
+
+        Args:
+            memory: MemoryEngine instance
+            budget: Budget level for reflect iterations (LOW/MID/HIGH)
+        """
+        self.memory = memory
+        self.budget = budget
+
+    def needs_external_search(self) -> bool:
+        """Reflect API does its own retrieval, so no external search needed."""
+        return False
+
+    async def generate_answer(
+        self,
+        question: str,
+        recall_result: Dict[str, Any],
+        question_date: Optional[datetime] = None,
+        question_type: Optional[str] = None,
+        bank_id: Optional[str] = None,
+    ) -> Tuple[str, str, Optional[List[Dict[str, Any]]]]:
+        """
+        Generate answer using the agentic reflect API.
+
+        The reflect API uses an agentic loop with tools to:
+        - lookup: Get mental models (synthesized knowledge)
+        - recall: Search facts (semantic + temporal retrieval)
+        - learn: Create/update mental models with new insights
+        - expand: Get chunk/document context for memories
+
+        Args:
+            question: Question to answer
+            recall_result: Not used (empty dict), as reflect does its own retrieval
+            question_date: Date when the question was asked (for temporal context)
+            question_type: Question category (for context in the prompt)
+            bank_id: Bank ID to query (required for reflect mode)
+
+        Returns:
+            Tuple of (answer, reasoning, retrieved_memories)
+            - answer: The generated answer text
+            - reasoning: Summary of how the answer was derived
+            - retrieved_memories: Empty list (reflect uses mental models, not raw facts)
+        """
+        if not bank_id:
+            raise ValueError("bank_id is required for ReflectAnswerGenerator")
+
+        try:
+            # Build context string with question date if available
+            context_parts = []
+            if question_date:
+                context_parts.append(
+                    f"The question is being asked on: {question_date.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+                )
+            if question_type:
+                context_parts.append(f"Question category: {question_type}")
+            context = "\n".join(context_parts) if context_parts else None
+
+            # Use the reflect API which does agentic reasoning with tools
+            result: ReflectResult = await self.memory.reflect_async(
+                bank_id=bank_id,
+                query=question,
+                budget=self.budget,
+                context=context,
+                request_context=RequestContext(),
+            )
+
+            # Extract answer
+            answer = result.text
+
+            # Build reasoning summary
+            reasoning = f"Reflect API (budget={self.budget.name})"
+
+            # Reflect doesn't return raw facts like recall, it uses mental models
+            # Return empty list for retrieved_memories
+            return answer, reasoning, []
+
+        except Exception as e:
+            logging.exception(f"Error in reflect API call: {e}")
+            return f"Error generating answer: {str(e)}", "Error occurred during reflect API call.", []
 
 
 class JudgeResponse(pydantic.BaseModel):
@@ -505,7 +702,7 @@ class BenchmarkRunner:
 
             # Generate answer using LLM - pass entire recall result
             answer, reasoning, memories_override = await self.answer_generator.generate_answer(
-                question, recall_result_dict, question_date, question_type
+                question, recall_result_dict, question_date, question_type, bank_id=agent_id
             )
 
             # Use override if provided, otherwise use the results from recall
@@ -517,10 +714,10 @@ class BenchmarkRunner:
 
             return answer, reasoning, final_memories, chunks
         else:
-            # Integrated flow: generator does its own search (e.g., think API)
+            # Integrated flow: generator does its own search (e.g., reflect API)
             # Pass empty recall result since generator doesn't need them
             answer, reasoning, memories_override = await self.answer_generator.generate_answer(
-                question, {"results": []}, question_date, question_type
+                question, {"results": []}, question_date, question_type, bank_id=agent_id
             )
 
             # Use memories from generator (should not be None for integrated mode)
@@ -760,6 +957,9 @@ class BenchmarkRunner:
         question_semaphore: asyncio.Semaphore,
         eval_semaphore_size: int = 8,
         clear_this_agent: bool = True,
+        use_reflect_mode: bool = False,
+        reflect_mission: Optional[str] = None,
+        refresh_mental_models: bool = True,
     ) -> Dict:
         """
         Process a single item (ingest + evaluate).
@@ -767,6 +967,9 @@ class BenchmarkRunner:
         Args:
             clear_this_agent: Whether to clear this agent's data before ingesting.
                              Set to False to skip clearing (e.g., when agent_id is shared and already cleared)
+            use_reflect_mode: If True, set up mission and refresh mental models after ingestion
+            reflect_mission: Custom mission text (uses DEFAULT_REFLECT_MISSION if not provided)
+            refresh_mental_models: If True (default), refresh mental models in reflect mode
 
         Returns:
             Result dict with metrics
@@ -775,23 +978,39 @@ class BenchmarkRunner:
 
         console.print(f"\n[bold blue]Item {i}/{total_items}[/bold blue] (ID: {item_id})")
 
+        step = 1
         if not skip_ingestion:
             # Clear agent data before ingesting
             if clear_this_agent:
-                console.print("  [1] Clearing previous agent data...")
+                console.print(f"  [{step}] Clearing previous agent data...")
                 await self.memory.delete_bank(agent_id, request_context=RequestContext())
                 console.print(f"      [green]✓[/green] Cleared '{agent_id}' agent data")
 
             # Ingest conversation
-            console.print("  [2] Ingesting conversation (batch mode)...")
+            step += 1
+            console.print(f"  [{step}] Ingesting conversation (batch mode)...")
             num_sessions = await self.ingest_conversation(item, agent_id)
             console.print(f"      [green]✓[/green] Ingested {num_sessions} sessions")
         else:
             num_sessions = -1
 
+        # Set up reflect mode if enabled (mission + mental models)
+        if use_reflect_mode:
+            step += 1
+            console.print(f"  [{step}] Setting up reflect mode...")
+            await setup_reflect_mode(
+                memory=self.memory,
+                bank_id=agent_id,
+                request_context=RequestContext(),
+                mission=reflect_mission,
+                refresh_mental_models=refresh_mental_models,
+                poll_timeout=600.0,
+            )
+
         # Evaluate QA
+        step += 1
         qa_pairs = self.dataset.get_qa_pairs(item)
-        console.print(f"  [3] Evaluating {len(qa_pairs)} QA pairs (parallel)...")
+        console.print(f"  [{step}] Evaluating {len(qa_pairs)} QA pairs (parallel)...")
         qa_results = await self.evaluate_qa_task(
             agent_id,
             qa_pairs,
@@ -803,7 +1022,8 @@ class BenchmarkRunner:
         )
 
         # Calculate metrics
-        console.print("  [4] Calculating metrics...")
+        step += 1
+        console.print(f"  [{step}] Calculating metrics...")
         metrics = await self.calculate_metrics(qa_results, eval_semaphore_size)
 
         console.print(
@@ -830,6 +1050,9 @@ class BenchmarkRunner:
         max_concurrent_items: int = 1,  # Max concurrent items (conversations) to process in parallel
         output_path: Optional[Path] = None,  # Path to save results incrementally
         merge_with_existing: bool = False,  # Whether to merge with existing results
+        use_reflect_mode: bool = False,  # If True, set up mission and use reflect API for answering
+        reflect_mission: Optional[str] = None,  # Custom mission text for reflect mode
+        refresh_mental_models: bool = True,  # If True (default), refresh mental models in reflect mode
     ) -> Dict[str, Any]:
         """
         Run the full benchmark evaluation.
@@ -849,6 +1072,9 @@ class BenchmarkRunner:
             separate_ingestion_phase: If True, ingest all data first, then evaluate all questions (single agent)
             filln: If True, only process items where the agent has no indexed data yet
             max_concurrent_items: Max concurrent items to process in parallel (requires clear_agent_per_item=True)
+            use_reflect_mode: If True, set up mission and use reflect API for answering.
+            reflect_mission: Custom mission text for reflect mode (uses default if not provided)
+            refresh_mental_models: If True (default), refresh mental models in reflect mode. Set to False to skip.
 
         Returns:
             Dict with complete benchmark results
@@ -890,6 +1116,8 @@ class BenchmarkRunner:
                 eval_semaphore_size,
                 output_path,
                 merge_with_existing,
+                use_reflect_mode,
+                reflect_mission,
             )
         else:
             # Original approach: process each item independently
@@ -907,6 +1135,9 @@ class BenchmarkRunner:
                 max_concurrent_items,
                 output_path,
                 merge_with_existing,
+                use_reflect_mode,
+                reflect_mission,
+                refresh_mental_models,
             )
 
     async def _run_single_phase(
@@ -924,6 +1155,9 @@ class BenchmarkRunner:
         max_concurrent_items: int = 1,
         output_path: Optional[Path] = None,
         merge_with_existing: bool = False,
+        use_reflect_mode: bool = False,
+        reflect_mission: Optional[str] = None,
+        refresh_mental_models: bool = True,
     ) -> Dict[str, Any]:
         """Original single-phase approach: process each item independently."""
         # Create semaphore for question processing
@@ -945,6 +1179,9 @@ class BenchmarkRunner:
                 max_concurrent_items,
                 output_path,
                 merge_with_existing,
+                use_reflect_mode,
+                reflect_mission,
+                refresh_mental_models,
             )
         else:
             # Sequential item processing (original behavior)
@@ -961,6 +1198,9 @@ class BenchmarkRunner:
                 filln,
                 output_path,
                 merge_with_existing,
+                use_reflect_mode,
+                reflect_mission,
+                refresh_mental_models,
             )
 
         # Calculate overall metrics
@@ -996,6 +1236,9 @@ class BenchmarkRunner:
         filln: bool,
         output_path: Optional[Path] = None,
         merge_with_existing: bool = False,
+        use_reflect_mode: bool = False,
+        reflect_mission: Optional[str] = None,
+        refresh_mental_models: bool = True,
     ) -> List[Dict]:
         """Process items sequentially (original behavior)."""
         all_results = []
@@ -1043,6 +1286,9 @@ class BenchmarkRunner:
                 question_semaphore,
                 eval_semaphore_size,
                 clear_this_agent,
+                use_reflect_mode,
+                reflect_mission,
+                refresh_mental_models,
             )
 
             # Replace existing result or append new one
@@ -1074,6 +1320,9 @@ class BenchmarkRunner:
         max_concurrent_items: int,
         output_path: Optional[Path] = None,
         merge_with_existing: bool = False,
+        use_reflect_mode: bool = False,
+        reflect_mission: Optional[str] = None,
+        refresh_mental_models: bool = True,
     ) -> List[Dict]:
         """Process items in parallel (requires unique agent IDs per item)."""
         # Load existing results if merge_with_existing is True
@@ -1118,6 +1367,9 @@ class BenchmarkRunner:
                     question_semaphore,
                     eval_semaphore_size,
                     clear_this_agent=True,  # Always clear for parallel processing
+                    use_reflect_mode=use_reflect_mode,
+                    reflect_mission=reflect_mission,
+                    refresh_mental_models=refresh_mental_models,
                 )
                 return result
 
@@ -1156,11 +1408,17 @@ class BenchmarkRunner:
         eval_semaphore_size: int,
         output_path: Optional[Path] = None,
         merge_with_existing: bool = False,
+        use_reflect_mode: bool = False,
+        reflect_mission: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Two-phase approach: ingest all data into single agent, then evaluate all questions.
 
         More realistic scenario where agent accumulates memories over time.
+
+        Args:
+            use_reflect_mode: If True, set up mission and refresh mental models after ingestion
+            reflect_mission: Custom mission text (uses DEFAULT_REFLECT_MISSION if not provided)
         """
         # Phase 1: Ingestion
         if not skip_ingestion:
@@ -1199,8 +1457,21 @@ class BenchmarkRunner:
         else:
             console.print("\n[3] Skipping ingestion (using existing data)")
 
+        # Phase 1.5: Set up reflect mode if enabled (mission + mental models)
+        if use_reflect_mode:
+            console.print("\n[4.5] Setting up reflect mode...")
+            await setup_reflect_mode(
+                memory=self.memory,
+                bank_id=agent_id,
+                request_context=RequestContext(),
+                mission=reflect_mission,
+                refresh_mental_models=True,
+                poll_timeout=600.0,  # 10 minute timeout for mental model refresh
+            )
+
         # Phase 2: Evaluation
-        console.print("\n[5] Phase 2: Evaluating all questions...")
+        phase_num = "[6]" if use_reflect_mode else "[5]"
+        console.print(f"\n{phase_num} Phase 2: Evaluating all questions...")
 
         # Create semaphore for question processing
         question_semaphore = asyncio.Semaphore(max_concurrent_questions)

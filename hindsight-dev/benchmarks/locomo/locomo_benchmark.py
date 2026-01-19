@@ -16,7 +16,14 @@ import pydantic
 from hindsight_api.engine.llm_wrapper import LLMConfig
 from openai import AsyncOpenAI
 
-from benchmarks.common.benchmark_runner import BenchmarkDataset, BenchmarkRunner, LLMAnswerEvaluator, LLMAnswerGenerator
+from benchmarks.common.benchmark_runner import (
+    BenchmarkDataset,
+    BenchmarkRunner,
+    LLMAnswerEvaluator,
+    LLMAnswerGenerator,
+    ReflectAnswerGenerator,
+    setup_reflect_mode,
+)
 
 
 class LoComoDataset(BenchmarkDataset):
@@ -117,6 +124,7 @@ class LoComoAnswerGenerator(LLMAnswerGenerator):
         recall_result: Dict[str, Any],
         question_date: Optional[datetime] = None,
         question_type: Optional[str] = None,
+        bank_id: Optional[str] = None,
     ) -> Tuple[str, str, Optional[List[Dict[str, Any]]]]:
         """
         Generate answer from retrieved memories using Groq.
@@ -208,6 +216,7 @@ class LoComoThinkAnswerGenerator(LLMAnswerGenerator):
         recall_result: Dict[str, Any],
         question_date: Optional[datetime] = None,
         question_type: Optional[str] = None,
+        bank_id: Optional[str] = None,
     ) -> Tuple[str, str, Optional[List[Dict[str, Any]]]]:
         """
         Generate answer using the integrated think API.
@@ -220,6 +229,7 @@ class LoComoThinkAnswerGenerator(LLMAnswerGenerator):
             recall_result: Not used (empty dict), as think does its own retrieval
             question_date: Date when the question was asked (currently not used by think API)
             question_type: Question category (unused in think API)
+            bank_id: Not used - think API uses self.agent_id from constructor
 
         Returns:
             Tuple of (answer, reasoning, retrieved_memories)
@@ -270,6 +280,7 @@ async def run_benchmark(
     max_questions_per_conv: int = None,
     skip_ingestion: bool = False,
     use_think: bool = False,
+    use_reflect: bool = False,
     conversation: str = None,
     api_url: str = None,
     max_concurrent_questions_override: int = None,
@@ -284,6 +295,8 @@ async def run_benchmark(
         max_questions_per_conv: Maximum questions per conversation (None for all)
         skip_ingestion: Whether to skip ingestion and use existing data
         use_think: Whether to use the think API instead of search + LLM
+        use_reflect: Whether to use the reflect API instead of search + LLM. Sets up mission and
+                     refreshes mental models after ingestion.
         conversation: Specific conversation ID to run (e.g., "conv-26")
         api_url: Optional API URL to connect to (default: use local memory)
         only_failed: If True, only run conversations that have failed questions (is_correct=False)
@@ -349,11 +362,27 @@ async def run_benchmark(
 
         memory = await create_memory_engine()
 
-    if use_think:
+    # Validate mutually exclusive modes
+    if use_think and use_reflect:
+        console.print("[red]Error: --use-think and --use-reflect cannot be used together[/red]")
+        return
+
+    # Select answer generator based on mode
+    from hindsight_api.engine.memory_engine import Budget
+
+    if use_reflect:
+        console.print("[blue]Mode: reflect (using agentic reflect API)[/blue]")
+        # bank_id is passed dynamically through generate_answer, ensuring it matches the runner's agent_id
+        answer_generator = ReflectAnswerGenerator(memory=memory, budget=Budget.MID)
+        max_concurrent_questions = max_concurrent_questions_override or 4
+        eval_semaphore_size = 4
+    elif use_think:
+        console.print("[blue]Mode: think (using think API)[/blue]")
         answer_generator = LoComoThinkAnswerGenerator(memory=memory, agent_id="locomo", thinking_budget=500)
         max_concurrent_questions = max_concurrent_questions_override or 4
         eval_semaphore_size = 4
     else:
+        console.print("[blue]Mode: recall+LLM (traditional)[/blue]")
         answer_generator = LoComoAnswerGenerator()
         # Reduced from 32 to 10 to match search semaphore limit
         # Prevents "too many connections" errors
@@ -386,7 +415,12 @@ async def run_benchmark(
         dataset.load = filtered_load
 
     # Determine output filename based on mode
-    suffix = "_think" if use_think else ""
+    if use_reflect:
+        suffix = "_reflect"
+    elif use_think:
+        suffix = "_think"
+    else:
+        suffix = ""
     results_filename = f"benchmark_results{suffix}.json"
     output_path = Path(__file__).parent / "results" / results_filename
 
@@ -395,6 +429,17 @@ async def run_benchmark(
 
     # Merge with existing results if running a specific conversation or using filters
     merge_with_existing = conversation is not None or only_failed or only_invalid
+
+    # Reflect mode uses per-conversation banks (like traditional mode) to maintain isolation
+    # Each conversation only sees its own context
+    if use_reflect:
+        separate_ingestion = False  # Process each item independently
+        clear_per_item = True  # Use unique agent ID per conversation
+        concurrent_items = 2  # Reflect is more expensive, limit parallelism
+    else:
+        separate_ingestion = False
+        clear_per_item = True  # Use unique agent ID per conversation
+        concurrent_items = 3  # Process up to 3 conversations in parallel
 
     # Run benchmark with parallel conversation processing
     # Each conversation gets its own agent ID (locomo_conv-26, locomo_conv-30, etc.)
@@ -410,10 +455,12 @@ async def run_benchmark(
         max_concurrent_questions=max_concurrent_questions,
         eval_semaphore_size=eval_semaphore_size,
         specific_item=conversation,
-        clear_agent_per_item=True,  # Use unique agent ID per conversation
-        max_concurrent_items=3,  # Process up to 3 conversations in parallel
+        separate_ingestion_phase=separate_ingestion,
+        clear_agent_per_item=clear_per_item,
+        max_concurrent_items=concurrent_items,
         output_path=output_path,  # Save results incrementally
         merge_with_existing=merge_with_existing,
+        use_reflect_mode=use_reflect,  # Enable reflect mode (mission + mental models per item)
     )
 
     # Display results (final save already happened incrementally)
@@ -421,12 +468,12 @@ async def run_benchmark(
     console.print(f"\n[green]✓[/green] Results saved incrementally to {output_path}")
 
     # Generate markdown table
-    generate_markdown_table(results, use_think)
+    generate_markdown_table(results, use_think=use_think, use_reflect=use_reflect)
 
     return results
 
 
-def generate_markdown_table(results: dict, use_think: bool = False):
+def generate_markdown_table(results: dict, use_think: bool = False, use_reflect: bool = False):
     """
     Generate a markdown table with benchmark results.
 
@@ -444,7 +491,12 @@ def generate_markdown_table(results: dict, use_think: bool = False):
 
     # Build markdown content
     lines = []
-    mode_str = " (Think Mode)" if use_think else ""
+    if use_reflect:
+        mode_str = " (Reflect Mode)"
+    elif use_think:
+        mode_str = " (Think Mode)"
+    else:
+        mode_str = ""
     lines.append(f"# LoComo Benchmark Results{mode_str}")
     lines.append("")
 
@@ -495,7 +547,12 @@ def generate_markdown_table(results: dict, use_think: bool = False):
         )
 
     # Write to file with suffix
-    suffix = "_think" if use_think else ""
+    if use_reflect:
+        suffix = "_reflect"
+    elif use_think:
+        suffix = "_think"
+    else:
+        suffix = ""
     output_file = Path(__file__).parent / "results" / f"results_table{suffix}.md"
     output_file.parent.mkdir(parents=True, exist_ok=True)
     output_file.write_text("\n".join(lines))
@@ -538,6 +595,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Only run conversations that have invalid questions (is_invalid=True). Requires existing results file.",
     )
+    parser.add_argument(
+        "--use-reflect",
+        action="store_true",
+        help="Use the reflect API instead of search + LLM. Sets up mission and refreshes mental models after ingestion. Cannot be combined with --use-think.",
+    )
 
     args = parser.parse_args()
 
@@ -545,12 +607,17 @@ if __name__ == "__main__":
     if args.only_failed and args.only_invalid:
         parser.error("Cannot use both --only-failed and --only-invalid at the same time")
 
+    # Validate that --use-think and --use-reflect are mutually exclusive
+    if args.use_think and args.use_reflect:
+        parser.error("Cannot use both --use-think and --use-reflect at the same time")
+
     results = asyncio.run(
         run_benchmark(
             max_conversations=args.max_conversations,
             max_questions_per_conv=args.max_questions,
             skip_ingestion=args.skip_ingestion,
             use_think=args.use_think,
+            use_reflect=args.use_reflect,
             conversation=args.conversation,
             api_url=args.api_url,
             max_concurrent_questions_override=args.max_concurrent_questions,

@@ -77,18 +77,19 @@ When in doubt, set promote=false."""
 
 def get_mission_filter_system_message() -> str:
     """System message for mission filtering."""
-    return """You filter entities for promotion. Output JSON with 'candidates' array.
+    return """You filter entities for promotion. Output JSON with a 'candidates' array where EACH item is an object with 'name', 'promote', and 'reason' fields.
+
+CRITICAL: Every candidate must be a JSON object like {"name": "...", "promote": true/false, "reason": "..."}
+NEVER return just a string - always return the full object structure for EACH candidate.
 
 Rules:
 - promote=true ONLY for specific names (people, organizations, named places/projects)
 - promote=false for common words, generic categories, abstract concepts
 
-Examples:
-- "John" → promote=true (person name)
-- "kids" → promote=false (generic category)
-- "community" → promote=false (abstract concept)
-- "Google" → promote=true (organization name)
-- "motivation" → promote=false (abstract concept)
+Examples output for candidates:
+{"name": "John", "promote": true, "reason": "person name"}
+{"name": "kids", "promote": false, "reason": "generic category"}
+{"name": "Google", "promote": true, "reason": "organization name"}
 
 When in doubt, promote=false. Most entities should be rejected."""
 
@@ -145,7 +146,7 @@ async def filter_candidates_by_mission(
                 # Candidate not in response - reject by default
                 logger.debug(f"[EMERGENT] '{candidate.name}' not in response, rejecting")
 
-        logger.info(f"[EMERGENT] Mission filter: {len(filtered)}/{len(candidates)} candidates promoted")
+        logger.debug(f"[EMERGENT] Mission filter: {len(filtered)}/{len(candidates)} candidates promoted")
         return filtered
 
     except Exception as e:
@@ -234,10 +235,10 @@ When in doubt, set promote=false."""
                     logger.debug(f"[EMERGENT] Keeping '{name}'")
             else:
                 # Model not in response - remove to be safe
-                logger.info(f"[EMERGENT] '{name}' not in evaluation response, marking for removal")
+                logger.debug(f"[EMERGENT] '{name}' not in evaluation response, marking for removal")
                 models_to_remove.append(model["id"])
 
-        logger.info(f"[EMERGENT] Evaluation: {len(models_to_remove)}/{len(models)} emergent models marked for removal")
+        logger.debug(f"[EMERGENT] Evaluation: {len(models_to_remove)}/{len(models)} emergent models marked for removal")
         return models_to_remove
 
     except Exception as e:

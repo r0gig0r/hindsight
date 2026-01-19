@@ -209,6 +209,7 @@ async def tool_recall(
         tags=tags,
         tags_match=tags_match,
         _connection_budget=connection_budget,
+        _quiet=True,  # Suppress logging for internal operations (mental model refresh)
     )
 
     memories = []
