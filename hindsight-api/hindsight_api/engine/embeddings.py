@@ -128,11 +128,34 @@ class LocalSTEmbeddings(Embeddings):
             )
 
         logger.info(f"Embeddings: initializing local provider with model {self.model_name}")
-        # Disable lazy loading (meta tensors) which causes issues with newer transformers/accelerate
-        # Setting low_cpu_mem_usage=False and device_map=None ensures tensors are fully materialized
+
+        # Determine device and device_map based on hardware and installed packages.
+        # When accelerate is installed but no GPU is available, transformers can
+        # incorrectly use lazy loading (meta tensors) which fails on .to(device).
+        # We use device_map="cpu" in that case to force direct CPU loading.
+        import torch
+
+        try:
+            import accelerate  # type: ignore[import-not-found]  # noqa: F401
+
+            accelerate_available = True
+        except ImportError:
+            accelerate_available = False
+
+        if torch.cuda.is_available():
+            device = None  # Let sentence-transformers auto-detect GPU
+            device_map = None
+        elif accelerate_available:
+            device = "cpu"
+            device_map = "cpu"  # Force direct CPU loading to avoid meta tensors
+        else:
+            device = "cpu"
+            device_map = None
+
         self._model = SentenceTransformer(
             self.model_name,
-            model_kwargs={"low_cpu_mem_usage": False, "device_map": None},
+            device=device,
+            model_kwargs={"low_cpu_mem_usage": False, "device_map": device_map},
         )
 
         self._dimension = self._model.get_sentence_embedding_dimension()
