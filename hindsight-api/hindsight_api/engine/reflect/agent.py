@@ -644,8 +644,8 @@ async def _execute_tool(
         query = args.get("query")
         if not query:
             return {"error": "search_mental_models requires a query parameter"}
-        max_results = args.get("max_results") or 10
-        return await search_mental_models_fn(query, max_results)
+        max_tokens = max(args.get("max_tokens") or 5000, 1000)  # Default 5000, min 1000
+        return await search_mental_models_fn(query, max_tokens)
 
     elif tool_name == "recall":
         query = args.get("query")
@@ -675,8 +675,8 @@ def _summarize_input(tool_name: str, args: dict[str, Any]) -> str:
     elif tool_name == "search_mental_models":
         query = args.get("query", "")
         query_preview = f"'{query[:30]}...'" if len(query) > 30 else f"'{query}'"
-        max_results = args.get("max_results") or 10
-        return f"(query={query_preview}, max_results={max_results})"
+        max_tokens = max(args.get("max_tokens") or 5000, 1000)
+        return f"(query={query_preview}, max_tokens={max_tokens})"
     elif tool_name == "recall":
         query = args.get("query", "")
         query_preview = f"'{query[:30]}...'" if len(query) > 30 else f"'{query}'"

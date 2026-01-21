@@ -10,6 +10,11 @@ import pytest
 
 from hindsight_api.engine.consolidation.consolidator import run_consolidation_job
 from hindsight_api.engine.memory_engine import MemoryEngine
+from hindsight_api.engine.reflect.tools import (
+    tool_recall,
+    tool_search_mental_models,
+    tool_search_reflections,
+)
 
 
 class TestConsolidationIntegration:
@@ -239,14 +244,12 @@ class TestConsolidationIntegration:
         recall_result = await memory.recall_async(
             bank_id=bank_id,
             query="What does Sarah do?",
-            include_mental_models=True,
-            max_mental_models=10,
+            fact_type=["world", "experience", "mental_model"],
             request_context=request_context,
         )
 
-        # Should have mental_models attribute in result
-        # Note: mental_models may be empty if the query doesn't match well enough
-        assert hasattr(recall_result, "mental_models")
+        # Mental models come back as regular results with fact_type='mental_model'
+        assert hasattr(recall_result, "results")
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -570,7 +573,7 @@ class TestRecallMentalModelFactType:
         """Test that mental_model can be used as a fact type in recall.
 
         When mental_model is in the types list, the recall should:
-        1. Return mental models in the mental_models field
+        1. Return mental models in the results field with fact_type='mental_model'
         2. Not raise validation errors for None context fields
         """
         bank_id = f"test-recall-mm-type-{uuid.uuid4().hex[:8]}"
@@ -593,14 +596,15 @@ class TestRecallMentalModelFactType:
             request_context=request_context,
         )
 
-        # Should have mental_models in result
+        # Mental models come back as regular results with fact_type='mental_model'
         assert recall_result is not None
-        assert hasattr(recall_result, "mental_models")
-        # mental_models may be None or a list depending on whether consolidation created any
-        if recall_result.mental_models:
-            for mm in recall_result.mental_models:
+        assert recall_result.results is not None
+        # Check that results include mental models
+        if recall_result.results:
+            for mm in recall_result.results:
                 assert mm.id is not None
                 assert mm.text is not None
+                assert mm.fact_type == "mental_model"
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -635,8 +639,8 @@ class TestRecallMentalModelFactType:
         assert recall_result is not None
         # Should have results from world/experience facts
         assert recall_result.results is not None
-        # mental_models is also populated when mental_model is in types
-        assert hasattr(recall_result, "mental_models")
+        # Mental models come back as regular results with fact_type='mental_model'
+        # when mental_model is included in fact_type parameter
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -1055,20 +1059,20 @@ class TestConsolidationTagRouting:
             query="What does everyone do for work?",
             tags=["alice"],
             tags_match="any_strict",  # Only alice's data
-            include_mental_models=True,
-            max_mental_models=10,
+            fact_type=["world", "experience", "mental_model"],
             request_context=request_context,
         )
 
         # Results should only include alice-tagged content
-        if recall_result.mental_models:
-            for mm in recall_result.mental_models:
-                # Mental model should be alice-scoped or global (untagged)
-                # Not bob-scoped
-                mm_tags = mm.tags or []
-                assert "bob" not in mm_tags, (
-                    f"Recall with tags=['alice'] should not return bob's models: {mm.text}"
-                )
+        # Mental models are now regular results with fact_type='mental_model'
+        mental_models = [r for r in recall_result.results if r.fact_type == "mental_model"]
+        for mm in mental_models:
+            # Mental model should be alice-scoped or global (untagged)
+            # Not bob-scoped
+            mm_tags = mm.tags or []
+            assert "bob" not in mm_tags, (
+                f"Recall with tags=['alice'] should not return bob's models: {mm.text}"
+            )
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -1144,6 +1148,427 @@ class TestConsolidationTagRouting:
             for mm in mm_after:
                 assert mm["text"], "Mental model should have text"
                 # Tags should be consistent (not mixing alice and bob, etc.)
+
+        # Cleanup
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_consolidation_inherits_dates_from_source_memory(
+        self, memory: MemoryEngine, request_context
+    ):
+        """Test that mental models inherit occurred_start and event_date from source memories.
+
+        When a mental model is created, it should inherit the temporal information
+        from the source memory that triggered its creation, not use the current time.
+        """
+        from datetime import datetime, timezone
+
+        bank_id = f"test-consolidation-dates-{uuid.uuid4().hex[:8]}"
+
+        # Create the bank
+        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+        # Create a specific date in the past for testing
+        past_date = datetime(2023, 6, 15, 10, 30, 0, tzinfo=timezone.utc)
+
+        # First, create a memory unit directly with a specific date
+        async with memory._pool.acquire() as conn:
+            memory_id = uuid.uuid4()
+            await conn.execute(
+                """
+                INSERT INTO memory_units (
+                    id, bank_id, text, fact_type, occurred_start, event_date, created_at
+                )
+                VALUES ($1, $2, $3, 'experience', $4, $4, now())
+                """,
+                memory_id,
+                bank_id,
+                "Sarah went to Paris for vacation and loved the Eiffel Tower.",
+                past_date,
+            )
+
+        # Run consolidation manually
+        from hindsight_api.engine.consolidation.consolidator import run_consolidation_job
+
+        result = await run_consolidation_job(
+            memory_engine=memory,
+            bank_id=bank_id,
+            request_context=request_context,
+        )
+
+        # Verify consolidation processed the memory
+        assert result["status"] == "completed"
+        assert result["memories_processed"] >= 1
+
+        # Check that mental model inherited the date from source memory
+        async with memory._pool.acquire() as conn:
+            mental_model = await conn.fetchrow(
+                """
+                SELECT id, text, occurred_start, event_date, source_memory_ids
+                FROM memory_units
+                WHERE bank_id = $1 AND fact_type = 'mental_model'
+                LIMIT 1
+                """,
+                bank_id,
+            )
+
+            if mental_model:
+                # Mental model should have inherited the date from the source memory
+                mm_occurred = mental_model["occurred_start"]
+                mm_event_date = mental_model["event_date"]
+
+                # Dates should match the source memory's date (2023-06-15), not today
+                assert mm_occurred is not None, "Mental model should have occurred_start"
+                assert mm_event_date is not None, "Mental model should have event_date"
+
+                # The date should be from 2023, not today
+                assert mm_occurred.year == 2023, (
+                    f"Expected occurred_start year 2023, got {mm_occurred.year}. "
+                    "Mental model should inherit date from source memory."
+                )
+                assert mm_occurred.month == 6, f"Expected month 6, got {mm_occurred.month}"
+                assert mm_occurred.day == 15, f"Expected day 15, got {mm_occurred.day}"
+
+        # Cleanup
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+class TestMentalModelDrillDown:
+    """Test that reflect agent can drill down from mental models to source memories."""
+
+    @pytest.mark.asyncio
+    async def test_search_mental_models_returns_source_memory_ids(
+        self, memory: MemoryEngine, request_context
+    ):
+        """Test that search_mental_models returns source_memory_ids for drill-down.
+
+        This verifies the agent can:
+        1. Find a mental model
+        2. Access its source_memory_ids
+        3. Use those IDs to expand/recall for more details
+        """
+        from hindsight_api.engine.reflect.tools import tool_search_mental_models, tool_expand
+
+        bank_id = f"test-mm-drilldown-{uuid.uuid4().hex[:8]}"
+
+        # Create the bank
+        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+        # Store memories with specific details that get summarized in mental model
+        await memory.retain_async(
+            bank_id=bank_id,
+            content="Sarah works at TechCorp as a senior software engineer since March 2020.",
+            request_context=request_context,
+        )
+        await memory.retain_async(
+            bank_id=bank_id,
+            content="Sarah's employee ID at TechCorp is EMP-12345.",
+            request_context=request_context,
+        )
+
+        # Search for mental models
+        result = await tool_search_mental_models(
+            memory_engine=memory,
+            bank_id=bank_id,
+            query="Sarah TechCorp",
+            request_context=request_context,
+        )
+
+        assert result["count"] > 0, "Expected at least one mental model"
+
+        # Verify source_memory_ids and proof_count are present
+        mm = result["mental_models"][0]
+        assert "source_memory_ids" in mm, "Mental model should have source_memory_ids"
+        assert "proof_count" in mm, "Mental model should have proof_count"
+        assert mm["proof_count"] >= 1, "proof_count should be at least 1"
+
+        # If source_memory_ids exist, verify they can be used with expand
+        if mm["source_memory_ids"]:
+            assert len(mm["source_memory_ids"]) >= 1, "Should have at least one source memory"
+
+            # Use expand tool to get source memory details
+            async with memory._pool.acquire() as conn:
+                expand_result = await tool_expand(
+                    conn=conn,
+                    bank_id=bank_id,
+                    memory_ids=mm["source_memory_ids"][:2],  # Take first 2
+                    depth="chunk",
+                )
+
+            assert "results" in expand_result
+            assert len(expand_result["results"]) > 0, "Expand should return source memories"
+
+            # Verify we get the original detailed information
+            all_text = " ".join(r["memory"]["text"] for r in expand_result["results"] if "memory" in r)
+            # The expanded memories should contain details not necessarily in the mental model
+            assert "Sarah" in all_text or "TechCorp" in all_text, (
+                f"Expanded memories should contain source details. Got: {all_text}"
+            )
+
+        # Cleanup
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_mental_model_source_ids_match_contributing_memories(
+        self, memory: MemoryEngine, request_context
+    ):
+        """Test that source_memory_ids actually point to the memories that built the mental model."""
+        bank_id = f"test-mm-source-ids-{uuid.uuid4().hex[:8]}"
+
+        # Create the bank
+        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+        # Store two related memories
+        await memory.retain_async(
+            bank_id=bank_id,
+            content="Project Phoenix was started by the engineering team in January 2024.",
+            request_context=request_context,
+        )
+        await memory.retain_async(
+            bank_id=bank_id,
+            content="Project Phoenix achieved 99.9% uptime in its first quarter.",
+            request_context=request_context,
+        )
+
+        # Get the mental model with source_memory_ids
+        async with memory._pool.acquire() as conn:
+            mm_rows = await conn.fetch(
+                """
+                SELECT id, text, proof_count, source_memory_ids
+                FROM memory_units
+                WHERE bank_id = $1 AND fact_type = 'mental_model'
+                """,
+                bank_id,
+            )
+
+        if mm_rows:
+            mm = mm_rows[0]
+            source_ids = mm["source_memory_ids"] or []
+
+            # Verify source_memory_ids point to actual memories
+            if source_ids:
+                async with memory._pool.acquire() as conn:
+                    source_memories = await conn.fetch(
+                        """
+                        SELECT id, text FROM memory_units
+                        WHERE id = ANY($1) AND fact_type IN ('world', 'experience')
+                        """,
+                        source_ids,
+                    )
+
+                # Should have found the source memories
+                assert len(source_memories) >= 1, (
+                    f"source_memory_ids should point to valid memories. "
+                    f"IDs: {source_ids}, Found: {len(source_memories)}"
+                )
+
+                # The source memories should contain our original content
+                source_texts = [m["text"].lower() for m in source_memories]
+                has_phoenix = any("phoenix" in t for t in source_texts)
+                assert has_phoenix, f"Source memories should contain original content. Got: {source_texts}"
+
+        # Cleanup
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+class TestHierarchicalRetrieval:
+    """Test the reflect agent's hierarchical retrieval tools.
+
+    The hierarchy is:
+    1. search_reflections - User-curated summaries (highest quality)
+    2. search_mental_models - Auto-consolidated knowledge
+    3. recall - Raw facts as ground truth
+
+    When a reflection matches the query, it should be used first.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reflection_takes_priority_over_mental_model(
+        self, memory: MemoryEngine, request_context
+    ):
+        """Test that reflections are found and would be used before mental models.
+
+        Given:
+        - A memory about "John's favorite color is blue"
+        - A mental model created from that memory (via consolidation)
+        - A reflection manually created about John
+
+        When searching, the reflection should be found first.
+        """
+        bank_id = f"test-hierarchy-{uuid.uuid4().hex[:8]}"
+
+        # Create the bank
+        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+        # Retain a memory - consolidation creates a mental model
+        await memory.retain_async(
+            bank_id=bank_id,
+            content="John's favorite color is blue and he likes painting.",
+            request_context=request_context,
+        )
+
+        # Verify mental model was created
+        async with memory._pool.acquire() as conn:
+            mm_count = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM memory_units
+                WHERE bank_id = $1 AND fact_type = 'mental_model'
+                """,
+                bank_id,
+            )
+        assert mm_count >= 1, "Consolidation should have created a mental model"
+
+        # Create a reflection about John (higher quality, user-curated)
+        reflection = await memory.create_reflection(
+            bank_id=bank_id,
+            name="John's Preferences",
+            source_query="What are John's preferences?",
+            content="John is an artist who loves the color blue. He has been painting for 10 years and prefers watercolors.",
+            tags=[],
+            request_context=request_context,
+        )
+        assert reflection["id"] is not None
+
+        # Search reflections - should find our reflection
+        async with memory._pool.acquire() as conn:
+            query_embedding = memory.embeddings.encode(["What does John like?"])[0]
+            reflection_result = await tool_search_reflections(
+                conn=conn,
+                bank_id=bank_id,
+                query="What does John like?",
+                query_embedding=query_embedding,
+                max_results=5,
+            )
+
+        # Reflection should be found
+        assert reflection_result["count"] >= 1, "Reflection should be found"
+        found_reflection = reflection_result["reflections"][0]
+        assert "John" in found_reflection["content"] or "blue" in found_reflection["content"]
+
+        # Search mental models - should also find something
+        mm_result = await tool_search_mental_models(
+            memory_engine=memory,
+            bank_id=bank_id,
+            query="What does John like?",
+            request_context=request_context,
+            max_tokens=5000,
+        )
+        assert mm_result["count"] >= 1, "Mental model should also be found"
+
+        # Verify the reflection has higher quality content (more detail)
+        reflection_content = found_reflection["content"]
+        mm_content = mm_result["mental_models"][0]["text"]
+
+        # The reflection should contain the richer, user-curated content
+        assert "watercolors" in reflection_content or "10 years" in reflection_content, (
+            f"Reflection should have the rich user-curated content. Got: {reflection_content}"
+        )
+
+        # Cleanup
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_fallback_to_mental_model_when_no_reflection(
+        self, memory: MemoryEngine, request_context
+    ):
+        """Test that mental models are used when no reflection matches.
+
+        Given:
+        - A memory about "Sarah works at Google"
+        - A mental model created from that memory
+        - NO reflection about Sarah
+
+        When searching, mental models should provide the information.
+        """
+        bank_id = f"test-hierarchy-fallback-{uuid.uuid4().hex[:8]}"
+
+        # Create the bank
+        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+        # Retain a memory - consolidation creates a mental model
+        await memory.retain_async(
+            bank_id=bank_id,
+            content="Sarah works at Google as a software engineer.",
+            request_context=request_context,
+        )
+
+        # Search reflections - should find nothing
+        async with memory._pool.acquire() as conn:
+            query_embedding = memory.embeddings.encode(["Where does Sarah work?"])[0]
+            reflection_result = await tool_search_reflections(
+                conn=conn,
+                bank_id=bank_id,
+                query="Where does Sarah work?",
+                query_embedding=query_embedding,
+                max_results=5,
+            )
+
+        # No reflections exist
+        assert reflection_result["count"] == 0, "No reflections should exist"
+
+        # Search mental models - should find the consolidated knowledge
+        mm_result = await tool_search_mental_models(
+            memory_engine=memory,
+            bank_id=bank_id,
+            query="Where does Sarah work?",
+            request_context=request_context,
+            max_tokens=5000,
+        )
+
+        # Mental model should be found
+        assert mm_result["count"] >= 1, "Mental model should be found when no reflection exists"
+        mm_text = mm_result["mental_models"][0]["text"].lower()
+        assert "sarah" in mm_text or "google" in mm_text, (
+            f"Mental model should contain info about Sarah. Got: {mm_text}"
+        )
+
+        # Cleanup
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_fallback_to_recall_for_fresh_data(
+        self, memory: MemoryEngine, request_context
+    ):
+        """Test that recall provides raw facts when needed for verification.
+
+        This tests the drill-down capability: when mental models are stale or
+        need verification, recall provides the original source facts.
+        """
+        bank_id = f"test-hierarchy-recall-{uuid.uuid4().hex[:8]}"
+
+        # Create the bank
+        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+        # Retain some specific memories
+        await memory.retain_async(
+            bank_id=bank_id,
+            content="The quarterly revenue was $1.5M in Q3 2024.",
+            request_context=request_context,
+        )
+        await memory.retain_async(
+            bank_id=bank_id,
+            content="The quarterly revenue was $2.1M in Q4 2024.",
+            request_context=request_context,
+        )
+
+        # Use recall to get the raw facts
+        recall_result = await tool_recall(
+            memory_engine=memory,
+            bank_id=bank_id,
+            query="What was the quarterly revenue?",
+            request_context=request_context,
+            max_tokens=2048,
+            max_results=10,
+        )
+
+        # Should have raw facts with specific numbers
+        assert recall_result["count"] >= 1, "Recall should find the raw facts"
+
+        # Check that we get the actual numbers from the original memories
+        all_memory_text = " ".join([m["text"] for m in recall_result["memories"]])
+        assert "$1.5M" in all_memory_text or "$2.1M" in all_memory_text, (
+            f"Recall should return raw facts with specific data. Got: {all_memory_text}"
+        )
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)

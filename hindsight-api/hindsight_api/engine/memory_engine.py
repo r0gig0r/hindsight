@@ -586,13 +586,7 @@ class MemoryEngine(MemoryEngineInterface):
                 ]
                 for fact_type, facts in reflect_result.based_on.items()
             },
-            "mental_models": [
-                {
-                    "id": str(mm.id),
-                    "text": mm.summary or mm.description,
-                }
-                for mm in (reflect_result.mental_models or [])
-            ],
+            "mental_models": [],  # Mental models are included in based_on["mental-models"]
         }
 
         # Update the reflection with the generated content and reflect_response
@@ -1446,10 +1440,6 @@ class MemoryEngine(MemoryEngineInterface):
         max_entity_tokens: int = 500,
         include_chunks: bool = False,
         max_chunk_tokens: int = 8192,
-        include_mental_models: bool = False,
-        max_mental_models: int = 10,
-        include_reflections: bool = False,
-        max_reflections: int = 5,
         request_context: "RequestContext",
         tags: list[str] | None = None,
         tags_match: TagsMatch = "any",
@@ -1671,133 +1661,7 @@ class MemoryEngine(MemoryEngineInterface):
             except Exception as e:
                 logger.warning(f"Post-recall hook error (non-fatal): {e}")
 
-        # Retrieve mental models and reflections if requested
-        if result is not None and (include_mental_models or include_reflections):
-            result = await self._add_mental_models_and_reflections_to_result(
-                bank_id=bank_id,
-                query=query,
-                result=result,
-                include_mental_models=include_mental_models,
-                max_mental_models=max_mental_models,
-                include_reflections=include_reflections,
-                max_reflections=max_reflections,
-                tags=tags,
-                tags_match=tags_match,
-                request_context=request_context,
-            )
-
         return result
-
-    async def _add_mental_models_and_reflections_to_result(
-        self,
-        bank_id: str,
-        query: str,
-        result: RecallResultModel,
-        include_mental_models: bool,
-        max_mental_models: int,
-        include_reflections: bool,
-        max_reflections: int,
-        tags: list[str] | None,
-        tags_match: TagsMatch,
-        request_context: "RequestContext",
-    ) -> RecallResultModel:
-        """Add mental models and reflections to recall result using semantic search."""
-        from .response_models import MentalModelResult, ReflectionResult
-
-        pool = await self._get_pool()
-
-        # Generate query embedding for similarity search (convert to string for pgvector)
-        query_embedding = await embedding_utils.generate_embeddings_batch(self.embeddings, [query])
-        query_emb = str(query_embedding[0]) if query_embedding else None
-
-        mental_models_list: list[MentalModelResult] | None = None
-        reflections_list: list[ReflectionResult] | None = None
-
-        async with acquire_with_retry(pool) as conn:
-            # Retrieve mental models from memory_units with fact_type='mental_model'
-            if include_mental_models and query_emb is not None:
-                # Build tag filter for mental models
-                tag_filter = ""
-                params: list[Any] = [bank_id, query_emb, max_mental_models]
-                if tags:
-                    if tags_match == "all":
-                        tag_filter = " AND tags @> $4::varchar[]"
-                    elif tags_match == "exact":
-                        tag_filter = " AND tags = $4::varchar[]"
-                    else:  # any
-                        tag_filter = " AND tags && $4::varchar[]"
-                    params.append(tags)
-
-                mm_rows = await conn.fetch(
-                    f"""
-                    SELECT id, text, proof_count, tags,
-                           1 - (embedding <=> $2::vector) as relevance
-                    FROM {fq_table("memory_units")}
-                    WHERE bank_id = $1 AND fact_type = 'mental_model' {tag_filter}
-                    AND embedding IS NOT NULL
-                    ORDER BY embedding <=> $2::vector
-                    LIMIT $3
-                    """,
-                    *params,
-                )
-
-                mental_models_list = [
-                    MentalModelResult(
-                        id=str(row["id"]),
-                        text=row["text"],
-                        proof_count=row["proof_count"] or 1,
-                        relevance=float(row["relevance"]) if row["relevance"] else 0.0,
-                        tags=row["tags"] or [],
-                    )
-                    for row in mm_rows
-                ]
-
-            # Retrieve reflections
-            if include_reflections and query_emb is not None:
-                # Build tag filter for reflections
-                tag_filter = ""
-                params = [bank_id, query_emb, max_reflections]
-                if tags:
-                    if tags_match == "all":
-                        tag_filter = " AND tags @> $4::varchar[]"
-                    elif tags_match == "exact":
-                        tag_filter = " AND tags = $4::varchar[]"
-                    else:  # any
-                        tag_filter = " AND tags && $4::varchar[]"
-                    params.append(tags)
-
-                reflection_rows = await conn.fetch(
-                    f"""
-                    SELECT id, name, content,
-                           1 - (embedding <=> $2::vector) as relevance
-                    FROM {fq_table("reflections")}
-                    WHERE bank_id = $1 {tag_filter}
-                    AND embedding IS NOT NULL
-                    ORDER BY embedding <=> $2::vector
-                    LIMIT $3
-                    """,
-                    *params,
-                )
-
-                reflections_list = [
-                    ReflectionResult(
-                        id=str(row["id"]),
-                        name=row["name"],
-                        content=row["content"],
-                        relevance=float(row["relevance"]) if row["relevance"] else 0.0,
-                    )
-                    for row in reflection_rows
-                ]
-
-        # Create new result with mental models and reflections
-        return RecallResultModel(
-            results=result.results,
-            trace=result.trace,
-            entities=result.entities,
-            chunks=result.chunks,
-            mental_models=mental_models_list,
-            reflections=reflections_list,
-        )
 
     async def _search_with_retries(
         self,
@@ -3506,13 +3370,13 @@ class MemoryEngine(MemoryEngineInterface):
                     exclude_ids=exclude_reflection_ids,
                 )
 
-        async def search_mental_models_fn(q: str, max_results: int = 10) -> dict[str, Any]:
+        async def search_mental_models_fn(q: str, max_tokens: int = 5000) -> dict[str, Any]:
             return await tool_search_mental_models(
                 self,
                 bank_id,
                 q,
                 request_context,
-                max_results=max_results,
+                max_tokens=max_tokens,
                 tags=tags,
                 tags_match=tags_match,
                 last_consolidated_at=last_consolidated_at,
@@ -3618,8 +3482,7 @@ class MemoryEngine(MemoryEngineInterface):
         # Extract mental models from tool outputs - only include models the agent actually used
         # agent_result.used_mental_model_ids contains validated IDs from the done action
         used_model_ids_set = set(agent_result.used_mental_model_ids) if agent_result.used_mental_model_ids else set()
-        based_on["mental_model"] = []
-        mental_models_result: list[MentalModelRef] = []
+        based_on["mental-models"] = []
         seen_model_ids: set[str] = set()
         for tc in agent_result.tool_trace:
             if tc.tool == "get_mental_model":
@@ -3632,32 +3495,69 @@ class MemoryEngine(MemoryEngineInterface):
                         if used_model_ids_set and model_id not in used_model_ids_set:
                             continue  # Skip models not actually used by the agent
                         seen_model_ids.add(model_id)
-                        # Add to based_on as MemoryFact with type "mental_model"
+                        # Add to based_on as MemoryFact with type "mental-models"
                         model_name = model.get("name", "")
                         model_summary = model.get("summary") or model.get("description", "")
-                        based_on["mental_model"].append(
+                        based_on["mental-models"].append(
                             MemoryFact(
                                 id=model_id,
                                 text=f"{model_name}: {model_summary}",
-                                fact_type="mental_model",
+                                fact_type="mental-models",
                                 context=f"{model.get('type', 'concept')} ({model.get('subtype', 'structural')})",
                                 occurred_start=None,
                                 occurred_end=None,
                             )
                         )
-                        mental_models_result.append(
-                            MentalModelRef(
+            elif tc.tool == "search_mental_models":
+                # Search mental models - include all returned models (filtered by used_model_ids_set if specified)
+                for model in tc.output.get("mental_models", []):
+                    model_id = model.get("id")
+                    if model_id and model_id not in seen_model_ids:
+                        # Only include models that the agent declared as used (or all if none specified)
+                        if used_model_ids_set and model_id not in used_model_ids_set:
+                            continue  # Skip models not actually used by the agent
+                        seen_model_ids.add(model_id)
+                        # Add to based_on as MemoryFact with type "mental-models"
+                        model_name = model.get("name", "")
+                        model_summary = model.get("summary") or model.get("description", "")
+                        based_on["mental-models"].append(
+                            MemoryFact(
                                 id=model_id,
-                                name=model_name,
-                                type=model.get("type", "concept"),
-                                subtype=model.get("subtype", "structural"),
-                                description=model.get("description", ""),
-                                summary=model.get("summary"),
+                                text=f"{model_name}: {model_summary}",
+                                fact_type="mental-models",
+                                context=f"{model.get('type', 'concept')} ({model.get('subtype', 'structural')})",
+                                occurred_start=None,
+                                occurred_end=None,
+                            )
+                        )
+            elif tc.tool == "search_reflections":
+                # Search reflections - include all returned reflections (filtered by used_reflection_ids_set if specified)
+                used_reflection_ids_set = (
+                    set(agent_result.used_reflection_ids) if agent_result.used_reflection_ids else set()
+                )
+                for reflection in tc.output.get("reflections", []):
+                    reflection_id = reflection.get("id")
+                    if reflection_id and reflection_id not in seen_model_ids:
+                        # Only include reflections that the agent declared as used (or all if none specified)
+                        if used_reflection_ids_set and reflection_id not in used_reflection_ids_set:
+                            continue  # Skip reflections not actually used by the agent
+                        seen_model_ids.add(reflection_id)
+                        # Add to based_on as MemoryFact with type "mental-models" (reflections are synthesized knowledge)
+                        reflection_name = reflection.get("name", "")
+                        reflection_content = reflection.get("content", "")
+                        based_on["mental-models"].append(
+                            MemoryFact(
+                                id=reflection_id,
+                                text=f"{reflection_name}: {reflection_content}",
+                                fact_type="mental-models",
+                                context="reflection (user-curated)",
+                                occurred_start=None,
+                                occurred_end=None,
                             )
                         )
                 # List all models lookup - don't add to based_on (too verbose, just a listing)
 
-        # Add directives to mental_models list (they are mental models with subtype='directive')
+        # Add directives to based_on["mental-models"] (they are mental models with subtype='directive')
         for directive in directives:
             # Extract summary from observations
             summary_parts: list[str] = []
@@ -3678,14 +3578,16 @@ class MemoryEngine(MemoryEngineInterface):
             if not summary_parts and directive.get("description"):
                 summary_parts.append(directive["description"])
 
-            mental_models_result.append(
-                MentalModelRef(
+            directive_name = directive.get("name", "")
+            directive_summary = "; ".join(summary_parts) if summary_parts else ""
+            based_on["mental-models"].append(
+                MemoryFact(
                     id=directive.get("id", ""),
-                    name=directive.get("name", ""),
-                    type="directive",
-                    subtype="directive",
-                    description=directive.get("description", ""),
-                    summary="; ".join(summary_parts) if summary_parts else None,
+                    text=f"{directive_name}: {directive_summary}",
+                    fact_type="mental-models",
+                    context="directive (directive)",
+                    occurred_start=None,
+                    occurred_end=None,
                 )
             )
 
@@ -3705,7 +3607,6 @@ class MemoryEngine(MemoryEngineInterface):
             usage=None,  # Token tracking not yet implemented for agentic loop
             tool_trace=tool_trace_result,
             llm_trace=llm_trace_result,
-            mental_models=mental_models_result,
             directives_applied=directives_applied_result,
         )
 
@@ -4901,13 +4802,7 @@ class MemoryEngine(MemoryEngineInterface):
                 ]
                 for fact_type, facts in reflect_result.based_on.items()
             },
-            "mental_models": [
-                {
-                    "id": str(mm.id),
-                    "text": mm.summary or mm.description,
-                }
-                for mm in (reflect_result.mental_models or [])
-            ],
+            "mental_models": [],  # Mental models are included in based_on["mental-models"]
         }
 
         # Update the reflection with new content and reflect_response

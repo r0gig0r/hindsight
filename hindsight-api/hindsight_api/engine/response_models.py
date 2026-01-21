@@ -174,6 +174,9 @@ class MentalModelResult(BaseModel):
     proof_count: int = Field(description="Number of facts supporting this mental model")
     relevance: float = Field(default=0.0, description="Relevance score to the query")
     tags: list[str] | None = Field(default=None, description="Tags for visibility scoping")
+    source_memory_ids: list[str] = Field(
+        default_factory=list, description="IDs of facts that contribute to this mental model"
+    )
 
 
 class ReflectionResult(BaseModel):
@@ -220,12 +223,6 @@ class RecallResult(BaseModel):
     chunks: dict[str, ChunkInfo] | None = Field(
         None, description="Chunks for facts, keyed by '{document_id}_{chunk_index}'"
     )
-    mental_models: list[MentalModelResult] | None = Field(
-        None, description="Relevant mental models (consolidated knowledge) matching the query"
-    )
-    reflections: list[ReflectionResult] | None = Field(
-        None, description="Relevant reflections (user-curated summaries) matching the query"
-    )
 
 
 class ReflectResult(BaseModel):
@@ -254,6 +251,7 @@ class ReflectResult(BaseModel):
                     ],
                     "experience": [],
                     "opinion": [],
+                    "mental-models": [],
                 },
                 "new_opinions": ["Machine learning has great potential in healthcare"],
                 "structured_output": {"summary": "ML in healthcare", "confidence": 0.9},
@@ -264,7 +262,7 @@ class ReflectResult(BaseModel):
 
     text: str = Field(description="The formulated answer text")
     based_on: dict[str, list[MemoryFact]] = Field(
-        description="Facts used to formulate the answer, organized by type (world, experience, opinion)"
+        description="Facts used to formulate the answer, organized by type (world, experience, opinion, mental-models)"
     )
     new_opinions: list[str] = Field(default_factory=list, description="List of newly formed opinions during reflection")
     structured_output: dict[str, Any] | None = Field(
@@ -282,10 +280,6 @@ class ReflectResult(BaseModel):
     llm_trace: list[LLMCallTrace] = Field(
         default_factory=list,
         description="Trace of LLM calls made during reflection. Only present when include.tool_calls is enabled.",
-    )
-    mental_models: list[MentalModelRef] = Field(
-        default_factory=list,
-        description="Mental models accessed during reflection, including directives (subtype='directive').",
     )
     directives_applied: list[DirectiveRef] = Field(
         default_factory=list,

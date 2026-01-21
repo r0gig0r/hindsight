@@ -263,25 +263,6 @@ class ChunkData(BaseModel):
     truncated: bool = Field(default=False, description="Whether the chunk text was truncated due to token limits")
 
 
-class RecallMentalModelResult(BaseModel):
-    """A mental model result in recall response."""
-
-    id: str = Field(description="Unique mental model ID")
-    text: str = Field(description="The consolidated mental model text")
-    proof_count: int = Field(description="Number of facts supporting this mental model")
-    relevance: float = Field(default=0.0, description="Relevance score to the query")
-    tags: list[str] | None = Field(default=None, description="Tags for visibility scoping")
-
-
-class RecallReflectionResult(BaseModel):
-    """A reflection result in recall response."""
-
-    id: str = Field(description="Unique reflection ID")
-    name: str = Field(description="Human-readable name")
-    content: str = Field(description="The synthesized content")
-    relevance: float = Field(default=0.0, description="Relevance score to the query")
-
-
 class RecallResponse(BaseModel):
     """Response model for recall endpoints."""
 
@@ -321,22 +302,6 @@ class RecallResponse(BaseModel):
                         "chunk_index": 0,
                     }
                 },
-                "mental_models": [
-                    {
-                        "id": "789e0123-e45b-67d8-a901-234567890123",
-                        "text": "Alice is a machine learning expert who frequently discusses AI applications",
-                        "proof_count": 5,
-                        "relevance": 0.92,
-                    }
-                ],
-                "reflections": [
-                    {
-                        "id": "012e3456-e78b-90d1-a234-567890123456",
-                        "name": "Team Expertise Summary",
-                        "content": "Alice specializes in ML...",
-                        "relevance": 0.88,
-                    }
-                ],
             }
         }
     )
@@ -347,12 +312,6 @@ class RecallResponse(BaseModel):
         default=None, description="Entity states for entities mentioned in results"
     )
     chunks: dict[str, ChunkData] | None = Field(default=None, description="Chunks for facts, keyed by chunk_id")
-    mental_models: list[RecallMentalModelResult] | None = Field(
-        default=None, description="Relevant mental models (consolidated knowledge) matching the query"
-    )
-    reflections: list[RecallReflectionResult] | None = Field(
-        default=None, description="Relevant reflections (user-curated summaries) matching the query"
-    )
 
 
 class EntityInput(BaseModel):
@@ -621,9 +580,6 @@ class ReflectBasedOn(BaseModel):
     """Evidence the response is based on: memories and mental models."""
 
     memories: list[ReflectFact] = Field(default_factory=list, description="Memory facts used to generate the response")
-    mental_models: list[ReflectMentalModel] = Field(
-        default_factory=list, description="Mental models accessed during reflection"
-    )
 
 
 class ReflectTrace(BaseModel):
@@ -1764,14 +1720,6 @@ def _register_routes(app: FastAPI):
             include_chunks = request.include.chunks is not None
             max_chunk_tokens = request.include.chunks.max_tokens if include_chunks else 8192
 
-            # Determine mental models inclusion settings (enabled when 'mental_model' is in types)
-            include_mental_models = "mental_model" in fact_types if fact_types else False
-            max_mental_models = 10
-
-            # Determine reflections inclusion settings
-            include_reflections = request.include.reflections is not None
-            max_reflections = request.include.reflections.max_results if include_reflections else 5
-
             pre_recall = time.time() - handler_start
             # Run recall with tracing (record metrics)
             with metrics.record_operation(
@@ -1790,10 +1738,6 @@ def _register_routes(app: FastAPI):
                     max_entity_tokens=max_entity_tokens,
                     include_chunks=include_chunks,
                     max_chunk_tokens=max_chunk_tokens,
-                    include_mental_models=include_mental_models,
-                    max_mental_models=max_mental_models,
-                    include_reflections=include_reflections,
-                    max_reflections=max_reflections,
                     request_context=request_context,
                     tags=request.tags,
                     tags_match=request.tags_match,
@@ -1843,40 +1787,11 @@ def _register_routes(app: FastAPI):
                         ],
                     )
 
-            # Convert mental models from engine to HTTP API format
-            mental_models_response = None
-            if core_result.mental_models:
-                mental_models_response = [
-                    RecallMentalModelResult(
-                        id=mm.id,
-                        text=mm.text,
-                        proof_count=mm.proof_count,
-                        relevance=mm.relevance,
-                        tags=mm.tags,
-                    )
-                    for mm in core_result.mental_models
-                ]
-
-            # Convert reflections from engine to HTTP API format
-            reflections_response = None
-            if core_result.reflections:
-                reflections_response = [
-                    RecallReflectionResult(
-                        id=r.id,
-                        name=r.name,
-                        content=r.content,
-                        relevance=r.relevance,
-                    )
-                    for r in core_result.reflections
-                ]
-
             response = RecallResponse(
                 results=recall_results,
                 trace=core_result.trace,
                 entities=entities_response,
                 chunks=chunks_response,
-                mental_models=mental_models_response,
-                reflections=reflections_response,
             )
 
             handler_duration = time.time() - handler_start
@@ -1962,16 +1877,7 @@ def _register_routes(app: FastAPI):
                                 occurred_end=fact.occurred_end,
                             )
                         )
-                mental_models = [
-                    ReflectMentalModel(
-                        id=mm.id,
-                        name=mm.name,
-                        type=mm.type,
-                        subtype=mm.subtype,
-                    )
-                    for mm in core_result.mental_models
-                ]
-                based_on_result = ReflectBasedOn(memories=memories, mental_models=mental_models)
+                based_on_result = ReflectBasedOn(memories=memories)
 
             # Build trace (tool_calls + llm_calls + mental_models) if tool_calls is requested
             trace_result: ReflectTrace | None = None
@@ -1990,17 +1896,27 @@ def _register_routes(app: FastAPI):
                 llm_calls = [ReflectLLMCall(scope=lc.scope, duration_ms=lc.duration_ms) for lc in core_result.llm_trace]
                 # Build map of directive observations by id
                 directive_observations = {d.id: d.rules for d in core_result.directives_applied}
-                # Include all mental models (including directives with subtype='directive')
-                trace_mental_models = [
-                    ReflectMentalModel(
-                        id=mm.id,
-                        name=mm.name,
-                        type=mm.type,
-                        subtype=mm.subtype,
-                        observations=directive_observations.get(mm.id) if mm.subtype == "directive" else None,
-                    )
-                    for mm in core_result.mental_models
-                ]
+                # Build mental models from tool trace (get_mental_model outputs)
+                trace_mental_models: list[ReflectMentalModel] = []
+                seen_model_ids: set[str] = set()
+                for tc in core_result.tool_trace:
+                    if tc.tool == "get_mental_model" and tc.output.get("found") and "model" in tc.output:
+                        model = tc.output["model"]
+                        model_id = model.get("id")
+                        if model_id and model_id not in seen_model_ids:
+                            seen_model_ids.add(model_id)
+                            model_subtype = model.get("subtype", "structural")
+                            trace_mental_models.append(
+                                ReflectMentalModel(
+                                    id=model_id,
+                                    name=model.get("name", ""),
+                                    type=model.get("type", "concept"),
+                                    subtype=model_subtype,
+                                    observations=directive_observations.get(model_id)
+                                    if model_subtype == "directive"
+                                    else None,
+                                )
+                            )
                 trace_result = ReflectTrace(
                     tool_calls=tool_calls,
                     llm_calls=llm_calls,

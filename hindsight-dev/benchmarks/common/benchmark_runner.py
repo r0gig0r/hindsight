@@ -565,8 +565,16 @@ class BenchmarkRunner:
             import time
 
             recall_start_time = time.time()
-            # When only_mental_models is True, skip facts and only retrieve mental models
-            fact_types = [] if only_mental_models else ["world", "experience"]
+            # Build fact_types based on what's requested
+            if only_mental_models:
+                # Only retrieve mental models
+                fact_types = ["mental_model"]
+            elif include_mental_models:
+                # Retrieve facts AND mental models
+                fact_types = ["world", "experience", "mental_model"]
+            else:
+                # Only retrieve facts
+                fact_types = ["world", "experience"]
             search_result = await self.memory.recall_async(
                 bank_id=agent_id,
                 query=question,
@@ -576,8 +584,7 @@ class BenchmarkRunner:
                 question_date=question_date,
                 include_entities=not only_mental_models,  # Skip entities when only mental models
                 max_entity_tokens=2048,
-                include_chunks=not only_mental_models,  # Skip chunks when only mental models
-                include_mental_models=include_mental_models or only_mental_models,
+                include_chunks=True,  # Always include chunks (mental models fetch from source memories)
                 request_context=RequestContext(),
             )
             recall_time = time.time() - recall_start_time

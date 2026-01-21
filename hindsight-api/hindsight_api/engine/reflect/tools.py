@@ -78,7 +78,7 @@ async def tool_search_reflections(
         f"""
         SELECT
             id, name, content, reflect_response,
-            tags, created_at, updated_at,
+            tags, created_at, last_refreshed_at,
             1 - (embedding <=> $2::vector) as relevance
         FROM {fq_table("reflections")}
         WHERE bank_id = $1 AND embedding IS NOT NULL {filters}
@@ -92,14 +92,14 @@ async def tool_search_reflections(
     reflections = []
 
     for row in rows:
-        updated_at = row["updated_at"]
-        if updated_at and updated_at.tzinfo is None:
-            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        last_refreshed_at = row["last_refreshed_at"]
+        if last_refreshed_at and last_refreshed_at.tzinfo is None:
+            last_refreshed_at = last_refreshed_at.replace(tzinfo=timezone.utc)
 
         # Calculate freshness
         is_stale = False
-        if updated_at:
-            age = now - updated_at
+        if last_refreshed_at:
+            age = now - last_refreshed_at
             is_stale = age > timedelta(days=STALE_THRESHOLD_DAYS)
 
         reflections.append(
@@ -110,7 +110,7 @@ async def tool_search_reflections(
                 "reflect_response": row["reflect_response"],
                 "tags": row["tags"] or [],
                 "relevance": round(row["relevance"], 4),
-                "updated_at": updated_at.isoformat() if updated_at else None,
+                "updated_at": last_refreshed_at.isoformat() if last_refreshed_at else None,
                 "is_stale": is_stale,
             }
         )
@@ -127,14 +127,14 @@ async def tool_search_mental_models(
     bank_id: str,
     query: str,
     request_context: "RequestContext",
-    max_results: int = 10,
+    max_tokens: int = 5000,
     tags: list[str] | None = None,
     tags_match: str = "any",
     last_consolidated_at: datetime | None = None,
     pending_consolidation: int = 0,
 ) -> dict[str, Any]:
     """
-    Search consolidated mental models using recall with fact_type='mental_model'.
+    Search consolidated mental models using recall with include_mental_models.
 
     Mental models are auto-generated from memories. Returns freshness info
     so the agent knows if it should also verify with recall().
@@ -144,7 +144,7 @@ async def tool_search_mental_models(
         bank_id: Bank identifier
         query: Search query
         request_context: Request context for authentication
-        max_results: Maximum number of mental models to return
+        max_tokens: Maximum tokens for results (default 5000)
         tags: Optional tags to filter models
         tags_match: How to match tags - "any" (OR), "all" (AND)
         last_consolidated_at: When consolidation last ran (for staleness check)
@@ -153,13 +153,14 @@ async def tool_search_mental_models(
     Returns:
         Dict with matching mental models including freshness info
     """
-    # Use recall with fact_type=['mental_model'] to search mental models
-    # Use max_tokens to limit the number of results (~500 tokens per model)
+    from ..memory_engine import fq_table
+
+    # Use recall to search mental models (they come back in results field when fact_type=["mental_model"])
     result = await memory_engine.recall_async(
         bank_id=bank_id,
         query=query,
-        fact_type=["mental_model"],
-        max_tokens=max_results * 500,
+        fact_type=["mental_model"],  # Only retrieve mental models
+        max_tokens=max_tokens,  # Token budget controls how many mental models are returned
         enable_trace=False,
         request_context=request_context,
         tags=tags,
@@ -168,44 +169,52 @@ async def tool_search_mental_models(
         _quiet=True,
     )
 
-    now = datetime.now(timezone.utc)
     mental_models = []
 
-    for m in result.results:
-        # Parse timestamps
-        updated_at = None
-        if m.mentioned_at:
-            try:
-                updated_at = datetime.fromisoformat(m.mentioned_at.replace("Z", "+00:00"))
-            except (ValueError, AttributeError):
-                pass
+    # When fact_type=["mental_model"], results come back in `results` field as MemoryFact objects
+    # We need to fetch additional fields (proof_count, source_memory_ids) from the database
+    if result.results:
+        mm_ids = [m.id for m in result.results]
 
-        # Determine staleness
-        is_stale = False
-        staleness_reason = None
+        # Fetch proof_count and source_memory_ids for these mental models
+        pool = await memory_engine._get_pool()
+        async with pool.acquire() as conn:
+            mm_rows = await conn.fetch(
+                f"""
+                SELECT id, proof_count, source_memory_ids
+                FROM {fq_table("memory_units")}
+                WHERE id = ANY($1::uuid[])
+                """,
+                mm_ids,
+            )
+            mm_data = {str(row["id"]): row for row in mm_rows}
 
-        if updated_at:
-            age = now - updated_at
-            if age > timedelta(days=STALE_THRESHOLD_DAYS):
+        for m in result.results:
+            # Get additional data from DB lookup
+            extra = mm_data.get(m.id, {})
+            proof_count = extra.get("proof_count", 1) if extra else 1
+            source_ids = extra.get("source_memory_ids", []) if extra else []
+            # Convert UUIDs to strings
+            source_memory_ids = [str(sid) for sid in (source_ids or [])]
+
+            # Determine staleness
+            is_stale = False
+            staleness_reason = None
+            if pending_consolidation > 0:
                 is_stale = True
-                staleness_reason = f"Not updated in {age.days} days"
+                staleness_reason = f"{pending_consolidation} memories pending consolidation"
 
-        # Also mark as stale if there are pending memories to consolidate
-        if pending_consolidation > 0:
-            is_stale = True
-            staleness_reason = f"{pending_consolidation} memories pending consolidation"
-
-        mental_models.append(
-            {
-                "id": str(m.id),
-                "text": m.text,
-                "entities": m.entities or [],
-                "tags": m.tags or [],
-                "updated_at": updated_at.isoformat() if updated_at else None,
-                "is_stale": is_stale,
-                "staleness_reason": staleness_reason,
-            }
-        )
+            mental_models.append(
+                {
+                    "id": str(m.id),
+                    "text": m.text,
+                    "proof_count": proof_count,
+                    "source_memory_ids": source_memory_ids,
+                    "tags": m.tags or [],
+                    "is_stale": is_stale,
+                    "staleness_reason": staleness_reason,
+                }
+            )
 
     # Return freshness info (more understandable than raw pending_consolidation count)
     if pending_consolidation == 0:

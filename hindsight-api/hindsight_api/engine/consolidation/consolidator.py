@@ -383,6 +383,8 @@ async def _process_memory(
             fact_text=fact_text,
             mission=mission,
             tags=fact_tags,
+            event_date=memory.get("event_date"),
+            occurred_start=memory.get("occurred_start"),
             perf=perf,
         )
 
@@ -409,6 +411,8 @@ async def _process_memory(
                 memory_id=memory_id,
                 action=action,
                 mission=mission,
+                event_date=memory.get("event_date"),
+                occurred_start=memory.get("occurred_start"),
                 perf=perf,
             )
             results.append(result)
@@ -423,6 +427,8 @@ async def _process_memory(
             fact_text=fact_text,
             mission=mission,
             tags=fact_tags,
+            event_date=memory.get("event_date"),
+            occurred_start=memory.get("occurred_start"),
             perf=perf,
         )
 
@@ -529,6 +535,8 @@ async def _execute_create_action(
     memory_id: uuid.UUID,
     action: dict[str, Any],
     mission: str,
+    event_date: datetime | None = None,
+    occurred_start: datetime | None = None,
     perf: ConsolidationPerfLog | None = None,
 ) -> dict[str, Any]:
     """
@@ -552,6 +560,8 @@ async def _execute_create_action(
         fact_text=text,
         mission=mission,
         tags=tags,
+        event_date=event_date,
+        occurred_start=occurred_start,
         perf=perf,
     )
 
@@ -666,22 +676,21 @@ async def _find_related_mental_models(
     recall_result = await memory_engine.recall_async(
         bank_id=bank_id,
         query=query,
-        include_mental_models=True,
-        max_mental_models=15,  # Higher limit since we're not filtering by tags
-        max_tokens=256,  # Low token budget - we only need mental models
-        fact_type=["world", "experience"],  # Doesn't matter much, we want mental models
+        max_tokens=5000,  # Token budget for mental models
+        fact_type=["mental_model"],  # Only retrieve mental models
         request_context=request_context,
         _quiet=True,  # Suppress logging
         # NO tags parameter - intentionally get ALL mental models
     )
 
     # If no mental models returned, return empty list
-    if not recall_result.mental_models:
+    # When fact_type=["mental_model"], results come back in `results` field
+    if not recall_result.results:
         return []
 
     # Trust recall's relevance filtering - fetch full data for each mental model
     results = []
-    for mm in recall_result.mental_models:
+    for mm in recall_result.results:
         # Fetch full mental model data from DB to get history, source_memory_ids, tags
         row = await conn.fetchrow(
             f"""
@@ -689,7 +698,7 @@ async def _find_related_mental_models(
             FROM {fq_table("memory_units")}
             WHERE id = $1 AND bank_id = $2 AND fact_type = 'mental_model'
             """,
-            mm.id,
+            uuid.UUID(mm.id),
             bank_id,
         )
 
@@ -708,7 +717,7 @@ async def _find_related_mental_models(
                     "history": history,
                     "tags": row["tags"] or [],  # Include tags for LLM tag routing
                     "source_memory_ids": row["source_memory_ids"] or [],
-                    "similarity": mm.relevance,
+                    "similarity": 1.0,  # Retrieved via recall so assumed relevant
                 }
             )
 
@@ -747,7 +756,13 @@ async def _classify_and_merge(
         for mm in mental_models
     )
 
+    # Only include mission section if mission is set and not the default
+    mission_section = ""
+    if mission and mission != "General memory consolidation":
+        mission_section = f"\nMISSION: {mission}\nFocus on facts that are relevant to this mission.\n"
+
     user_prompt = CONSOLIDATION_USER_PROMPT.format(
+        mission_section=mission_section,
         fact_text=fact_text,
         fact_tags=json.dumps(fact_tags),
         mental_models_text=mental_models_text,
@@ -808,8 +823,13 @@ async def _create_new_mental_model(
     They inherit entities and temporal info from their source memories.
     Tags are used for visibility scoping (see tag routing rules in prompts).
     """
+    # Only include mission section if mission is set and not the default
+    mission_section = ""
+    if mission and mission != "General memory consolidation":
+        mission_section = f"\nMISSION: {mission}\nFrame the knowledge in a way that's useful for this mission.\n"
+
     user_prompt = NEW_LEARNING_USER_PROMPT.format(
-        mission=mission,
+        mission_section=mission_section,
         fact_text=fact_text,
     )
 

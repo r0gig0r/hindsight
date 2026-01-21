@@ -52,9 +52,9 @@ TOOL_SEARCH_MENTAL_MODELS = {
                     "type": "string",
                     "description": "Search query to find relevant mental models",
                 },
-                "max_results": {
+                "max_tokens": {
                     "type": "integer",
-                    "description": "Maximum number of mental models to return (default 10)",
+                    "description": "Maximum tokens for results (default 5000). Use higher values for broader searches.",
                 },
             },
             "required": ["query"],

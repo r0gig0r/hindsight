@@ -37,7 +37,7 @@ Output an ARRAY of actions (can be empty, one, or many).
 - Cross-scope insights (alice's fact about bob's topic) become UNTAGGED (global)"""
 
 CONSOLIDATION_USER_PROMPT = """Analyze this new fact against existing mental models.
-
+{mission_section}
 NEW FACT: {fact_text}
 FACT TAGS: {fact_tags}
 
@@ -81,7 +81,7 @@ BAD examples (do not do this):
 - Fact: "Alice works at Google" -> "Tracking employment information aids relationship management" (TOO GENERIC)"""
 
 NEW_LEARNING_USER_PROMPT = """Convert this fact into a clear knowledge statement. Preserve specific details.
-
+{mission_section}
 FACT: {fact_text}
 
 Output JSON:
