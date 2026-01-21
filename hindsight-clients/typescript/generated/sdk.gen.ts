@@ -12,6 +12,9 @@ import type {
   ClearBankMemoriesData,
   ClearBankMemoriesErrors,
   ClearBankMemoriesResponses,
+  ClearMentalModelsData,
+  ClearMentalModelsErrors,
+  ClearMentalModelsResponses,
   CreateDirectiveData,
   CreateDirectiveErrors,
   CreateDirectiveResponses,
@@ -57,9 +60,6 @@ import type {
   GetMemoryData,
   GetMemoryErrors,
   GetMemoryResponses,
-  GetMentalModelData,
-  GetMentalModelErrors,
-  GetMentalModelResponses,
   GetOperationStatusData,
   GetOperationStatusErrors,
   GetOperationStatusResponses,
@@ -83,9 +83,6 @@ import type {
   ListMemoriesData,
   ListMemoriesErrors,
   ListMemoriesResponses,
-  ListMentalModelsData,
-  ListMentalModelsErrors,
-  ListMentalModelsResponses,
   ListOperationsData,
   ListOperationsErrors,
   ListOperationsResponses,
@@ -112,6 +109,9 @@ import type {
   RetainMemoriesData,
   RetainMemoriesErrors,
   RetainMemoriesResponses,
+  TriggerConsolidationData,
+  TriggerConsolidationErrors,
+  TriggerConsolidationResponses,
   UpdateBankData,
   UpdateBankDispositionData,
   UpdateBankDispositionErrors,
@@ -344,37 +344,6 @@ export const regenerateEntityObservations = <
     ThrowOnError
   >({
     url: "/v1/default/banks/{bank_id}/entities/{entity_id}/regenerate",
-    ...options,
-  });
-
-/**
- * List mental models
- *
- * List auto-consolidated mental models. Mental models are automatically created and updated by the consolidation engine.
- */
-export const listMentalModels = <ThrowOnError extends boolean = false>(
-  options: Options<ListMentalModelsData, ThrowOnError>,
-) =>
-  (options.client ?? client).get<
-    ListMentalModelsResponses,
-    ListMentalModelsErrors,
-    ThrowOnError
-  >({ url: "/v1/default/banks/{bank_id}/mental-models", ...options });
-
-/**
- * Get mental model
- *
- * Get a specific mental model by ID.
- */
-export const getMentalModel = <ThrowOnError extends boolean = false>(
-  options: Options<GetMentalModelData, ThrowOnError>,
-) =>
-  (options.client ?? client).get<
-    GetMentalModelResponses,
-    GetMentalModelErrors,
-    ThrowOnError
-  >({
-    url: "/v1/default/banks/{bank_id}/mental-models/{model_id}",
     ...options,
   });
 
@@ -813,6 +782,34 @@ export const createOrUpdateBank = <ThrowOnError extends boolean = false>(
       ...options.headers,
     },
   });
+
+/**
+ * Clear all mental models
+ *
+ * Delete all mental models for a memory bank. This is useful for resetting the consolidated knowledge.
+ */
+export const clearMentalModels = <ThrowOnError extends boolean = false>(
+  options: Options<ClearMentalModelsData, ThrowOnError>,
+) =>
+  (options.client ?? client).delete<
+    ClearMentalModelsResponses,
+    ClearMentalModelsErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/mental-models", ...options });
+
+/**
+ * Trigger consolidation
+ *
+ * Run memory consolidation to create/update mental models from recent memories.
+ */
+export const triggerConsolidation = <ThrowOnError extends boolean = false>(
+  options: Options<TriggerConsolidationData, ThrowOnError>,
+) =>
+  (options.client ?? client).post<
+    TriggerConsolidationResponses,
+    TriggerConsolidationErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/consolidate", ...options });
 
 /**
  * Clear memory bank memories

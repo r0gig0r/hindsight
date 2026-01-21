@@ -759,7 +759,11 @@ async def _classify_and_merge(
     # Only include mission section if mission is set and not the default
     mission_section = ""
     if mission and mission != "General memory consolidation":
-        mission_section = f"\nMISSION: {mission}\nFocus on facts that are relevant to this mission.\n"
+        mission_section = f"""
+MISSION CONTEXT: {mission}
+
+Focus on DURABLE knowledge that serves this mission, not ephemeral state.
+"""
 
     user_prompt = CONSOLIDATION_USER_PROMPT.format(
         mission_section=mission_section,
@@ -826,7 +830,14 @@ async def _create_new_mental_model(
     # Only include mission section if mission is set and not the default
     mission_section = ""
     if mission and mission != "General memory consolidation":
-        mission_section = f"\nMISSION: {mission}\nFrame the knowledge in a way that's useful for this mission.\n"
+        mission_section = f"""
+MISSION CONTEXT: {mission}
+
+Extract knowledge that serves this mission. Ask yourself:
+- What PERMANENT fact does this teach us that helps the mission?
+- Is this durable knowledge (office locations, people, layouts) or ephemeral state (where user is now)?
+- Only extract what helps the mission - ignore irrelevant details.
+"""
 
     user_prompt = NEW_LEARNING_USER_PROMPT.format(
         mission_section=mission_section,

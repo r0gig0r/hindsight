@@ -782,194 +782,6 @@
         }
       }
     },
-    "/v1/default/banks/{bank_id}/mental-models": {
-      "get": {
-        "tags": [
-          "Mental Models"
-        ],
-        "summary": "List mental models",
-        "description": "List auto-consolidated mental models. Mental models are automatically created and updated by the consolidation engine.",
-        "operationId": "list_mental_models",
-        "parameters": [
-          {
-            "name": "bank_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Bank Id"
-            }
-          },
-          {
-            "name": "tags",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Filter by tags",
-              "title": "Tags"
-            },
-            "description": "Filter by tags"
-          },
-          {
-            "name": "tags_match",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "enum": [
-                "any",
-                "all",
-                "exact"
-              ],
-              "type": "string",
-              "description": "How to match tags",
-              "default": "any",
-              "title": "Tags Match"
-            },
-            "description": "How to match tags"
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "maximum": 1000,
-              "minimum": 1,
-              "default": 100,
-              "title": "Limit"
-            }
-          },
-          {
-            "name": "offset",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 0,
-              "default": 0,
-              "title": "Offset"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/MentalModelListResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/default/banks/{bank_id}/mental-models/{model_id}": {
-      "get": {
-        "tags": [
-          "Mental Models"
-        ],
-        "summary": "Get mental model",
-        "description": "Get a specific mental model by ID.",
-        "operationId": "get_mental_model",
-        "parameters": [
-          {
-            "name": "bank_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Bank Id"
-            }
-          },
-          {
-            "name": "model_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Model Id"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/MentalModelApiResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/default/banks/{bank_id}/reflections": {
       "get": {
         "tags": [
@@ -2811,6 +2623,124 @@
         }
       }
     },
+    "/v1/default/banks/{bank_id}/mental-models": {
+      "delete": {
+        "tags": [
+          "Banks"
+        ],
+        "summary": "Clear all mental models",
+        "description": "Delete all mental models for a memory bank. This is useful for resetting the consolidated knowledge.",
+        "operationId": "clear_mental_models",
+        "parameters": [
+          {
+            "name": "bank_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bank Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/default/banks/{bank_id}/consolidate": {
+      "post": {
+        "tags": [
+          "Banks"
+        ],
+        "summary": "Trigger consolidation",
+        "description": "Run memory consolidation to create/update mental models from recent memories.",
+        "operationId": "trigger_consolidation",
+        "parameters": [
+          {
+            "name": "bank_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bank Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsolidationResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/default/banks/{bank_id}/memories": {
       "post": {
         "tags": [
@@ -3428,6 +3358,45 @@
           "document_id": "session_1"
         }
       },
+      "ConsolidationResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status",
+            "description": "Status of the consolidation (completed or queued)"
+          },
+          "processed": {
+            "type": "integer",
+            "title": "Processed",
+            "description": "Number of memories processed"
+          },
+          "created": {
+            "type": "integer",
+            "title": "Created",
+            "description": "Number of mental models created"
+          },
+          "updated": {
+            "type": "integer",
+            "title": "Updated",
+            "description": "Number of mental models updated"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message",
+            "description": "Human-readable summary"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "processed",
+          "created",
+          "updated",
+          "message"
+        ],
+        "title": "ConsolidationResponse",
+        "description": "Response model for consolidation trigger endpoint."
+      },
       "CreateBankRequest": {
         "properties": {
           "name": {
@@ -3589,33 +3558,6 @@
         ],
         "title": "CreateReflectionResponse",
         "description": "Response model for reflection creation."
-      },
-      "CreatedMentalModel": {
-        "properties": {
-          "id": {
-            "type": "string",
-            "title": "Id",
-            "description": "Mental model ID"
-          },
-          "name": {
-            "type": "string",
-            "title": "Name",
-            "description": "Human-readable name"
-          },
-          "description": {
-            "type": "string",
-            "title": "Description",
-            "description": "What this model tracks"
-          }
-        },
-        "type": "object",
-        "required": [
-          "id",
-          "name",
-          "description"
-        ],
-        "title": "CreatedMentalModel",
-        "description": "A mental model created during reflection."
       },
       "DeleteDocumentResponse": {
         "properties": {
@@ -4294,17 +4236,6 @@
               }
             ],
             "description": "Include raw chunks. Set to {} to enable, null to disable (default: disabled)."
-          },
-          "reflections": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ReflectionsIncludeOptions"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Include relevant reflections. Set to {} to enable, null to disable (default: disabled)."
           }
         },
         "type": "object",
@@ -4575,111 +4506,6 @@
           "timestamp": "2024-01-15T10:30:00Z"
         }
       },
-      "MentalModelApiResponse": {
-        "properties": {
-          "id": {
-            "type": "string",
-            "title": "Id",
-            "description": "Unique mental model ID"
-          },
-          "bank_id": {
-            "type": "string",
-            "title": "Bank Id",
-            "description": "Bank this mental model belongs to"
-          },
-          "text": {
-            "type": "string",
-            "title": "Text",
-            "description": "The consolidated mental model text"
-          },
-          "proof_count": {
-            "type": "integer",
-            "title": "Proof Count",
-            "description": "Number of facts supporting this mental model"
-          },
-          "history": {
-            "items": {
-              "additionalProperties": true,
-              "type": "object"
-            },
-            "type": "array",
-            "title": "History",
-            "description": "History of changes to this mental model"
-          },
-          "tags": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array",
-            "title": "Tags",
-            "description": "Tags for scoped visibility"
-          },
-          "source_memory_ids": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array",
-            "title": "Source Memory Ids",
-            "description": "IDs of memories that consolidated into this"
-          },
-          "source_memories": {
-            "items": {
-              "$ref": "#/components/schemas/SourceMemory"
-            },
-            "type": "array",
-            "title": "Source Memories",
-            "description": "Full source memory details (when requested)"
-          },
-          "created_at": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Created At"
-          },
-          "updated_at": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Updated At"
-          }
-        },
-        "type": "object",
-        "required": [
-          "id",
-          "bank_id",
-          "text",
-          "proof_count"
-        ],
-        "title": "MentalModelApiResponse",
-        "description": "Response model for a mental model (auto-consolidated knowledge)."
-      },
-      "MentalModelListResponse": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/MentalModelApiResponse"
-            },
-            "type": "array",
-            "title": "Items"
-          }
-        },
-        "type": "object",
-        "required": [
-          "items"
-        ],
-        "title": "MentalModelListResponse",
-        "description": "Response model for listing mental models."
-      },
       "OperationResponse": {
         "properties": {
           "id": {
@@ -4871,72 +4697,6 @@
           "total": 150
         }
       },
-      "RecallMentalModelResult": {
-        "properties": {
-          "id": {
-            "type": "string",
-            "title": "Id",
-            "description": "Unique mental model ID"
-          },
-          "text": {
-            "type": "string",
-            "title": "Text",
-            "description": "The consolidated mental model text"
-          },
-          "proof_count": {
-            "type": "integer",
-            "title": "Proof Count",
-            "description": "Number of facts supporting this mental model"
-          },
-          "relevance": {
-            "type": "number",
-            "title": "Relevance",
-            "description": "Relevance score to the query",
-            "default": 0.0
-          }
-        },
-        "type": "object",
-        "required": [
-          "id",
-          "text",
-          "proof_count"
-        ],
-        "title": "RecallMentalModelResult",
-        "description": "A mental model result in recall response."
-      },
-      "RecallReflectionResult": {
-        "properties": {
-          "id": {
-            "type": "string",
-            "title": "Id",
-            "description": "Unique reflection ID"
-          },
-          "name": {
-            "type": "string",
-            "title": "Name",
-            "description": "Human-readable name"
-          },
-          "content": {
-            "type": "string",
-            "title": "Content",
-            "description": "The synthesized content"
-          },
-          "relevance": {
-            "type": "number",
-            "title": "Relevance",
-            "description": "Relevance score to the query",
-            "default": 0.0
-          }
-        },
-        "type": "object",
-        "required": [
-          "id",
-          "name",
-          "content"
-        ],
-        "title": "RecallReflectionResult",
-        "description": "A reflection result in recall response."
-      },
       "RecallRequest": {
         "properties": {
           "query": {
@@ -5093,36 +4853,6 @@
             ],
             "title": "Chunks",
             "description": "Chunks for facts, keyed by chunk_id"
-          },
-          "mental_models": {
-            "anyOf": [
-              {
-                "items": {
-                  "$ref": "#/components/schemas/RecallMentalModelResult"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Mental Models",
-            "description": "Relevant mental models (consolidated knowledge) matching the query"
-          },
-          "reflections": {
-            "anyOf": [
-              {
-                "items": {
-                  "$ref": "#/components/schemas/RecallReflectionResult"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Reflections",
-            "description": "Relevant reflections (user-curated summaries) matching the query"
           }
         },
         "type": "object",
@@ -5151,22 +4881,6 @@
               ]
             }
           },
-          "mental_models": [
-            {
-              "id": "789e0123-e45b-67d8-a901-234567890123",
-              "proof_count": 5,
-              "relevance": 0.92,
-              "text": "Alice is a machine learning expert who frequently discusses AI applications"
-            }
-          ],
-          "reflections": [
-            {
-              "content": "Alice specializes in ML...",
-              "id": "012e3456-e78b-90d1-a234-567890123456",
-              "name": "Team Expertise Summary",
-              "relevance": 0.88
-            }
-          ],
           "results": [
             {
               "chunk_id": "456e7890-e12b-34d5-a678-901234567890",
@@ -5358,14 +5072,6 @@
             "type": "array",
             "title": "Memories",
             "description": "Memory facts used to generate the response"
-          },
-          "mental_models": {
-            "items": {
-              "$ref": "#/components/schemas/ReflectMentalModel"
-            },
-            "type": "array",
-            "title": "Mental Models",
-            "description": "Mental models accessed during reflection"
           }
         },
         "type": "object",
@@ -5709,14 +5415,6 @@
               }
             ],
             "description": "Execution trace of tool and LLM calls. Only present when include.tool_calls is set."
-          },
-          "mental_models_created": {
-            "items": {
-              "$ref": "#/components/schemas/CreatedMentalModel"
-            },
-            "type": "array",
-            "title": "Mental Models Created",
-            "description": "Mental models created during this reflection (via the learn tool)."
           }
         },
         "type": "object",
@@ -5749,13 +5447,6 @@
               }
             ]
           },
-          "mental_models_created": [
-            {
-              "description": "Track AI-related decisions and plans",
-              "id": "mm-new-1",
-              "name": "AI Strategy"
-            }
-          ],
           "structured_output": {
             "key_points": [
               "Used in healthcare",
@@ -5959,21 +5650,6 @@
         "title": "ReflectionResponse",
         "description": "Response model for a reflection."
       },
-      "ReflectionsIncludeOptions": {
-        "properties": {
-          "max_results": {
-            "type": "integer",
-            "maximum": 20.0,
-            "minimum": 1.0,
-            "title": "Max Results",
-            "description": "Maximum number of reflections to return",
-            "default": 5
-          }
-        },
-        "type": "object",
-        "title": "ReflectionsIncludeOptions",
-        "description": "Options for including reflections in recall results."
-      },
       "RetainRequest": {
         "properties": {
           "items": {
@@ -6094,69 +5770,6 @@
             "total_tokens": 600
           }
         }
-      },
-      "SourceMemory": {
-        "properties": {
-          "id": {
-            "type": "string",
-            "title": "Id",
-            "description": "Memory unit ID"
-          },
-          "text": {
-            "type": "string",
-            "title": "Text",
-            "description": "Memory text content"
-          },
-          "type": {
-            "type": "string",
-            "title": "Type",
-            "description": "Fact type (world, experience)"
-          },
-          "context": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Context",
-            "description": "Memory context"
-          },
-          "occurred_start": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Occurred Start",
-            "description": "When the event occurred"
-          },
-          "mentioned_at": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Mentioned At",
-            "description": "When the memory was mentioned"
-          }
-        },
-        "type": "object",
-        "required": [
-          "id",
-          "text",
-          "type"
-        ],
-        "title": "SourceMemory",
-        "description": "A source memory that contributed to a mental model."
       },
       "TagItem": {
         "properties": {

@@ -229,6 +229,13 @@ export function BankProfileView() {
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
 
+  // Clear mental models state
+  const [showClearMentalModelsDialog, setShowClearMentalModelsDialog] = useState(false);
+  const [isClearingMentalModels, setIsClearingMentalModels] = useState(false);
+
+  // Consolidation state
+  const [isConsolidating, setIsConsolidating] = useState(false);
+
   // Edit state
   const [editMission, setEditMission] = useState("");
   const [editDisposition, setEditDisposition] = useState<DispositionTraits>({
@@ -332,6 +339,42 @@ export function BankProfileView() {
     }
   };
 
+  const handleClearMentalModels = async () => {
+    if (!currentBank) return;
+
+    setIsClearingMentalModels(true);
+    try {
+      const result = await client.clearMentalModels(currentBank);
+      setShowClearMentalModelsDialog(false);
+      await loadData();
+      alert(result.message || "Mental models cleared successfully");
+    } catch (error) {
+      console.error("Error clearing mental models:", error);
+      alert("Error clearing mental models: " + (error as Error).message);
+    } finally {
+      setIsClearingMentalModels(false);
+    }
+  };
+
+  const handleTriggerConsolidation = async () => {
+    if (!currentBank) return;
+
+    setIsConsolidating(true);
+    try {
+      const result = await client.triggerConsolidation(currentBank);
+      await loadData();
+      alert(
+        result.message ||
+          `Consolidation completed: ${result.created} created, ${result.updated} updated`
+      );
+    } catch (error) {
+      console.error("Error triggering consolidation:", error);
+      alert("Error triggering consolidation: " + (error as Error).message);
+    } finally {
+      setIsConsolidating(false);
+    }
+  };
+
   const handleDeleteDirective = async () => {
     if (!currentBank || !directiveDeleteTarget) return;
 
@@ -429,6 +472,33 @@ export function BankProfileView() {
               </Button>
               <Button onClick={() => setEditMode(true)} size="sm">
                 Edit Profile
+              </Button>
+              <Button
+                onClick={handleTriggerConsolidation}
+                variant="outline"
+                size="sm"
+                disabled={isConsolidating}
+              >
+                {isConsolidating ? (
+                  <>
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    Consolidating...
+                  </>
+                ) : (
+                  <>
+                    <Brain className="w-4 h-4 mr-2" />
+                    Run Consolidation
+                  </>
+                )}
+              </Button>
+              <Button
+                onClick={() => setShowClearMentalModelsDialog(true)}
+                variant="outline"
+                size="sm"
+                className="text-amber-600 hover:text-amber-700 hover:bg-amber-50 border-amber-300"
+              >
+                <Trash2 className="w-4 h-4 mr-2" />
+                Clear Mental Models
               </Button>
               <Button onClick={() => setShowDeleteDialog(true)} variant="destructive" size="sm">
                 <Trash2 className="w-4 h-4 mr-2" />
@@ -806,6 +876,50 @@ export function BankProfileView() {
                 <>
                   <Trash2 className="w-4 h-4 mr-2" />
                   Delete Bank
+                </>
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Clear Mental Models Confirmation Dialog */}
+      <AlertDialog open={showClearMentalModelsDialog} onOpenChange={setShowClearMentalModelsDialog}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Clear Mental Models</AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-2 text-sm text-muted-foreground">
+                <p>
+                  Are you sure you want to clear all mental models for{" "}
+                  <span className="font-semibold text-foreground">{currentBank}</span>?
+                </p>
+                <p className="text-amber-600 dark:text-amber-400 font-medium">
+                  This will delete all consolidated knowledge. Mental models will be regenerated the
+                  next time consolidation runs.
+                </p>
+                {stats && stats.total_mental_models > 0 && (
+                  <p>This will delete {stats.total_mental_models} mental models.</p>
+                )}
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isClearingMentalModels}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleClearMentalModels}
+              disabled={isClearingMentalModels}
+              className="bg-amber-500 text-white hover:bg-amber-600"
+            >
+              {isClearingMentalModels ? (
+                <>
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  Clearing...
+                </>
+              ) : (
+                <>
+                  <Trash2 className="w-4 h-4 mr-2" />
+                  Clear Mental Models
                 </>
               )}
             </AlertDialogAction>

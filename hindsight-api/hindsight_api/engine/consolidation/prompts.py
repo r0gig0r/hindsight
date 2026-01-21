@@ -65,26 +65,40 @@ NEW_LEARNING_SYSTEM_PROMPT = """You are a memory consolidation system. Your job 
 
 You must output ONLY valid JSON with no markdown formatting, no code blocks, and no additional text.
 
-IMPORTANT: Preserve the specific information from the fact. Do NOT:
-- Abstract into general principles or advice
-- Generate business insights or recommendations
-- Remove specific names, places, or details
-- Make the knowledge generic
+## EXTRACT DURABLE KNOWLEDGE, NOT EPHEMERAL STATE
+Facts often describe events or actions. Extract the DURABLE KNOWLEDGE implied by the fact, not the transient state.
+
+Examples of extracting durable knowledge:
+- "User moved to Room 203" -> "Room 203 exists" (location exists, not where user is now)
+- "User visited Patterson Law at Room 203" -> "Patterson Law is located in Room 203"
+- "User took the elevator to floor 3" -> "Floor 3 is accessible by elevator"
+- "User met John at the coffee shop" -> "John frequents the coffee shop" or just the fact itself
+
+DO NOT track current user position/state as knowledge - that changes constantly.
+DO track permanent facts learned from the user's actions.
+
+## PRESERVE SPECIFIC DETAILS
+Keep names, locations, numbers, and other specifics. Do NOT:
+- Abstract into general principles
+- Generate business insights
+- Make knowledge generic
 
 GOOD examples:
-- Fact: "John likes pizza" -> Knowledge: "John likes pizza"
-- Fact: "Alice works at Google" -> Knowledge: "Alice works at Google"
-- Fact: "The meeting is at 3pm on Tuesdays" -> Knowledge: "Meetings are scheduled for 3pm on Tuesdays"
+- Fact: "John likes pizza" -> "John likes pizza"
+- Fact: "Alice works at Google" -> "Alice works at Google"
 
-BAD examples (do not do this):
-- Fact: "John likes pizza" -> "Understanding dietary preferences helps with meal planning" (TOO ABSTRACT)
-- Fact: "Alice works at Google" -> "Tracking employment information aids relationship management" (TOO GENERIC)"""
+BAD examples:
+- "John likes pizza" -> "Understanding dietary preferences helps..." (TOO ABSTRACT)
+- "User is at Room 203" -> "User is currently at Room 203" (EPHEMERAL STATE)"""
 
-NEW_LEARNING_USER_PROMPT = """Convert this fact into a clear knowledge statement. Preserve specific details.
+NEW_LEARNING_USER_PROMPT = """Convert this fact into a clear, durable knowledge statement.
 {mission_section}
 FACT: {fact_text}
 
+IMPORTANT: Extract PERMANENT knowledge from this fact, not transient user state.
+If the fact describes user movement/location, extract what it tells us about the environment, not where the user currently is.
+
 Output JSON:
 {{
-  "learning_text": "..."  // The knowledge statement (preserve specific details!)
+  "learning_text": "..."  // Durable knowledge (not "user is currently at X")
 }}"""

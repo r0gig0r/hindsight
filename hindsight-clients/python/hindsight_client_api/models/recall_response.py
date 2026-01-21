@@ -21,8 +21,6 @@ from pydantic import BaseModel, ConfigDict
 from typing import Any, ClassVar, Dict, List, Optional
 from hindsight_client_api.models.chunk_data import ChunkData
 from hindsight_client_api.models.entity_state_response import EntityStateResponse
-from hindsight_client_api.models.recall_mental_model_result import RecallMentalModelResult
-from hindsight_client_api.models.recall_reflection_result import RecallReflectionResult
 from hindsight_client_api.models.recall_result import RecallResult
 from typing import Optional, Set
 from typing_extensions import Self
@@ -35,9 +33,7 @@ class RecallResponse(BaseModel):
     trace: Optional[Dict[str, Any]] = None
     entities: Optional[Dict[str, EntityStateResponse]] = None
     chunks: Optional[Dict[str, ChunkData]] = None
-    mental_models: Optional[List[RecallMentalModelResult]] = None
-    reflections: Optional[List[RecallReflectionResult]] = None
-    __properties: ClassVar[List[str]] = ["results", "trace", "entities", "chunks", "mental_models", "reflections"]
+    __properties: ClassVar[List[str]] = ["results", "trace", "entities", "chunks"]
 
     model_config = ConfigDict(
         populate_by_name=True,
@@ -99,20 +95,6 @@ class RecallResponse(BaseModel):
                 if self.chunks[_key_chunks]:
                     _field_dict[_key_chunks] = self.chunks[_key_chunks].to_dict()
             _dict['chunks'] = _field_dict
-        # override the default output from pydantic by calling `to_dict()` of each item in mental_models (list)
-        _items = []
-        if self.mental_models:
-            for _item_mental_models in self.mental_models:
-                if _item_mental_models:
-                    _items.append(_item_mental_models.to_dict())
-            _dict['mental_models'] = _items
-        # override the default output from pydantic by calling `to_dict()` of each item in reflections (list)
-        _items = []
-        if self.reflections:
-            for _item_reflections in self.reflections:
-                if _item_reflections:
-                    _items.append(_item_reflections.to_dict())
-            _dict['reflections'] = _items
         # set to None if trace (nullable) is None
         # and model_fields_set contains the field
         if self.trace is None and "trace" in self.model_fields_set:
@@ -127,16 +109,6 @@ class RecallResponse(BaseModel):
         # and model_fields_set contains the field
         if self.chunks is None and "chunks" in self.model_fields_set:
             _dict['chunks'] = None
-
-        # set to None if mental_models (nullable) is None
-        # and model_fields_set contains the field
-        if self.mental_models is None and "mental_models" in self.model_fields_set:
-            _dict['mental_models'] = None
-
-        # set to None if reflections (nullable) is None
-        # and model_fields_set contains the field
-        if self.reflections is None and "reflections" in self.model_fields_set:
-            _dict['reflections'] = None
 
         return _dict
 
@@ -163,9 +135,7 @@ class RecallResponse(BaseModel):
                 for _k, _v in obj["chunks"].items()
             )
             if obj.get("chunks") is not None
-            else None,
-            "mental_models": [RecallMentalModelResult.from_dict(_item) for _item in obj["mental_models"]] if obj.get("mental_models") is not None else None,
-            "reflections": [RecallReflectionResult.from_dict(_item) for _item in obj["reflections"]] if obj.get("reflections") is not None else None
+            else None
         })
         return _obj
 

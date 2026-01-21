@@ -17,18 +17,21 @@ import pprint
 import re  # noqa: F401
 import json
 
-from pydantic import BaseModel, ConfigDict, Field
-from typing import Any, ClassVar, Dict, List, Optional
-from typing_extensions import Annotated
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+from typing import Any, ClassVar, Dict, List
 from typing import Optional, Set
 from typing_extensions import Self
 
-class ReflectionsIncludeOptions(BaseModel):
+class ConsolidationResponse(BaseModel):
     """
-    Options for including reflections in recall results.
+    Response model for consolidation trigger endpoint.
     """ # noqa: E501
-    max_results: Optional[Annotated[int, Field(le=20, strict=True, ge=1)]] = Field(default=5, description="Maximum number of reflections to return")
-    __properties: ClassVar[List[str]] = ["max_results"]
+    status: StrictStr = Field(description="Status of the consolidation (completed or queued)")
+    processed: StrictInt = Field(description="Number of memories processed")
+    created: StrictInt = Field(description="Number of mental models created")
+    updated: StrictInt = Field(description="Number of mental models updated")
+    message: StrictStr = Field(description="Human-readable summary")
+    __properties: ClassVar[List[str]] = ["status", "processed", "created", "updated", "message"]
 
     model_config = ConfigDict(
         populate_by_name=True,
@@ -48,7 +51,7 @@ class ReflectionsIncludeOptions(BaseModel):
 
     @classmethod
     def from_json(cls, json_str: str) -> Optional[Self]:
-        """Create an instance of ReflectionsIncludeOptions from a JSON string"""
+        """Create an instance of ConsolidationResponse from a JSON string"""
         return cls.from_dict(json.loads(json_str))
 
     def to_dict(self) -> Dict[str, Any]:
@@ -73,7 +76,7 @@ class ReflectionsIncludeOptions(BaseModel):
 
     @classmethod
     def from_dict(cls, obj: Optional[Dict[str, Any]]) -> Optional[Self]:
-        """Create an instance of ReflectionsIncludeOptions from a dict"""
+        """Create an instance of ConsolidationResponse from a dict"""
         if obj is None:
             return None
 
@@ -81,7 +84,11 @@ class ReflectionsIncludeOptions(BaseModel):
             return cls.model_validate(obj)
 
         _obj = cls.model_validate({
-            "max_results": obj.get("max_results") if obj.get("max_results") is not None else 5
+            "status": obj.get("status"),
+            "processed": obj.get("processed"),
+            "created": obj.get("created"),
+            "updated": obj.get("updated"),
+            "message": obj.get("message")
         })
         return _obj
 

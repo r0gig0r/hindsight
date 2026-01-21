@@ -209,6 +209,34 @@ export class ControlPlaneClient {
   }
 
   /**
+   * Clear all mental models for a bank
+   */
+  async clearMentalModels(bankId: string) {
+    return this.fetchApi<{
+      success: boolean;
+      message: string;
+      deleted_count: number;
+    }>(`/api/banks/${bankId}/mental-models`, {
+      method: "DELETE",
+    });
+  }
+
+  /**
+   * Trigger consolidation for a bank
+   */
+  async triggerConsolidation(bankId: string) {
+    return this.fetchApi<{
+      status: string;
+      processed: number;
+      created: number;
+      updated: number;
+      message: string;
+    }>(`/api/banks/${bankId}/consolidate`, {
+      method: "POST",
+    });
+  }
+
+  /**
    * Get chunk
    */
   async getChunk(chunkId: string) {

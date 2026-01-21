@@ -177,41 +177,24 @@ class TestReflectionsCRUD:
 
 
 class TestMentalModelsAPI:
-    """Test mental models API endpoints (read-only).
+    """Test mental models API endpoints.
 
-    Mental models are auto-generated via consolidation, not manually created.
-    The API only supports listing and getting mental models.
+    NOTE: Mental models are now stored in memory_units with fact_type='mental_model'
+    and accessed via recall with fact_type=["mental_model"]. The old /mental-models
+    endpoint was removed. These tests are skipped.
     """
 
+    @pytest.mark.skip(reason="Mental models endpoint removed - use recall with fact_type=['mental_model']")
     @pytest.mark.asyncio
     async def test_list_mental_models_empty(self, api_client, test_bank_id):
         """Test listing mental models when none exist."""
-        # Create bank first via profile endpoint
-        await api_client.get(f"/v1/default/banks/{test_bank_id}/profile")
+        pass
 
-        # List mental models (should be empty)
-        response = await api_client.get(f"/v1/default/banks/{test_bank_id}/mental-models")
-        assert response.status_code == 200
-        result = response.json()
-        assert "items" in result
-        assert len(result["items"]) == 0
-
-        # Cleanup
-        await api_client.delete(f"/v1/default/banks/{test_bank_id}")
-
+    @pytest.mark.skip(reason="Mental models endpoint removed - use recall with fact_type=['mental_model']")
     @pytest.mark.asyncio
     async def test_get_mental_model_not_found(self, api_client, test_bank_id):
         """Test getting a non-existent mental model."""
-        # Create bank first via profile endpoint
-        await api_client.get(f"/v1/default/banks/{test_bank_id}/profile")
-
-        # Try to get a non-existent mental model
-        fake_id = "00000000-0000-0000-0000-000000000000"
-        response = await api_client.get(f"/v1/default/banks/{test_bank_id}/mental-models/{fake_id}")
-        assert response.status_code == 404
-
-        # Cleanup
-        await api_client.delete(f"/v1/default/banks/{test_bank_id}")
+        pass
 
 
 class TestReflectionsAPI:
@@ -220,10 +203,12 @@ class TestReflectionsAPI:
     @pytest.mark.asyncio
     async def test_reflections_api_crud(self, api_client, test_bank_id):
         """Test full CRUD cycle through API."""
+        import asyncio
+
         # Create bank first via profile endpoint
         await api_client.get(f"/v1/default/banks/{test_bank_id}/profile")
 
-        # Create a reflection
+        # Create a reflection (async operation)
         response = await api_client.post(
             f"/v1/default/banks/{test_bank_id}/reflections",
             json={
@@ -234,19 +219,34 @@ class TestReflectionsAPI:
             },
         )
         assert response.status_code == 200
-        reflection = response.json()
-        assert reflection["name"] == "API Test Reflection"
+        create_result = response.json()
+        assert "operation_id" in create_result
+        operation_id = create_result["operation_id"]
+
+        # Wait for the async operation to complete
+        for _ in range(30):  # Wait up to 30 seconds
+            response = await api_client.get(f"/v1/default/banks/{test_bank_id}/operations/{operation_id}")
+            if response.status_code == 200:
+                op_status = response.json()
+                if op_status.get("status") == "completed":
+                    break
+            await asyncio.sleep(1)
+
+        # List reflections to get the created reflection
+        response = await api_client.get(f"/v1/default/banks/{test_bank_id}/reflections")
+        assert response.status_code == 200
+        reflections = response.json()["items"]
+        assert len(reflections) >= 1
+
+        # Find our reflection
+        reflection = next((r for r in reflections if r["name"] == "API Test Reflection"), None)
+        assert reflection is not None, f"Reflection not found. Items: {reflections}"
         reflection_id = reflection["id"]
 
         # Get the reflection
         response = await api_client.get(f"/v1/default/banks/{test_bank_id}/reflections/{reflection_id}")
         assert response.status_code == 200
         assert response.json()["name"] == "API Test Reflection"
-
-        # List reflections
-        response = await api_client.get(f"/v1/default/banks/{test_bank_id}/reflections")
-        assert response.status_code == 200
-        assert len(response.json()["items"]) >= 1
 
         # Update the reflection
         response = await api_client.patch(

@@ -1,42 +1,83 @@
 import { NextResponse } from "next/server";
-
-const DATAPLANE_URL = process.env.HINDSIGHT_CP_DATAPLANE_API_URL || "http://localhost:8888";
+import { sdk, lowLevelClient } from "@/lib/hindsight-client";
 
 export async function GET(request: Request, { params }: { params: Promise<{ bankId: string }> }) {
   try {
     const { bankId } = await params;
     const { searchParams } = new URL(request.url);
     const tags = searchParams.getAll("tags");
-    const tagsMatch = searchParams.get("tags_match");
+    const tagsMatch = searchParams.get("tags_match") as
+      | "any"
+      | "all"
+      | "any_strict"
+      | "all_strict"
+      | undefined;
 
     if (!bankId) {
       return NextResponse.json({ error: "bank_id is required" }, { status: 400 });
     }
 
-    const queryParams = new URLSearchParams();
-    if (tags.length > 0) {
-      tags.forEach((t) => queryParams.append("tags", t));
-    }
-    if (tagsMatch) {
-      queryParams.append("tags_match", tagsMatch);
-    }
+    const response = await sdk.listMemories({
+      client: lowLevelClient,
+      path: { bank_id: bankId },
+      query: {
+        type: "mental_model",
+        tags: tags.length > 0 ? tags : undefined,
+        tags_match: tagsMatch,
+        limit: 1000,
+      },
+    });
 
-    const url = `${DATAPLANE_URL}/v1/default/banks/${bankId}/mental-models${queryParams.toString() ? `?${queryParams}` : ""}`;
-    const response = await fetch(url, { method: "GET" });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("API error listing mental models:", errorText);
-      return NextResponse.json(
-        { error: "Failed to list mental models" },
-        { status: response.status }
-      );
+    if (response.error) {
+      console.error("API error listing mental models:", response.error);
+      return NextResponse.json({ error: "Failed to list mental models" }, { status: 500 });
     }
 
-    const data = await response.json();
-    return NextResponse.json(data, { status: 200 });
+    // Transform list memories response to mental models format
+    const items = (response.data?.items || []).map((item) => ({
+      id: item.id,
+      bank_id: bankId,
+      text: item.text,
+      proof_count: 1,
+      history: [],
+      tags: item.tags || [],
+      source_memory_ids: [],
+      source_memories: [],
+      created_at: item.date,
+      updated_at: item.date,
+    }));
+
+    return NextResponse.json({ items }, { status: 200 });
   } catch (error) {
     console.error("Error listing mental models:", error);
     return NextResponse.json({ error: "Failed to list mental models" }, { status: 500 });
+  }
+}
+
+export async function DELETE(
+  request: Request,
+  { params }: { params: Promise<{ bankId: string }> }
+) {
+  try {
+    const { bankId } = await params;
+
+    if (!bankId) {
+      return NextResponse.json({ error: "bank_id is required" }, { status: 400 });
+    }
+
+    const response = await sdk.clearMentalModels({
+      client: lowLevelClient,
+      path: { bank_id: bankId },
+    });
+
+    if (response.error) {
+      console.error("API error clearing mental models:", response.error);
+      return NextResponse.json({ error: "Failed to clear mental models" }, { status: 500 });
+    }
+
+    return NextResponse.json(response.data, { status: 200 });
+  } catch (error) {
+    console.error("Error clearing mental models:", error);
+    return NextResponse.json({ error: "Failed to clear mental models" }, { status: 500 });
   }
 }

@@ -2576,6 +2576,79 @@ class MemoryEngine(MemoryEngineInterface):
                 except Exception as e:
                     raise Exception(f"Failed to delete agent data: {str(e)}")
 
+    async def clear_mental_models(
+        self,
+        bank_id: str,
+        *,
+        request_context: "RequestContext",
+    ) -> dict[str, int]:
+        """
+        Clear all mental models for a bank.
+
+        Args:
+            bank_id: Bank ID to clear mental models for
+            request_context: Request context for authentication.
+
+        Returns:
+            Dictionary with count of deleted mental models
+        """
+        await self._authenticate_tenant(request_context)
+        pool = await self._get_pool()
+        async with acquire_with_retry(pool) as conn:
+            async with conn.transaction():
+                # Count mental models before deletion
+                count = await conn.fetchval(
+                    f"SELECT COUNT(*) FROM {fq_table('memory_units')} WHERE bank_id = $1 AND fact_type = 'mental_model'",
+                    bank_id,
+                )
+
+                # Delete all mental models
+                await conn.execute(
+                    f"DELETE FROM {fq_table('memory_units')} WHERE bank_id = $1 AND fact_type = 'mental_model'",
+                    bank_id,
+                )
+
+                # Reset consolidation timestamp
+                await conn.execute(
+                    f"UPDATE {fq_table('banks')} SET last_consolidated_at = NULL WHERE bank_id = $1",
+                    bank_id,
+                )
+
+                return {"deleted_count": count or 0}
+
+    async def run_consolidation(
+        self,
+        bank_id: str,
+        *,
+        request_context: "RequestContext",
+    ) -> dict[str, int]:
+        """
+        Run memory consolidation to create/update mental models.
+
+        Args:
+            bank_id: Bank ID to run consolidation for
+            request_context: Request context for authentication.
+
+        Returns:
+            Dictionary with consolidation stats
+        """
+        await self._authenticate_tenant(request_context)
+
+        from .consolidation import run_consolidation_job
+
+        result = await run_consolidation_job(
+            memory_engine=self,
+            bank_id=bank_id,
+            request_context=request_context,
+        )
+
+        return {
+            "processed": result.get("processed", 0),
+            "created": result.get("created", 0),
+            "updated": result.get("updated", 0),
+            "skipped": result.get("skipped", 0),
+        }
+
     async def get_graph_data(
         self,
         bank_id: str | None = None,
@@ -3354,10 +3427,12 @@ class MemoryEngine(MemoryEngineInterface):
 
         # Create tool callbacks that acquire connections only when needed
         from .reflect.tools import tool_search_reflections
+        from .retain import embedding_utils
 
         async def search_reflections_fn(q: str, max_results: int = 5) -> dict[str, Any]:
             # Generate embedding for the query
-            query_embedding = await self.embeddings.generate_embeddings(q)
+            embeddings = await embedding_utils.generate_embeddings_batch(self.embeddings, [q])
+            query_embedding = embeddings[0]
             async with pool.acquire() as conn:
                 return await tool_search_reflections(
                     conn,
