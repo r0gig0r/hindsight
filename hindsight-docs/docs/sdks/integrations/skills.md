@@ -25,6 +25,8 @@ The skill supports two deployment modes:
 
 ## Quick Install
 
+### Option 1: Interactive Installer (Recommended)
+
 ```bash
 curl -fsSL https://hindsight.vectorize.io/get-skill | bash
 ```
@@ -53,6 +55,21 @@ curl -fsSL https://hindsight.vectorize.io/get-skill | bash -s -- --app codex
 ```bash
 # Direct cloud setup (skips interactive prompts for mode)
 curl -fsSL https://hindsight.vectorize.io/get-skill | bash -s -- --app claude --mode cloud
+```
+
+### Option 2: Using add-skill
+
+If you use [add-skill](https://add-skill.org/) to manage your agent skills:
+
+```bash
+npx add-skill vectorize-io/hindsight --skill hindsight
+```
+
+This installs a universal SKILL.md that auto-detects your configuration. On first use, the AI will prompt you to run the interactive setup if Hindsight isn't configured yet.
+
+**Note:** After installing via add-skill, you still need to configure Hindsight on first use. The AI will guide you through running:
+```bash
+curl -fsSL https://hindsight.vectorize.io/get-skill | bash
 ```
 
 ## What the Skill Provides
