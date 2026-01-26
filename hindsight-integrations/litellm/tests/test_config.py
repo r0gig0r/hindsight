@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from hindsight_litellm import configure, wrap_openai, wrap_anthropic
+from hindsight_litellm import configure, wrap_openai, wrap_anthropic, reset_config, is_configured
 from hindsight_litellm.config import (
     DEFAULT_HINDSIGHT_API_URL,
     DEFAULT_BANK_ID,
@@ -82,9 +82,9 @@ class TestConfigure:
         configure()
         assert is_configured() is True
 
-    def test_is_configured_false_when_disabled(self):
-        """Test is_configured() returns False when disabled."""
-        configure(enabled=False)
+    def test_is_configured_false_when_not_configured(self):
+        """Test is_configured() returns False when not configured."""
+        reset_config()
         assert is_configured() is False
 
 
