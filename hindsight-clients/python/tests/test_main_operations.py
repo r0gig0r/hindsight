@@ -6,10 +6,11 @@ These tests require a running Hindsight API server.
 
 import os
 import uuid
-import pytest
 from datetime import datetime
-from hindsight_client import Hindsight
 
+import pytest
+
+from hindsight_client import Hindsight
 
 # Test configuration
 HINDSIGHT_API_URL = os.getenv("HINDSIGHT_API_URL", "http://localhost:8888")
@@ -191,14 +192,14 @@ class TestReflect:
         When response_schema is provided, the response returns structured_output
         field parsed according to the provided JSON schema.
         """
-        from typing import Optional
+
         from pydantic import BaseModel
 
         # Define schema using Pydantic model
         class RecommendationResponse(BaseModel):
             recommendation: str
             reasons: list[str]
-            confidence: Optional[str] = None  # Optional for LLM flexibility
+            confidence: str | None = None  # Optional for LLM flexibility
 
         response = client.reflect(
             bank_id=bank_id,
@@ -224,9 +225,7 @@ class TestListMemories:
         """Setup: Store some test memories synchronously."""
         client.retain_batch(
             bank_id=bank_id,
-            items=[
-                {"content": f"Alice likes topic number {i}"} for i in range(5)
-            ],
+            items=[{"content": f"Alice likes topic number {i}"} for i in range(5)],
             retain_async=False,  # Wait for fact extraction to complete
         )
 
@@ -359,6 +358,7 @@ class TestDocuments:
     def test_delete_document(self, client, bank_id):
         """Test deleting a document."""
         import asyncio
+
         from hindsight_client_api import ApiClient, Configuration
         from hindsight_client_api.api import DocumentsApi
 
@@ -390,6 +390,7 @@ class TestDocuments:
     def test_get_document(self, client, bank_id):
         """Test getting a document."""
         import asyncio
+
         from hindsight_client_api import ApiClient, Configuration
         from hindsight_client_api.api import DocumentsApi
 
@@ -432,6 +433,7 @@ class TestEntities:
     def test_list_entities(self, client, bank_id):
         """Test listing entities."""
         import asyncio
+
         from hindsight_client_api import ApiClient, Configuration
         from hindsight_client_api.api import EntitiesApi
 
@@ -456,6 +458,7 @@ class TestEntities:
     def test_list_entities_with_pagination(self, client, bank_id):
         """Test listing entities with pagination parameters."""
         import asyncio
+
         from hindsight_client_api import ApiClient, Configuration
         from hindsight_client_api.api import EntitiesApi
 
@@ -482,6 +485,7 @@ class TestEntities:
     def test_get_entity(self, client, bank_id):
         """Test getting a specific entity."""
         import asyncio
+
         from hindsight_client_api import ApiClient, Configuration
         from hindsight_client_api.api import EntitiesApi
 
@@ -508,12 +512,151 @@ class TestEntities:
             assert entity.id == entity_id
 
 
+
+class TestTags:
+    """Tests for tags filtering functionality."""
+
+    @pytest.fixture(autouse=True)
+    def setup_memories(self, client, bank_id):
+        """Setup: Store memories with different tags."""
+        client.retain_batch(
+            bank_id=bank_id,
+            items=[
+                {"content": "Project X meeting notes from Monday", "tags": ["project_x", "meetings"]},
+                {"content": "Project X design document", "tags": ["project_x", "docs"]},
+                {"content": "Project Y sprint planning", "tags": ["project_y", "meetings"]},
+                {"content": "General company announcement", "tags": ["company"]},
+                {"content": "Untagged memory about random things"},  # no tags
+            ],
+            retain_async=False,
+        )
+
+    def test_recall_with_tags_any(self, client, bank_id):
+        """Test recall with tags using 'any' match (includes untagged)."""
+        response = client.recall(
+            bank_id=bank_id,
+            query="What are the documents?",
+            tags=["project_x"],
+            tags_match="any",
+        )
+
+        assert response is not None
+        assert response.results is not None
+        # Should include project_x tagged items and potentially untagged items
+        result_texts = [r.text.lower() for r in response.results]
+        assert any("project x" in text for text in result_texts)
+
+    def test_recall_with_tags_any_strict(self, client, bank_id):
+        """Test recall with tags using 'any_strict' match (excludes untagged)."""
+        response = client.recall(
+            bank_id=bank_id,
+            query="meetings",
+            tags=["project_x"],
+            tags_match="any_strict",
+        )
+
+        assert response is not None
+        assert response.results is not None
+        # All results should have project_x tag - no untagged items
+        result_texts = [r.text.lower() for r in response.results]
+        # Should find project_x items only
+        for text in result_texts:
+            assert "project x" in text or "untagged" not in text
+
+    def test_recall_with_tags_all_strict(self, client, bank_id):
+        """Test recall with tags using 'all_strict' match (AND matching)."""
+        response = client.recall(
+            bank_id=bank_id,
+            query="meeting notes",
+            tags=["project_x", "meetings"],
+            tags_match="all_strict",
+        )
+
+        assert response is not None
+        assert response.results is not None
+        # Should only return items tagged with BOTH project_x AND meetings
+        if len(response.results) > 0:
+            result_texts = [r.text.lower() for r in response.results]
+            # The "Project X meeting notes" should be found
+            assert any("project x" in text and "meeting" in text for text in result_texts)
+
+    def test_recall_with_multiple_tags_any(self, client, bank_id):
+        """Test recall with multiple tags using 'any' match (OR)."""
+        response = client.recall(
+            bank_id=bank_id,
+            query="What's happening?",
+            tags=["project_x", "project_y"],
+            tags_match="any_strict",
+        )
+
+        assert response is not None
+        assert response.results is not None
+        # Should include items from both project_x and project_y
+        result_texts = [r.text.lower() for r in response.results]
+        has_project_x = any("project x" in text for text in result_texts)
+        has_project_y = any("project y" in text for text in result_texts)
+        # At least one of them should be present
+        assert has_project_x or has_project_y
+
+    def test_reflect_with_tags(self, client, bank_id):
+        """Test reflect with tags filtering."""
+        response = client.reflect(
+            bank_id=bank_id,
+            query="Summarize project X activities",
+            tags=["project_x"],
+            tags_match="any_strict",
+        )
+
+        assert response is not None
+        assert response.text is not None
+        assert len(response.text) > 0
+
+    def test_retain_with_tags(self, client, bank_id):
+        """Test storing a memory with tags."""
+        response = client.retain(
+            bank_id=bank_id,
+            content="New feature implementation for project Z",
+            tags=["project_z", "features"],
+        )
+
+        assert response is not None
+        assert response.success is True
+
+        # Verify we can recall it with the tag
+        recall_response = client.recall(
+            bank_id=bank_id,
+            query="project Z features",
+            tags=["project_z"],
+            tags_match="any_strict",
+        )
+        assert recall_response is not None
+        result_texts = [r.text.lower() for r in recall_response.results]
+        assert any("project z" in text for text in result_texts)
+
+    def test_retain_batch_with_document_tags(self, client, bank_id):
+        """Test batch retain with document-level tags."""
+        response = client.retain_batch(
+            bank_id=bank_id,
+            items=[
+                {"content": "First item in batch"},
+                {"content": "Second item in batch"},
+            ],
+            document_tags=["batch_import", "test_data"],
+            retain_async=False,
+        )
+
+        assert response is not None
+        assert response.success is True
+        assert response.items_count == 2
+
+
 class TestDeleteBank:
     """Tests for bank deletion."""
 
     def test_delete_bank(self, client):
         """Test deleting a bank."""
         import asyncio
+
         from hindsight_client_api import ApiClient, Configuration
         from hindsight_client_api.api import BanksApi
 
@@ -546,8 +689,8 @@ class TestDeleteBank:
         assert memories.total == 0
 
 
-class TestMentalModels:
-    """Tests for mental model operations."""
+class TestMission:
+    """Tests for mission operations."""
 
     def test_set_mission(self, client, bank_id):
         """Test setting a bank's mission."""
@@ -559,190 +702,3 @@ class TestMentalModels:
         assert response is not None
         assert response.bank_id == bank_id
         assert response.mission == "Be a helpful PM tracking sprint progress and team capacity"
-
-    def test_create_pinned_mental_model(self, client, bank_id):
-        """Test creating a pinned mental model."""
-        # Create bank first (required for mental models)
-        client.create_bank(bank_id=bank_id)
-
-        response = client.create_mental_model(
-            bank_id=bank_id,
-            name="Product Roadmap",
-            description="Track product priorities and feature decisions",
-            subtype="pinned",
-            tags=["test"],
-        )
-
-        assert response is not None
-        assert response.name == "Product Roadmap"
-        assert response.description == "Track product priorities and feature decisions"
-        assert response.subtype == "pinned"
-
-    def test_create_directive_mental_model(self, client, bank_id):
-        """Test creating a directive mental model with observations."""
-        # Create bank first (required for mental models)
-        client.create_bank(bank_id=bank_id)
-
-        response = client.create_mental_model(
-            bank_id=bank_id,
-            name="Response Guidelines",
-            description="Rules for responding to users",
-            subtype="directive",
-            observations=[
-                {"title": "Always be polite", "content": "All responses must be courteous and professional"},
-                {"title": "Never share private info", "content": "Do not reveal internal details or user data"},
-            ],
-            tags=["test"],
-        )
-
-        assert response is not None
-        assert response.name == "Response Guidelines"
-        assert response.subtype == "directive"
-        assert response.observations is not None
-        assert len(response.observations) == 2
-
-    def test_list_mental_models(self, client, bank_id):
-        """Test listing mental models."""
-        # Create bank first (required for mental models)
-        client.create_bank(bank_id=bank_id)
-
-        # Create a model first
-        client.create_mental_model(
-            bank_id=bank_id,
-            name="Test Model",
-            description="A test mental model",
-            subtype="pinned",
-        )
-
-        response = client.list_mental_models(bank_id=bank_id)
-
-        assert response is not None
-        assert response.items is not None
-        assert len(response.items) >= 1
-
-    def test_get_mental_model(self, client, bank_id):
-        """Test getting a specific mental model."""
-        # Create bank first (required for mental models)
-        client.create_bank(bank_id=bank_id)
-
-        # Create a model first
-        created = client.create_mental_model(
-            bank_id=bank_id,
-            name="Retrieve Test Model",
-            description="A model to retrieve",
-            subtype="pinned",
-        )
-
-        response = client.get_mental_model(
-            bank_id=bank_id,
-            model_id=created.id,
-        )
-
-        assert response is not None
-        assert response.id == created.id
-        assert response.name == "Retrieve Test Model"
-
-    def test_update_mental_model(self, client, bank_id):
-        """Test updating a mental model."""
-        # Create bank first (required for mental models)
-        client.create_bank(bank_id=bank_id)
-
-        # Create a model first
-        created = client.create_mental_model(
-            bank_id=bank_id,
-            name="Update Test Model",
-            description="Original description",
-            subtype="pinned",
-        )
-
-        response = client.update_mental_model(
-            bank_id=bank_id,
-            model_id=created.id,
-            name="Updated Model Name",
-            description="Updated description",
-        )
-
-        assert response is not None
-        assert response.name == "Updated Model Name"
-        assert response.description == "Updated description"
-
-    def test_delete_mental_model(self, client, bank_id):
-        """Test deleting a mental model."""
-        # Create bank first (required for mental models)
-        client.create_bank(bank_id=bank_id)
-
-        # Create a model first
-        created = client.create_mental_model(
-            bank_id=bank_id,
-            name="Delete Test Model",
-            description="A model to delete",
-            subtype="pinned",
-        )
-
-        response = client.delete_mental_model(
-            bank_id=bank_id,
-            model_id=created.id,
-        )
-
-        assert response is not None
-        assert response.success is True
-
-    def test_refresh_mental_models(self, client, bank_id):
-        """Test refreshing all mental models (async operation)."""
-        # Set mission first (required for refresh) - this also creates the bank
-        client.set_mission(
-            bank_id=bank_id,
-            mission="Track team progress and decisions",
-        )
-
-        response = client.refresh_mental_models(
-            bank_id=bank_id,
-            tags=["test"],
-        )
-
-        assert response is not None
-        assert response.operation_id is not None
-        assert response.status == "queued"
-
-    def test_refresh_mental_model(self, client, bank_id):
-        """Test refreshing a single mental model (async operation)."""
-        # Create bank first (required for mental models)
-        client.create_bank(bank_id=bank_id)
-
-        # Create a model first
-        created = client.create_mental_model(
-            bank_id=bank_id,
-            name="Refresh Single Test",
-            description="A model to refresh individually",
-            subtype="pinned",
-        )
-
-        response = client.refresh_mental_model(
-            bank_id=bank_id,
-            model_id=created.id,
-        )
-
-        assert response is not None
-        assert response.operation_id is not None
-        assert response.status == "queued"
-
-    def test_list_mental_model_versions(self, client, bank_id):
-        """Test listing mental model versions."""
-        # Create bank first (required for mental models)
-        client.create_bank(bank_id=bank_id)
-
-        # Create a model first
-        created = client.create_mental_model(
-            bank_id=bank_id,
-            name="Versions Test Model",
-            description="A model to test version history",
-            subtype="pinned",
-        )
-
-        response = client.list_mental_model_versions(
-            bank_id=bank_id,
-            model_id=created.id,
-        )
-
-        # Newly created model should have version history
-        assert response is not None

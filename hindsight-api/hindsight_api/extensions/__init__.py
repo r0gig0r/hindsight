@@ -21,20 +21,23 @@ from hindsight_api.extensions.context import DefaultExtensionContext, ExtensionC
 from hindsight_api.extensions.http import HttpExtension
 from hindsight_api.extensions.loader import load_extension
 from hindsight_api.extensions.operation_validator import (
+    # Consolidation operation
+    ConsolidateContext,
+    ConsolidateResult,
+    # Core operations
     OperationValidationError,
     OperationValidatorExtension,
     RecallContext,
     RecallResult,
     ReflectContext,
     ReflectResultContext,
-    RefreshMentalModelContext,
-    RefreshMentalModelResult,
     RetainContext,
     RetainResult,
     ValidationResult,
 )
 from hindsight_api.extensions.tenant import (
     AuthenticationError,
+    Tenant,
     TenantContext,
     TenantExtension,
 )
@@ -49,22 +52,24 @@ __all__ = [
     "DefaultExtensionContext",
     # HTTP Extension
     "HttpExtension",
-    # Operation Validator
+    # Operation Validator - Core
     "OperationValidationError",
     "OperationValidatorExtension",
     "RecallContext",
     "RecallResult",
     "ReflectContext",
     "ReflectResultContext",
-    "RefreshMentalModelContext",
-    "RefreshMentalModelResult",
     "RetainContext",
     "RetainResult",
     "ValidationResult",
+    # Operation Validator - Consolidation
+    "ConsolidateContext",
+    "ConsolidateResult",
     # Tenant/Auth
     "ApiKeyTenantExtension",
     "AuthenticationError",
     "RequestContext",
+    "Tenant",
     "TenantContext",
     "TenantExtension",
 ]

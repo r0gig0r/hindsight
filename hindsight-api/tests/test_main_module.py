@@ -355,15 +355,14 @@ class TestMainModuleExtensionLoading:
 
 # Mock extensions for testing
 from hindsight_api.extensions import (
-    TenantExtension,
-    TenantContext,
-    RequestContext,
     OperationValidatorExtension,
-    ValidationResult,
-    RetainContext,
     RecallContext,
     ReflectContext,
-    RefreshMentalModelContext,
+    RequestContext,
+    RetainContext,
+    TenantContext,
+    TenantExtension,
+    ValidationResult,
 )
 
 
@@ -376,6 +375,11 @@ class MockTenantExtension(TenantExtension):
 
     async def authenticate(self, request_context: RequestContext) -> TenantContext:
         return TenantContext(schema_name="public")
+
+    async def list_tenants(self) -> list:
+        from hindsight_api.extensions.tenant import Tenant
+
+        return [Tenant(schema="public")]
 
     def set_context(self, context) -> None:
         self._context_set = True
@@ -394,7 +398,4 @@ class MockOperationValidator(OperationValidatorExtension):
         return ValidationResult.accept()
 
     async def validate_reflect(self, ctx: ReflectContext) -> ValidationResult:
-        return ValidationResult.accept()
-
-    async def validate_refresh_mental_model(self, ctx: RefreshMentalModelContext) -> ValidationResult:
         return ValidationResult.accept()

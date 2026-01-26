@@ -39,6 +39,11 @@ ENV_REFLECT_LLM_API_KEY = "HINDSIGHT_API_REFLECT_LLM_API_KEY"
 ENV_REFLECT_LLM_MODEL = "HINDSIGHT_API_REFLECT_LLM_MODEL"
 ENV_REFLECT_LLM_BASE_URL = "HINDSIGHT_API_REFLECT_LLM_BASE_URL"
 
+ENV_CONSOLIDATION_LLM_PROVIDER = "HINDSIGHT_API_CONSOLIDATION_LLM_PROVIDER"
+ENV_CONSOLIDATION_LLM_API_KEY = "HINDSIGHT_API_CONSOLIDATION_LLM_API_KEY"
+ENV_CONSOLIDATION_LLM_MODEL = "HINDSIGHT_API_CONSOLIDATION_LLM_MODEL"
+ENV_CONSOLIDATION_LLM_BASE_URL = "HINDSIGHT_API_CONSOLIDATION_LLM_BASE_URL"
+
 ENV_EMBEDDINGS_PROVIDER = "HINDSIGHT_API_EMBEDDINGS_PROVIDER"
 ENV_EMBEDDINGS_LOCAL_MODEL = "HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL"
 ENV_EMBEDDINGS_TEI_URL = "HINDSIGHT_API_EMBEDDINGS_TEI_URL"
@@ -92,6 +97,11 @@ ENV_RETAIN_CHUNK_SIZE = "HINDSIGHT_API_RETAIN_CHUNK_SIZE"
 ENV_RETAIN_EXTRACT_CAUSAL_LINKS = "HINDSIGHT_API_RETAIN_EXTRACT_CAUSAL_LINKS"
 ENV_RETAIN_EXTRACTION_MODE = "HINDSIGHT_API_RETAIN_EXTRACTION_MODE"
 ENV_RETAIN_OBSERVATIONS_ASYNC = "HINDSIGHT_API_RETAIN_OBSERVATIONS_ASYNC"
+
+# Mental models settings
+ENV_ENABLE_MENTAL_MODELS = "HINDSIGHT_API_ENABLE_MENTAL_MODELS"
+ENV_CONSOLIDATION_SIMILARITY_THRESHOLD = "HINDSIGHT_API_CONSOLIDATION_SIMILARITY_THRESHOLD"
+ENV_CONSOLIDATION_BATCH_SIZE = "HINDSIGHT_API_CONSOLIDATION_BATCH_SIZE"
 
 # Optimization flags
 ENV_SKIP_LLM_VERIFICATION = "HINDSIGHT_API_SKIP_LLM_VERIFICATION"
@@ -170,6 +180,11 @@ DEFAULT_RETAIN_EXTRACT_CAUSAL_LINKS = True  # Extract causal links between facts
 DEFAULT_RETAIN_EXTRACTION_MODE = "concise"  # Extraction mode: "concise" or "verbose"
 RETAIN_EXTRACTION_MODES = ("concise", "verbose")  # Allowed extraction modes
 DEFAULT_RETAIN_OBSERVATIONS_ASYNC = False  # Run observation generation async (after retain completes)
+
+# Mental models defaults
+DEFAULT_ENABLE_MENTAL_MODELS = False  # Mental models disabled by default (experimental)
+DEFAULT_CONSOLIDATION_SIMILARITY_THRESHOLD = 0.75  # Minimum similarity to consider a learning related
+DEFAULT_CONSOLIDATION_BATCH_SIZE = 50  # Memories to load per batch (internal memory optimization)
 
 # Database migrations
 DEFAULT_RUN_MIGRATIONS_ON_STARTUP = True
@@ -283,6 +298,11 @@ class HindsightConfig:
     reflect_llm_model: str | None
     reflect_llm_base_url: str | None
 
+    consolidation_llm_provider: str | None
+    consolidation_llm_api_key: str | None
+    consolidation_llm_model: str | None
+    consolidation_llm_base_url: str | None
+
     # Embeddings
     embeddings_provider: str
     embeddings_local_model: str
@@ -323,6 +343,11 @@ class HindsightConfig:
     retain_extract_causal_links: bool
     retain_extraction_mode: str
     retain_observations_async: bool
+
+    # Mental models settings
+    enable_mental_models: bool
+    consolidation_similarity_threshold: float
+    consolidation_batch_size: int
 
     # Optimization flags
     skip_llm_verification: bool
@@ -370,6 +395,10 @@ class HindsightConfig:
             reflect_llm_api_key=os.getenv(ENV_REFLECT_LLM_API_KEY) or None,
             reflect_llm_model=os.getenv(ENV_REFLECT_LLM_MODEL) or None,
             reflect_llm_base_url=os.getenv(ENV_REFLECT_LLM_BASE_URL) or None,
+            consolidation_llm_provider=os.getenv(ENV_CONSOLIDATION_LLM_PROVIDER) or None,
+            consolidation_llm_api_key=os.getenv(ENV_CONSOLIDATION_LLM_API_KEY) or None,
+            consolidation_llm_model=os.getenv(ENV_CONSOLIDATION_LLM_MODEL) or None,
+            consolidation_llm_base_url=os.getenv(ENV_CONSOLIDATION_LLM_BASE_URL) or None,
             # Embeddings
             embeddings_provider=os.getenv(ENV_EMBEDDINGS_PROVIDER, DEFAULT_EMBEDDINGS_PROVIDER),
             embeddings_local_model=os.getenv(ENV_EMBEDDINGS_LOCAL_MODEL, DEFAULT_EMBEDDINGS_LOCAL_MODEL),
@@ -426,6 +455,15 @@ class HindsightConfig:
                 ENV_RETAIN_OBSERVATIONS_ASYNC, str(DEFAULT_RETAIN_OBSERVATIONS_ASYNC)
             ).lower()
             == "true",
+            # Mental models settings
+            enable_mental_models=os.getenv(ENV_ENABLE_MENTAL_MODELS, str(DEFAULT_ENABLE_MENTAL_MODELS)).lower()
+            == "true",
+            consolidation_similarity_threshold=float(
+                os.getenv(ENV_CONSOLIDATION_SIMILARITY_THRESHOLD, str(DEFAULT_CONSOLIDATION_SIMILARITY_THRESHOLD))
+            ),
+            consolidation_batch_size=int(
+                os.getenv(ENV_CONSOLIDATION_BATCH_SIZE, str(DEFAULT_CONSOLIDATION_BATCH_SIZE))
+            ),
             # Database migrations
             run_migrations_on_startup=os.getenv(ENV_RUN_MIGRATIONS_ON_STARTUP, "true").lower() == "true",
             # Database connection pool
@@ -507,6 +545,10 @@ class HindsightConfig:
             reflect_provider = self.reflect_llm_provider or self.llm_provider
             reflect_model = self.reflect_llm_model or self.llm_model
             logger.info(f"LLM (reflect): provider={reflect_provider}, model={reflect_model}")
+        if self.consolidation_llm_provider or self.consolidation_llm_model:
+            consolidation_provider = self.consolidation_llm_provider or self.llm_provider
+            consolidation_model = self.consolidation_llm_model or self.llm_model
+            logger.info(f"LLM (consolidation): provider={consolidation_provider}, model={consolidation_model}")
         logger.info(f"Embeddings: provider={self.embeddings_provider}")
         logger.info(f"Reranker: provider={self.reranker_provider}")
         logger.info(f"Graph retriever: {self.graph_retriever}")

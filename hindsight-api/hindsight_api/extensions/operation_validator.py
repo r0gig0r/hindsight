@@ -1,4 +1,4 @@
-"""Operation Validator Extension for validating retain/recall/reflect operations."""
+"""Operation Validator Extension for validating retain/recall/reflect/consolidate operations."""
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -97,15 +97,16 @@ class ReflectContext:
     context: str | None = None
 
 
-@dataclass
-class RefreshMentalModelContext:
-    """Context for a refresh mental model operation validation (pre-operation).
+# =============================================================================
+# Consolidation Pre-operation Context
+# =============================================================================
 
-    Contains ALL user-provided parameters for the refresh mental model operation.
-    """
+
+@dataclass
+class ConsolidateContext:
+    """Context for a consolidation operation validation (pre-operation)."""
 
     bank_id: str
-    model_id: str
     request_context: "RequestContext"
 
 
@@ -176,30 +177,28 @@ class ReflectResultContext:
     error: str | None = None
 
 
-@dataclass
-class RefreshMentalModelResult:
-    """Result context for post-refresh-mental-model hook.
+# =============================================================================
+# Consolidation Post-operation Context
+# =============================================================================
 
-    Contains the operation parameters and the result including token usage.
-    """
+
+@dataclass
+class ConsolidateResult:
+    """Result context for post-consolidation hook."""
 
     bank_id: str
-    model_id: str
     request_context: "RequestContext"
     # Result
-    model_name: str | None = None
-    observations_count: int = 0
-    input_tokens: int = 0
-    output_tokens: int = 0
-    total_tokens: int = 0
-    duration_ms: int = 0
+    processed: int = 0
+    created: int = 0
+    updated: int = 0
     success: bool = True
     error: str | None = None
 
 
 class OperationValidatorExtension(Extension, ABC):
     """
-    Validates and hooks into retain/recall/reflect operations.
+    Validates and hooks into retain/recall/reflect/consolidate operations.
 
     This extension allows implementing custom logic such as:
     - Rate limiting (pre-operation)
@@ -218,9 +217,13 @@ class OperationValidatorExtension(Extension, ABC):
         -> config = {"max_requests": "100"}
 
     Hook execution order:
-        1. validate_retain/validate_recall/validate_reflect (pre-operation)
+        1. validate_* (pre-operation)
         2. [operation executes]
-        3. on_retain_complete/on_recall_complete/on_reflect_complete (post-operation)
+        3. on_*_complete (post-operation)
+
+    Supported operations:
+        - retain, recall, reflect (core memory operations)
+        - consolidate (mental models consolidation)
     """
 
     # =========================================================================
@@ -298,25 +301,6 @@ class OperationValidatorExtension(Extension, ABC):
         """
         ...
 
-    @abstractmethod
-    async def validate_refresh_mental_model(self, ctx: RefreshMentalModelContext) -> ValidationResult:
-        """
-        Validate a refresh mental model operation before execution.
-
-        Called before the refresh mental model operation is processed.
-        Return ValidationResult.reject() to prevent the operation from executing.
-
-        Args:
-            ctx: Context containing all user-provided parameters:
-                - bank_id: Bank identifier
-                - model_id: Mental model ID to refresh
-                - request_context: Request context with auth info
-
-        Returns:
-            ValidationResult indicating whether the operation is allowed.
-        """
-        ...
-
     # =========================================================================
     # Post-operation hooks (optional - override to implement)
     # =========================================================================
@@ -378,26 +362,42 @@ class OperationValidatorExtension(Extension, ABC):
         """
         pass
 
-    async def on_refresh_mental_model_complete(self, result: RefreshMentalModelResult) -> None:
-        """
-        Called after a refresh mental model operation completes (success or failure).
+    # =========================================================================
+    # Consolidation - Pre-operation validation hook (optional - override to implement)
+    # =========================================================================
 
-        Override this method to implement post-operation logic such as:
-        - Token usage tracking and billing
-        - Audit logging
-        - Metrics collection
+    async def validate_consolidate(self, ctx: ConsolidateContext) -> ValidationResult:
+        """
+        Validate a consolidation operation before execution.
+
+        Override to implement custom validation logic for consolidation.
+
+        Args:
+            ctx: Context containing:
+                - bank_id: Bank identifier
+                - request_context: Request context with auth info
+
+        Returns:
+            ValidationResult indicating whether the operation is allowed.
+        """
+        return ValidationResult.accept()
+
+    # =========================================================================
+    # Consolidation - Post-operation hook (optional - override to implement)
+    # =========================================================================
+
+    async def on_consolidate_complete(self, result: ConsolidateResult) -> None:
+        """
+        Called after a consolidation operation completes (success or failure).
+
+        Override to implement post-operation logic such as usage tracking or audit logging.
 
         Args:
             result: Result context containing:
                 - bank_id: Bank identifier
-                - model_id: Mental model ID
-                - request_context: Request context with auth info
-                - model_name: Name of the mental model (if success)
-                - observations_count: Number of observations generated
-                - input_tokens: Number of input tokens used
-                - output_tokens: Number of output tokens used
-                - total_tokens: Total tokens used (input + output)
-                - duration_ms: Total operation duration in milliseconds
+                - processed: Number of memories processed
+                - created: Number of mental models created
+                - updated: Number of mental models updated
                 - success: Whether the operation succeeded
                 - error: Error message (if failed)
         """

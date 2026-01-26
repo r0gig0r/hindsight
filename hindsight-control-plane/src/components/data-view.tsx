@@ -19,6 +19,8 @@ import {
   Eye,
   EyeOff,
   RefreshCw,
+  CheckCircle,
+  Clock,
 } from "lucide-react";
 import {
   Table,
@@ -34,7 +36,7 @@ import { Switch } from "@/components/ui/switch";
 import { MemoryDetailPanel } from "./memory-detail-panel";
 import { Graph2D, convertHindsightGraphData, GraphNode } from "./graph-2d";
 
-type FactType = "world" | "experience";
+type FactType = "world" | "experience" | "mental_model";
 type ViewMode = "graph" | "table" | "timeline";
 
 interface DataViewProps {
@@ -55,6 +57,12 @@ export function DataView({ factType }: DataViewProps) {
 
   // Fetch limit state - how many memories to load from the API
   const [fetchLimit, setFetchLimit] = useState(1000);
+
+  // Consolidation status for mental models
+  const [consolidationStatus, setConsolidationStatus] = useState<{
+    pending_consolidation: number;
+    last_consolidated_at: string | null;
+  } | null>(null);
 
   // Graph controls state
   const [showLabels, setShowLabels] = useState(true);
@@ -108,6 +116,15 @@ export function DataView({ factType }: DataViewProps) {
         limit: limit ?? fetchLimit,
       });
       setData(graphData);
+
+      // Fetch consolidation status for mental models
+      if (factType === "mental_model") {
+        const stats: any = await client.getBankStats(currentBank);
+        setConsolidationStatus({
+          pending_consolidation: stats.pending_consolidation || 0,
+          last_consolidated_at: stats.last_consolidated_at || null,
+        });
+      }
     } catch (error) {
       console.error("Error loading data:", error);
       alert(`Error loading ${factType} data: ` + (error as Error).message);
@@ -267,25 +284,55 @@ export function DataView({ factType }: DataViewProps) {
           </div>
 
           <div className="flex items-center justify-between mb-6">
-            <div className="text-sm text-muted-foreground">
-              {searchQuery ? (
-                `${filteredTableRows.length} of ${data.table_rows?.length ?? 0} loaded memories`
-              ) : data.table_rows?.length < data.total_units ? (
-                <span>
-                  Showing {data.table_rows?.length ?? 0} of {data.total_units} total memories
-                  <button
-                    onClick={() => {
-                      const newLimit = Math.min(data.total_units, fetchLimit + 1000);
-                      setFetchLimit(newLimit);
-                      loadData(newLimit);
-                    }}
-                    className="ml-2 text-primary hover:underline"
-                  >
-                    Load more
-                  </button>
-                </span>
-              ) : (
-                `${data.total_units} total memories`
+            <div className="flex items-center gap-4">
+              <div className="text-sm text-muted-foreground">
+                {searchQuery ? (
+                  `${filteredTableRows.length} of ${data.table_rows?.length ?? 0} loaded memories`
+                ) : data.table_rows?.length < data.total_units ? (
+                  <span>
+                    Showing {data.table_rows?.length ?? 0} of {data.total_units} total memories
+                    <button
+                      onClick={() => {
+                        const newLimit = Math.min(data.total_units, fetchLimit + 1000);
+                        setFetchLimit(newLimit);
+                        loadData(newLimit);
+                      }}
+                      className="ml-2 text-primary hover:underline"
+                    >
+                      Load more
+                    </button>
+                  </span>
+                ) : (
+                  `${data.total_units} total memories`
+                )}
+              </div>
+
+              {/* Consolidation status for mental models */}
+              {factType === "mental_model" && consolidationStatus && (
+                <div
+                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${
+                    consolidationStatus.pending_consolidation === 0
+                      ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20"
+                      : "bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20"
+                  }`}
+                  title={
+                    consolidationStatus.pending_consolidation === 0
+                      ? `All memories consolidated${consolidationStatus.last_consolidated_at ? ` (last: ${new Date(consolidationStatus.last_consolidated_at).toLocaleString()})` : ""}`
+                      : `${consolidationStatus.pending_consolidation} memories pending consolidation`
+                  }
+                >
+                  {consolidationStatus.pending_consolidation === 0 ? (
+                    <>
+                      <CheckCircle className="w-3 h-3" />
+                      In Sync
+                    </>
+                  ) : (
+                    <>
+                      <Clock className="w-3 h-3" />
+                      {consolidationStatus.pending_consolidation} Pending
+                    </>
+                  )}
+                </div>
               )}
             </div>
             <div className="flex items-center gap-2 bg-muted rounded-lg p-1">
@@ -569,10 +616,24 @@ export function DataView({ factType }: DataViewProps) {
                             <Table className="table-fixed">
                               <TableHeader>
                                 <TableRow className="bg-muted/50">
-                                  <TableHead className="w-[45%]">Memory</TableHead>
-                                  <TableHead className="w-[20%]">Entities</TableHead>
-                                  <TableHead className="w-[15%]">Occurred</TableHead>
-                                  <TableHead className="w-[15%]">Mentioned</TableHead>
+                                  <TableHead
+                                    className={factType === "mental_model" ? "w-[55%]" : "w-[45%]"}
+                                  >
+                                    {factType === "mental_model" ? "Mental Model" : "Memory"}
+                                  </TableHead>
+                                  {factType === "mental_model" ? (
+                                    <>
+                                      <TableHead className="w-[10%]">Sources</TableHead>
+                                      <TableHead className="w-[15%]">Created</TableHead>
+                                      <TableHead className="w-[15%]">Mentioned</TableHead>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <TableHead className="w-[20%]">Entities</TableHead>
+                                      <TableHead className="w-[15%]">Occurred</TableHead>
+                                      <TableHead className="w-[15%]">Mentioned</TableHead>
+                                    </>
+                                  )}
                                   <TableHead className="w-[5%]"></TableHead>
                                 </TableRow>
                               </TableHeader>
@@ -586,6 +647,12 @@ export function DataView({ factType }: DataViewProps) {
                                     : null;
                                   const mentionedDisplay = row.mentioned_at
                                     ? new Date(row.mentioned_at).toLocaleDateString("en-US", {
+                                        month: "short",
+                                        day: "numeric",
+                                      })
+                                    : null;
+                                  const createdDisplay = row.created_at
+                                    ? new Date(row.created_at).toLocaleDateString("en-US", {
                                         month: "short",
                                         day: "numeric",
                                       })
@@ -609,40 +676,62 @@ export function DataView({ factType }: DataViewProps) {
                                           </div>
                                         )}
                                       </TableCell>
-                                      <TableCell className="py-2">
-                                        {row.entities ? (
-                                          <div className="flex gap-1 flex-wrap">
-                                            {row.entities
-                                              .split(", ")
-                                              .slice(0, 2)
-                                              .map((entity: string, i: number) => (
-                                                <span
-                                                  key={i}
-                                                  className="text-[10px] px-1.5 py-0.5 rounded-full bg-primary/10 text-primary font-medium"
-                                                >
-                                                  {entity}
-                                                </span>
-                                              ))}
-                                            {row.entities.split(", ").length > 2 && (
-                                              <span className="text-[10px] text-muted-foreground">
-                                                +{row.entities.split(", ").length - 2}
+                                      {factType === "mental_model" ? (
+                                        <>
+                                          <TableCell className="text-xs py-2 text-foreground text-center">
+                                            {row.proof_count || 1}
+                                          </TableCell>
+                                          <TableCell className="text-xs py-2 text-foreground">
+                                            {createdDisplay || (
+                                              <span className="text-muted-foreground">-</span>
+                                            )}
+                                          </TableCell>
+                                          <TableCell className="text-xs py-2 text-foreground">
+                                            {mentionedDisplay || (
+                                              <span className="text-muted-foreground">-</span>
+                                            )}
+                                          </TableCell>
+                                        </>
+                                      ) : (
+                                        <>
+                                          <TableCell className="py-2">
+                                            {row.entities ? (
+                                              <div className="flex gap-1 flex-wrap">
+                                                {row.entities
+                                                  .split(", ")
+                                                  .slice(0, 2)
+                                                  .map((entity: string, i: number) => (
+                                                    <span
+                                                      key={i}
+                                                      className="text-[10px] px-1.5 py-0.5 rounded-full bg-primary/10 text-primary font-medium"
+                                                    >
+                                                      {entity}
+                                                    </span>
+                                                  ))}
+                                                {row.entities.split(", ").length > 2 && (
+                                                  <span className="text-[10px] text-muted-foreground">
+                                                    +{row.entities.split(", ").length - 2}
+                                                  </span>
+                                                )}
+                                              </div>
+                                            ) : (
+                                              <span className="text-xs text-muted-foreground">
+                                                -
                                               </span>
                                             )}
-                                          </div>
-                                        ) : (
-                                          <span className="text-xs text-muted-foreground">-</span>
-                                        )}
-                                      </TableCell>
-                                      <TableCell className="text-xs py-2 text-foreground">
-                                        {occurredDisplay || (
-                                          <span className="text-muted-foreground">-</span>
-                                        )}
-                                      </TableCell>
-                                      <TableCell className="text-xs py-2 text-foreground">
-                                        {mentionedDisplay || (
-                                          <span className="text-muted-foreground">-</span>
-                                        )}
-                                      </TableCell>
+                                          </TableCell>
+                                          <TableCell className="text-xs py-2 text-foreground">
+                                            {occurredDisplay || (
+                                              <span className="text-muted-foreground">-</span>
+                                            )}
+                                          </TableCell>
+                                          <TableCell className="text-xs py-2 text-foreground">
+                                            {mentionedDisplay || (
+                                              <span className="text-muted-foreground">-</span>
+                                            )}
+                                          </TableCell>
+                                        </>
+                                      )}
                                       <TableCell className="py-2">
                                         <Button
                                           onClick={(e) => {
