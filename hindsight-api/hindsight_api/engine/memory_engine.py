@@ -3722,12 +3722,12 @@ class MemoryEngine(MemoryEngineInterface):
                             continue  # Skip models not actually used by the agent
                         seen_model_ids.add(model_id)
                         # Add to based_on as MemoryFact with type "mental-models"
-                        model_name = model.get("name", "")
-                        model_summary = model.get("summary") or model.get("description", "")
+                        # Use "text" if available (search_mental_models), else build from name/summary (get_mental_model)
+                        model_text = model.get("text") or f"{model.get('name', '')}: {model.get('summary') or model.get('description', '')}"
                         based_on["mental-models"].append(
                             MemoryFact(
                                 id=model_id,
-                                text=f"{model_name}: {model_summary}",
+                                text=model_text,
                                 fact_type="mental-models",
                                 context=f"{model.get('type', 'concept')} ({model.get('subtype', 'structural')})",
                                 occurred_start=None,
@@ -3744,12 +3744,12 @@ class MemoryEngine(MemoryEngineInterface):
                             continue  # Skip models not actually used by the agent
                         seen_model_ids.add(model_id)
                         # Add to based_on as MemoryFact with type "mental-models"
-                        model_name = model.get("name", "")
-                        model_summary = model.get("summary") or model.get("description", "")
+                        # Use "text" if available (search_mental_models), else build from name/summary (get_mental_model)
+                        model_text = model.get("text") or f"{model.get('name', '')}: {model.get('summary') or model.get('description', '')}"
                         based_on["mental-models"].append(
                             MemoryFact(
                                 id=model_id,
-                                text=f"{model_name}: {model_summary}",
+                                text=model_text,
                                 fact_type="mental-models",
                                 context=f"{model.get('type', 'concept')} ({model.get('subtype', 'structural')})",
                                 occurred_start=None,
