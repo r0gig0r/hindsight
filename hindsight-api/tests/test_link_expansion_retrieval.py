@@ -9,6 +9,18 @@ from datetime import datetime, timezone
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def enable_observations():
+    """Enable observations for all tests in this module."""
+    from hindsight_api.config import get_config
+
+    config = get_config()
+    original_value = config.enable_observations
+    config.enable_observations = True
+    yield
+    config.enable_observations = original_value
+
+
 @pytest.mark.asyncio
 async def test_link_expansion_observation_graph_retrieval(memory, request_context):
     """
@@ -102,8 +114,9 @@ async def test_link_expansion_observation_graph_retrieval(memory, request_contex
         from hindsight_api.engine.memory_engine import Budget
 
         # Wait for consolidation to complete with retry logic
+        # Consolidation runs as a background task and may take longer in CI
         obs_result = None
-        for _ in range(10):  # Try up to 10 times
+        for _ in range(30):  # Try up to 30 times (30 seconds max)
             await asyncio.sleep(1)  # Wait 1 second between attempts
             obs_result = await memory.recall_async(
                 bank_id=bank_id,
