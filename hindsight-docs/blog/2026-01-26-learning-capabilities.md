@@ -213,16 +213,6 @@ Entity summaries were created automatically for top entities, but opinions only 
 
 The bank's `background` field has been renamed to `mission`. During the migration, your existing background text is automatically copied to the mission field — no action needed.
 
-### Enabling Observations
-
-Observations are disabled by default in 0.4.0 as an experimental feature. To enable them, set the environment variable:
-
-```bash
-HINDSIGHT_API_ENABLE_OBSERVATIONS=true
-```
-
-Once enabled, observations will be automatically consolidated after each `retain()` call.
-
 ### Agentic Reflect
 
 The `reflect` operation is now agentic — it reasons more deeply by iteratively retrieving memories and consulting mental models and observations before formulating a response. This makes reflect significantly smarter, especially for complex questions that require synthesizing information across multiple topics.
