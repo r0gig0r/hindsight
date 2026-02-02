@@ -944,13 +944,16 @@ class MemoryEngine(MemoryEngineInterface):
             run_migrations(self.db_url, schema=get_config().database_schema)
 
             # Migrate all tenant schemas
+            # Skip the default schema since we already migrated it above
+            default_schema = get_config().database_schema
             try:
                 tenants = await self._tenant_extension.list_tenants()
                 if tenants:
                     logger.info(f"Running migrations on {len(tenants)} tenant schemas...")
                     for tenant in tenants:
                         schema = tenant.schema
-                        if schema and schema != "public":
+                        # Skip if it's the default schema (already migrated above)
+                        if schema and schema != default_schema:
                             try:
                                 run_migrations(self.db_url, schema=schema)
                             except Exception as e:
