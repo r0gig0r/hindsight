@@ -231,8 +231,8 @@ def _do_configure_profile_with_env(profile_name: str, env_vars: list[str]) -> in
     print(f"  \033[2mPort:\033[0m {pm.resolve_profile_paths(profile_name).port}")
     print()
     print("  \033[2mUse with:\033[0m")
-    print(f"    \033[36mHINDSIGHT_EMBED_PROFILE={profile_name} hindsight-embed memory retain default \"text\"\033[0m")
-    print(f"    \033[36mhindsight-embed --profile {profile_name} memory recall default \"query\"\033[0m")
+    print(f'    \033[36mHINDSIGHT_EMBED_PROFILE={profile_name} hindsight-embed memory retain default "text"\033[0m')
+    print(f'    \033[36mhindsight-embed --profile {profile_name} memory recall default "query"\033[0m')
     print()
 
     return 0
