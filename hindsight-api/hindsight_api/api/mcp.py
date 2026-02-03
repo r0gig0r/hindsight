@@ -8,7 +8,10 @@ from contextvars import ContextVar
 from fastmcp import FastMCP
 
 from hindsight_api import MemoryEngine
+from hindsight_api.engine.memory_engine import _current_schema
+from hindsight_api.extensions.tenant import AuthenticationError
 from hindsight_api.mcp_tools import MCPToolsConfig, register_mcp_tools
+from hindsight_api.models import RequestContext
 
 # Configure logging from HINDSIGHT_API_LOG_LEVEL environment variable
 _log_level_str = os.environ.get("HINDSIGHT_API_LOG_LEVEL", "info").lower()
@@ -28,9 +31,6 @@ logger = logging.getLogger(__name__)
 
 # Default bank_id from environment variable
 DEFAULT_BANK_ID = os.environ.get("HINDSIGHT_MCP_BANK_ID", "default")
-
-# MCP authentication token (optional - if set, Bearer token auth is required)
-MCP_AUTH_TOKEN = os.environ.get("HINDSIGHT_API_MCP_AUTH_TOKEN")
 
 # Context variable to hold the current bank_id
 _current_bank_id: ContextVar[str | None] = ContextVar("current_bank_id", default=None)
@@ -80,8 +80,11 @@ class MCPMiddleware:
     """ASGI middleware that handles authentication and extracts bank_id from header or path.
 
     Authentication:
-        If HINDSIGHT_API_MCP_AUTH_TOKEN is set, all requests must include a valid
-        Authorization header with Bearer token or direct token matching the configured value.
+        Uses the TenantExtension from the MemoryEngine to authenticate requests.
+        The tenant extension validates the API key from the Authorization header.
+        - DefaultTenantExtension: no auth required (local dev)
+        - ApiKeyTenantExtension: validates against env var
+        - CloudTenantExtension: HMAC + DB lookup (production)
 
     Bank ID can be provided via:
     1. X-Bank-Id header (recommended for Claude Code)
@@ -96,6 +99,7 @@ class MCPMiddleware:
     def __init__(self, app, memory: MemoryEngine):
         self.app = app
         self.memory = memory
+        self.tenant_extension = memory._tenant_extension
         self.mcp_server = create_mcp_server(memory)
         self.mcp_app = self.mcp_server.http_app(path="/")
         # Expose the lifespan for the parent app to chain
@@ -121,14 +125,15 @@ class MCPMiddleware:
             # Support both "Bearer <token>" and direct token
             auth_token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else auth_header.strip()
 
-        # Authenticate if MCP_AUTH_TOKEN is configured
-        if MCP_AUTH_TOKEN:
-            if not auth_token:
-                await self._send_error(send, 401, "Authorization header required")
-                return
-            if auth_token != MCP_AUTH_TOKEN:
-                await self._send_error(send, 401, "Invalid authentication token")
-                return
+        # Authenticate using TenantExtension (same auth as REST API)
+        try:
+            tenant_context = await self.tenant_extension.authenticate(RequestContext(api_key=auth_token))
+        except AuthenticationError as e:
+            await self._send_error(send, 401, str(e))
+            return
+
+        # Set schema from tenant context so downstream DB queries use the correct schema
+        schema_token = _current_schema.set(tenant_context.schema_name) if tenant_context.schema_name else None
 
         path = scope.get("path", "")
 
@@ -189,6 +194,8 @@ class MCPMiddleware:
             _current_bank_id.reset(bank_id_token)
             if api_key_token is not None:
                 _current_api_key.reset(api_key_token)
+            if schema_token is not None:
+                _current_schema.reset(schema_token)
 
     async def _send_error(self, send, status: int, message: str):
         """Send an error response."""
@@ -213,8 +220,7 @@ def create_mcp_app(memory: MemoryEngine):
     Create an ASGI app that handles MCP requests.
 
     Authentication:
-        Set HINDSIGHT_API_MCP_AUTH_TOKEN to require Bearer token authentication.
-        If not set, MCP endpoint is open (for local development).
+        Uses the TenantExtension from the MemoryEngine (same auth as REST API).
 
     Bank ID can be provided via:
     1. X-Bank-Id header: claude mcp add --transport http hindsight http://localhost:8888/mcp --header "X-Bank-Id: my-bank"
