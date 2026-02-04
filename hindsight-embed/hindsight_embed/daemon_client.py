@@ -17,9 +17,8 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 
-from .profile_utils import get_profile_database_url
-
 from .profile_manager import ProfileManager, resolve_active_profile
+from .profile_utils import get_profile_database_url
 
 console = Console(stderr=True)
 
