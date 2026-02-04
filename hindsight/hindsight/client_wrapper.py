@@ -203,35 +203,35 @@ class HindsightClient(Hindsight):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._banks_api: BanksAPI | None = None
-        self._mental_models_api: MentalModelsAPI | None = None
-        self._directives_api: DirectivesAPI | None = None
-        self._memories_api: MemoriesAPI | None = None
+        self._banks_namespace: BanksAPI | None = None
+        self._mental_models_namespace: MentalModelsAPI | None = None
+        self._directives_namespace: DirectivesAPI | None = None
+        self._memories_namespace: MemoriesAPI | None = None
 
     @property
     def banks(self) -> BanksAPI:
         """Access bank management operations."""
-        if self._banks_api is None:
-            self._banks_api = BanksAPI(self)
-        return self._banks_api
+        if self._banks_namespace is None:
+            self._banks_namespace = BanksAPI(self)
+        return self._banks_namespace
 
     @property
     def mental_models(self) -> MentalModelsAPI:
         """Access mental model operations."""
-        if self._mental_models_api is None:
-            self._mental_models_api = MentalModelsAPI(self)
-        return self._mental_models_api
+        if self._mental_models_namespace is None:
+            self._mental_models_namespace = MentalModelsAPI(self)
+        return self._mental_models_namespace
 
     @property
     def directives(self) -> DirectivesAPI:
         """Access directive operations."""
-        if self._directives_api is None:
-            self._directives_api = DirectivesAPI(self)
-        return self._directives_api
+        if self._directives_namespace is None:
+            self._directives_namespace = DirectivesAPI(self)
+        return self._directives_namespace
 
     @property
     def memories(self) -> MemoriesAPI:
         """Access memory listing operations."""
-        if self._memories_api is None:
-            self._memories_api = MemoriesAPI(self)
-        return self._memories_api
+        if self._memories_namespace is None:
+            self._memories_namespace = MemoriesAPI(self)
+        return self._memories_namespace

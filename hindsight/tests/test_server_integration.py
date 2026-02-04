@@ -75,7 +75,7 @@ def test_server_context_manager_basic_workflow(client):
     bank_response = client.create_bank(
         bank_id=bank_id,
         name="Test Assistant",
-        background="An AI assistant that helps with programming and data analysis tasks."
+        mission="An AI assistant that helps with programming and data analysis tasks."
     )
     assert "bank_id" in bank_response
     assert bank_response["bank_id"] == bank_id
@@ -252,8 +252,8 @@ def test_list_banks(client, shared_server):
     bank1_id = f"test_bank_1_{test_suffix}"
     bank2_id = f"test_bank_2_{test_suffix}"
 
-    client.create_bank(bank_id=bank1_id, name="Test Bank 1", background="First test bank")
-    client.create_bank(bank_id=bank2_id, name="Test Bank 2", background="Second test bank")
+    client.create_bank(bank_id=bank1_id, name="Test Bank 1", mission="First test bank")
+    client.create_bank(bank_id=bank2_id, name="Test Bank 2", mission="Second test bank")
 
     # List all banks using the generated client
     import hindsight_client_api
