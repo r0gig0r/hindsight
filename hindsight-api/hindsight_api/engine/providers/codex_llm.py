@@ -177,6 +177,9 @@ class CodexLLM(LLMInterface):
             schema_msg = f"\n\nYou must respond with valid JSON matching this schema:\n{json.dumps(schema, indent=2)}"
             system_instruction += schema_msg
 
+        # gpt-5.2-codex only supports "detailed" reasoning summary
+        reasoning_summary = "detailed" if "5.2" in self.model else self.reasoning_summary
+
         # Build Codex request payload
         payload = {
             "model": self.model,
@@ -192,7 +195,7 @@ class CodexLLM(LLMInterface):
             "tools": [],
             "tool_choice": "auto",
             "parallel_tool_calls": True,
-            "reasoning": {"summary": self.reasoning_summary},
+            "reasoning": {"summary": reasoning_summary},
             "store": False,  # Codex uses stateless mode
             "stream": True,  # SSE streaming
             "include": ["reasoning.encrypted_content"],
@@ -283,13 +286,20 @@ class CodexLLM(LLMInterface):
                         "Run 'codex auth login' to re-authenticate."
                     ) from e
 
+                # Log the actual error message from the API
+                error_detail = e.response.text[:500] if hasattr(e.response, "text") else str(e)
+
                 if attempt < max_retries:
                     backoff = min(initial_backoff * (2**attempt), max_backoff)
-                    logger.warning(f"Codex HTTP error {status_code} (attempt {attempt + 1}/{max_retries + 1})")
+                    logger.warning(
+                        f"Codex HTTP error {status_code} (attempt {attempt + 1}/{max_retries + 1}): {error_detail}"
+                    )
                     await asyncio.sleep(backoff)
                     continue
                 else:
-                    logger.error(f"Codex HTTP error after {max_retries + 1} attempts: {e}")
+                    logger.error(
+                        f"Codex HTTP error after {max_retries + 1} attempts: Status {status_code}, Detail: {error_detail}"
+                    )
                     raise
 
             except httpx.RequestError as e:

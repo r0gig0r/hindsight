@@ -1,5 +1,10 @@
 """
-Test LLM provider with different models using actual memory operations.
+Test LLM provider with different models using actual Hindsight memory operations.
+
+Tests validate that providers work correctly with:
+1. Retain (memory ingestion with fact extraction)
+2. Reflect (memory retrieval with tool calling)
+3. Mental models (consolidated knowledge generation)
 """
 import os
 from datetime import datetime
@@ -82,6 +87,124 @@ def should_skip_provider(provider: str, model: str = "") -> tuple[bool, str]:
 
 @pytest.mark.parametrize("provider,model", MODEL_MATRIX)
 @pytest.mark.asyncio
+async def test_llm_provider_api_methods(provider: str, model: str):
+    """
+    Test all LLM API methods used by Hindsight at runtime.
+    This validates that the provider correctly implements the LLMInterface.
+
+    Tests:
+    1. verify_connection() - Connection verification
+    2. call() with plain text - Basic LLM call
+    3. call() with response_format - Structured output (used in fact extraction)
+    4. call_with_tools() - Tool calling (used in reflect agent)
+    """
+    should_skip, reason = should_skip_provider(provider, model)
+    if should_skip:
+        pytest.skip(f"Skipping {provider}/{model}: {reason}")
+
+    api_key = get_api_key_for_provider(provider)
+
+    llm = LLMProvider(
+        provider=provider,
+        api_key=api_key or "",
+        base_url="",
+        model=model,
+    )
+
+    print(f"\n{provider}/{model} - API methods test:")
+
+    # Test 1: verify_connection()
+    try:
+        await llm.verify_connection()
+        print("  ✓ verify_connection()")
+    except Exception as e:
+        pytest.fail(f"{provider}/{model} verify_connection() failed: {e}")
+
+    # Test 2: call() with plain text
+    try:
+        response = await llm.call(
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "What is 2+2? Answer in one word."},
+            ],
+            max_completion_tokens=50,
+        )
+        assert response is not None, "call() returned None"
+        assert len(response) > 0, "call() returned empty string"
+        print(f"  ✓ call() plain text: {response[:50]}")
+    except Exception as e:
+        pytest.fail(f"{provider}/{model} call() plain text failed: {e}")
+
+    # Test 3: call() with response_format (structured output)
+    try:
+        from pydantic import BaseModel
+
+        class TestResponse(BaseModel):
+            answer: str
+            confidence: str
+
+        response = await llm.call(
+            messages=[
+                {"role": "system", "content": "You are a math assistant."},
+                {"role": "user", "content": "What is the capital of France?"},
+            ],
+            response_format=TestResponse,
+            max_completion_tokens=100,
+        )
+        assert isinstance(response, TestResponse), f"Expected TestResponse, got {type(response)}"
+        assert hasattr(response, "answer"), "Structured output missing 'answer' field"
+        assert hasattr(response, "confidence"), "Structured output missing 'confidence' field"
+        print(f"  ✓ call() structured output: answer={response.answer}, confidence={response.confidence}")
+    except Exception as e:
+        pytest.fail(f"{provider}/{model} call() structured output failed: {e}")
+
+    # Test 4: call_with_tools() (tool calling)
+    try:
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the weather for a location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string", "description": "City name"},
+                            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                        },
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
+
+        result = await llm.call_with_tools(
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant with access to tools."},
+                {"role": "user", "content": "What's the weather like in Paris?"},
+            ],
+            tools=tools,
+            max_completion_tokens=200,
+        )
+
+        assert result is not None, "call_with_tools() returned None"
+        assert hasattr(result, "tool_calls"), "Result missing 'tool_calls' attribute"
+        assert len(result.tool_calls) > 0, f"Expected at least 1 tool call, got {len(result.tool_calls)}"
+
+        # Verify tool call structure
+        tool_call = result.tool_calls[0]
+        assert hasattr(tool_call, "name"), "Tool call missing 'name'"
+        assert hasattr(tool_call, "arguments"), "Tool call missing 'arguments'"
+        assert tool_call.name == "get_weather", f"Expected 'get_weather', got '{tool_call.name}'"
+        assert "location" in tool_call.arguments, "Tool call arguments missing 'location'"
+
+        print(f"  ✓ call_with_tools(): {tool_call.name}({tool_call.arguments})")
+    except Exception as e:
+        pytest.fail(f"{provider}/{model} call_with_tools() failed: {e}")
+
+
+@pytest.mark.parametrize("provider,model", MODEL_MATRIX)
+@pytest.mark.asyncio
 async def test_llm_provider_memory_operations(provider: str, model: str):
     """
     Test LLM provider with actual memory operations: fact extraction and reflect.
@@ -152,87 +275,113 @@ async def test_llm_provider_memory_operations(provider: str, model: str):
     assert len(response) > 10, f"{provider}/{model} reflect response too short"
 
 
-@pytest.mark.parametrize("provider,model", MODEL_MATRIX)
+@pytest.mark.parametrize("provider,model", [
+    ("claude-code", "claude-sonnet-4-20250514"),
+    ("openai-codex", "gpt-5.2-codex"),
+])
 @pytest.mark.asyncio
-async def test_llm_provider_tool_calling(provider: str, model: str):
+async def test_llm_provider_consolidation(memory_no_llm_verify, request_context, provider: str, model: str):
     """
-    Test LLM provider tool calling capability.
-    This verifies that the provider can properly call tools (critical for reflect agent).
+    Test LLM provider with consolidation (automatic mental model generation from observations).
+    This validates that the provider can generate synthesized knowledge from raw memories.
+
+    This test is limited to claude-code and codex since they're the critical providers
+    that needed tool calling fixes for reflect and consolidation operations.
     """
     should_skip, reason = should_skip_provider(provider, model)
     if should_skip:
         pytest.skip(f"Skipping {provider}/{model}: {reason}")
 
+    # Use provider-specific LLM for this test
     api_key = get_api_key_for_provider(provider)
-
-    llm = LLMProvider(
+    memory_no_llm_verify._consolidation_llm = LLMProvider(
         provider=provider,
         api_key=api_key or "",
         base_url="",
         model=model,
     )
+    # Also need retain LLM for ingesting data
+    memory_no_llm_verify._retain_llm = memory_no_llm_verify._consolidation_llm
 
-    # For mock provider, set it to return tool calls
-    if provider == "mock":
-        llm.set_mock_response([
-            {"name": "get_memory", "arguments": {"topic": "Paris trip"}},
-        ])
+    test_bank_id = f"llm_test_consolidation_{provider}_{model}_{datetime.now().timestamp()}"
 
-    # Define simple test tools
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "get_memory",
-                "description": "Retrieve a memory about the user's trip",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "topic": {"type": "string", "description": "What to retrieve (e.g., 'Paris trip')"},
-                    },
-                    "required": ["topic"],
-                },
-            },
-        },
-    ]
+    # Enable observations for this bank
+    from hindsight_api.config import get_config
+    config = get_config()
+    original_value = config.enable_observations
+    config.enable_observations = True
 
-    # Call with tools - should return tool calls
-    result = await llm.call_with_tools(
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant with access to the user's memories."},
-            {"role": "user", "content": "What do you remember about my Paris trip? Use the get_memory tool."},
-        ],
-        tools=tools,
-        max_completion_tokens=500,
-    )
+    try:
+        # Retain memories to consolidate
+        test_content = """
+        Bob prefers functional programming with Rust and Haskell.
+        He emphasizes immutability and pure functions in code reviews.
+        Bob advocates for type safety and compile-time guarantees.
+        He avoids mutable state and prefers declarative code patterns.
+        """
 
-    print(f"\n{provider}/{model} - Tool calling test:")
-    print(f"  Tool calls: {len(result.tool_calls)}")
-    print(f"  Content: {result.content[:200] if result.content else 'None'}...")
-    if result.tool_calls:
-        for tc in result.tool_calls:
-            print(f"    - {tc.name}({tc.arguments})")
+        await memory_no_llm_verify.retain_async(
+            bank_id=test_bank_id,
+            content=test_content,
+            context="Team coding preferences",
+            event_date=datetime(2024, 12, 1),
+            request_context=request_context,
+        )
 
-    # Verify tool calling worked
-    assert result.tool_calls is not None, f"{provider}/{model} returned None for tool_calls"
-    assert len(result.tool_calls) > 0, (
-        f"{provider}/{model} did not call any tools - provider may not support tool calling properly. "
-        f"Content: {result.content[:200] if result.content else 'None'}"
-    )
+        print(f"\n{provider}/{model} - Consolidation test:")
 
-    # Verify at least one tool call is the expected tool
-    tool_names = [tc.name for tc in result.tool_calls]
-    assert "get_memory" in tool_names, (
-        f"{provider}/{model} called wrong tools: {tool_names}. "
-        f"Expected 'get_memory'. This indicates tool calling is not working correctly."
-    )
+        # Run consolidation to generate observations (mental models)
+        from hindsight_api.engine.consolidation.consolidator import run_consolidation_job
 
-    # Verify content doesn't have meta-commentary (the bug we're fixing with Claude Code)
-    # Some providers return both tool calls AND explanatory text
-    if result.content:
-        content_lower = result.content.lower()
-        meta_phrases = ["i'll search", "let me search", "i'll look", "let me look", "i'm going to", "i will"]
-        has_meta = any(phrase in content_lower for phrase in meta_phrases)
-        if has_meta:
-            print(f"  WARNING: {provider}/{model} content has meta-commentary: {result.content[:100]}")
-            # Don't fail for this - some providers do return explanatory text alongside tool calls
+        result = await run_consolidation_job(
+            memory_engine=memory_no_llm_verify,
+            bank_id=test_bank_id,
+            request_context=request_context,
+        )
+
+        print(f"  Processed: {result.get('memories_processed', 0)} memories")
+        print(f"  Created: {result.get('observations_created', 0)} observations")
+        print(f"  Updated: {result.get('observations_updated', 0)} observations")
+
+        # Verify consolidation ran successfully
+        assert result["status"] in ["success", "no_new_memories"], f"{provider}/{model} consolidation failed"
+
+        # If observations were created, verify they contain relevant content
+        if result.get("observations_created", 0) > 0:
+            observations = await memory_no_llm_verify.list_mental_models_consolidated(
+                bank_id=test_bank_id,
+                request_context=request_context,
+            )
+
+            assert len(observations) > 0, f"{provider}/{model} consolidation created 0 observations"
+
+            # Check first observation contains relevant information
+            obs_content = observations[0].get("content", "").lower()
+            relevant_terms = ["bob", "functional", "rust", "immutab", "type"]
+            matches = [term for term in relevant_terms if term in obs_content]
+
+            print(f"  Observation preview: {observations[0].get('content', '')[:200]}...")
+            print(f"  Found {len(matches)} relevant terms: {matches}")
+
+            assert len(matches) >= 2, (
+                f"{provider}/{model} consolidated observation doesn't contain relevant info. "
+                f"Expected at least 2 of {relevant_terms}, found {len(matches)}: {matches}"
+            )
+
+    finally:
+        # Restore original config
+        config.enable_observations = original_value
+
+
+# NOTE: The tests above validate the critical Hindsight operations:
+#
+# test_llm_provider_memory_operations (ALL providers):
+#   - Fact extraction (retain): tests structured output generation
+#   - Reflect: tests memory retrieval and reasoning (uses tool calling for claude-code/codex)
+#
+# test_llm_provider_consolidation (claude-code and codex only):
+#   - Consolidation: tests automatic mental model generation from observations
+#   - Requires MemoryEngine fixture with working LLM (from .env or env vars)
+#   - Run your local LLM server OR set HINDSIGHT_API_LLM_PROVIDER/API_KEY/MODEL env vars
+#
+# For full end-to-end integration tests using the HTTP API, see tests/test_http_api_integration.py
