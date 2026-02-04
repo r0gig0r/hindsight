@@ -30,6 +30,8 @@ import os
 import sys
 from pathlib import Path
 
+from .profile_utils import get_profile_database_url, sanitize_profile_name
+
 CONFIG_DIR = Path.home() / ".hindsight"
 CONFIG_FILE = CONFIG_DIR / "embed"
 CONFIG_FILE_ALT = CONFIG_DIR / "config.env"  # Alternative config file location
@@ -559,7 +561,6 @@ def do_daemon(args, config: dict, logger):
 
     elif args.daemon_command == "status":
         import os
-        import re
         from pathlib import Path
 
         from rich.console import Console
@@ -579,9 +580,8 @@ def do_daemon(args, config: dict, logger):
             # Check if using pg0 and show database location
             database_url = os.getenv("HINDSIGHT_EMBED_API_DATABASE_URL")
             if not database_url:
-                # Default: use profile-specific pg0
-                safe_profile = re.sub(r"[^a-zA-Z0-9_-]", "-", profile or "default")
-                database_url = f"pg0://hindsight-embed-{safe_profile}"
+                # Default: use profile-specific pg0 (shared utility ensures consistency)
+                database_url = get_profile_database_url(profile)
 
             if database_url.startswith("pg0://"):
                 pg0_name = database_url.replace("pg0://", "")

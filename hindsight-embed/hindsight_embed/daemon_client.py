@@ -6,7 +6,6 @@ Handles daemon lifecycle (start if needed) and API requests via the Python clien
 
 import logging
 import os
-import re
 import shlex
 import subprocess
 import time
@@ -17,6 +16,8 @@ from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
+
+from .profile_utils import get_profile_database_url
 
 from .profile_manager import ProfileManager, resolve_active_profile
 
@@ -145,9 +146,8 @@ def _start_daemon(config: dict, profile: str | None = None) -> bool:
     # Allow override via HINDSIGHT_EMBED_API_DATABASE_URL for external PostgreSQL
     # (e.g. when running as root where embedded pg0 cannot use initdb)
     if "HINDSIGHT_EMBED_API_DATABASE_URL" not in env:
-        # Sanitize profile name for use in database name (allow only alphanumeric, dash, underscore)
-        safe_profile = re.sub(r"[^a-zA-Z0-9_-]", "-", profile or "default")
-        env["HINDSIGHT_API_DATABASE_URL"] = f"pg0://hindsight-embed-{safe_profile}"
+        # Use shared utility to generate profile-specific database URL
+        env["HINDSIGHT_API_DATABASE_URL"] = get_profile_database_url(profile)
     else:
         # Pass through the embed-specific env var to the daemon as the standard API env var
         env["HINDSIGHT_API_DATABASE_URL"] = env["HINDSIGHT_EMBED_API_DATABASE_URL"]
