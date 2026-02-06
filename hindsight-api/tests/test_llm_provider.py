@@ -77,11 +77,6 @@ def should_skip_provider(provider: str, model: str = "") -> tuple[bool, str]:
     if provider == "ollama" and "gemma" in model.lower():
         return True, f"Ollama {model} does not support tool calling"
 
-    # Skip groq gpt-oss-120b (API hangs on receive_response_body - Groq API issue, not test issue)
-    # Groq API successfully receives request headers but never returns response body, causing 300s+ timeouts
-    if provider == "groq" and "gpt-oss-120b" in model.lower():
-        return True, f"Groq {model} API hangs indefinitely on response body (Groq API issue)"
-
     # Other providers need an API key
     if provider not in ("ollama", "claude-code", "openai-codex", "mock"):
         api_key = get_api_key_for_provider(provider)
