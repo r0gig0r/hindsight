@@ -156,7 +156,9 @@ class MCPMiddleware:
                 return
 
         # Set schema from tenant context so downstream DB queries use the correct schema
-        schema_token = _current_schema.set(tenant_context.schema_name) if tenant_context and tenant_context.schema_name else None
+        schema_token = (
+            _current_schema.set(tenant_context.schema_name) if tenant_context and tenant_context.schema_name else None
+        )
 
         path = scope.get("path", "")
 
