@@ -91,6 +91,20 @@ export HINDSIGHT_API_RETAIN_LLM_PROVIDER=anthropic
 
 Other LLM models not listed above may work with Hindsight, but they must support **at least 65,000 output tokens** to ensure reliable fact extraction. If you need support for a specific model that doesn't meet this requirement, please [open an issue](https://github.com/hindsight-ai/hindsight/issues) to request an exception.
 
+:::tip Models with Limited Output Tokens
+If your model only supports 32k or fewer output tokens (e.g., some older models), you can reduce the retain completion token limit:
+
+```bash
+# For models that support 32k output tokens
+export HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=32000
+
+# For models that support 16k output tokens
+export HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=16000
+```
+
+**Important:** `HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS` must be greater than `HINDSIGHT_API_RETAIN_CHUNK_SIZE` (default: 3000). The system will validate this on startup and provide an error message if the configuration is invalid.
+:::
+
 ### Configuration
 
 ```bash
