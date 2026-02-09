@@ -76,7 +76,7 @@ docker compose up
 >API: http://localhost:8888
 >UI: http://localhost:9999
 
-Install client:
+### Client
 
 ```bash
 pip install hindsight-client -U
@@ -84,7 +84,7 @@ pip install hindsight-client -U
 npm install @vectorize-io/hindsight-client
 ```
 
-Python example:
+#### Python
 
 ```python
 from hindsight_client import Hindsight
@@ -101,7 +101,29 @@ client.recall(bank_id="my-bank", query="What does Alice do?")
 client.reflect(bank_id="my-bank", query="Tell me about Alice")
 ```
 
-### Python (embedded, no Docker)
+#### Node.js / TypeScript
+
+```bash
+npm install @vectorize-io/hindsight-client
+```
+
+```javascript
+const { HindsightClient } = require('@vectorize-io/hindsight-client');
+
+const main = async () => {
+  const client = new HindsightClient({ baseUrl: 'http://localhost:8888' });
+
+  await client.retain('my-bank', 'Alice loves hiking in Yosemite');
+
+  const results = await client.recall('my-bank', 'What does Alice like?');
+  console.log(results);
+}
+
+main();
+```
+
+
+### Python Embedded (no server required)
 
 ```bash
 pip install hindsight-all -U
@@ -121,26 +143,6 @@ with HindsightServer(
     results = client.recall(bank_id="my-bank", query="Where does Alice work?")
 ```
 
-### Node.js / TypeScript
-
-```bash
-npm install @vectorize-io/hindsight-client
-```
-
-```javascript
-const { HindsightClient } = require('@vectorize-io/hindsight-client');
-
-const example = async () => {
-  const client = new HindsightClient({ baseUrl: 'http://localhost:8888' });
-
-  await client.retain('my-bank', 'Alice loves hiking in Yosemite');
-
-  const results = await client.recall('my-bank', 'What does Alice like?');
-  console.log(results);
-}
-
-example();
-```
 
 ---
 
