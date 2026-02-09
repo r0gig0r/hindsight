@@ -135,6 +135,10 @@ storage = HindsightStorage(
 )
 ```
 
+## Examples
+
+See the [CrewAI memory example](https://github.com/vectorize-io/hindsight-cookbook/tree/main/applications/crewai-memory) in the Hindsight Cookbook for a complete working demo with a Researcher + Writer crew.
+
 ## Configuration Reference
 
 | Parameter | Default | Description |
