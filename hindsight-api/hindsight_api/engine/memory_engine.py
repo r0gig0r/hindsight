@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..config import get_config
 from ..metrics import get_metrics_collector
+from ..tracing import create_operation_span
 from ..utils import mask_network_location
 from .db_budget import budgeted_operation
 
@@ -1540,21 +1541,24 @@ class MemoryEngine(MemoryEngineInterface):
             from .retain import orchestrator
 
             pool = await self._get_pool()
-            return await orchestrator.retain_batch(
-                pool=pool,
-                embeddings_model=self.embeddings,
-                llm_config=self._retain_llm_config,
-                entity_resolver=self.entity_resolver,
-                format_date_fn=self._format_readable_date,
-                duplicate_checker_fn=self._find_duplicate_facts_batch,
-                bank_id=bank_id,
-                contents_dicts=contents,
-                document_id=document_id,
-                is_first_batch=is_first_batch,
-                fact_type_override=fact_type_override,
-                confidence_score=confidence_score,
-                document_tags=document_tags,
-            )
+
+            # Create parent span for retain operation
+            with create_operation_span("retain", bank_id):
+                return await orchestrator.retain_batch(
+                    pool=pool,
+                    embeddings_model=self.embeddings,
+                    llm_config=self._retain_llm_config,
+                    entity_resolver=self.entity_resolver,
+                    format_date_fn=self._format_readable_date,
+                    duplicate_checker_fn=self._find_duplicate_facts_batch,
+                    bank_id=bank_id,
+                    contents_dicts=contents,
+                    document_id=document_id,
+                    is_first_batch=is_first_batch,
+                    fact_type_override=fact_type_override,
+                    confidence_score=confidence_score,
+                    document_tags=document_tags,
+                )
 
     def recall(
         self,
@@ -2750,18 +2754,20 @@ class MemoryEngine(MemoryEngineInterface):
 
         from .consolidation import run_consolidation_job
 
-        result = await run_consolidation_job(
-            memory_engine=self,
-            bank_id=bank_id,
-            request_context=request_context,
-        )
+        # Create parent span for consolidation operation
+        with create_operation_span("consolidation", bank_id):
+            result = await run_consolidation_job(
+                memory_engine=self,
+                bank_id=bank_id,
+                request_context=request_context,
+            )
 
-        return {
-            "processed": result.get("processed", 0),
-            "created": result.get("created", 0),
-            "updated": result.get("updated", 0),
-            "skipped": result.get("skipped", 0),
-        }
+            return {
+                "processed": result.get("processed", 0),
+                "created": result.get("created", 0),
+                "updated": result.get("updated", 0),
+                "skipped": result.get("skipped", 0),
+            }
 
     async def get_graph_data(
         self,
@@ -3726,24 +3732,25 @@ class MemoryEngine(MemoryEngineInterface):
         if has_mental_models:
             logger.info(f"[REFLECT {reflect_id}] Bank has {mental_model_count} mental models")
 
-        # Run the agent
-        agent_result = await run_reflect_agent(
-            llm_config=self._reflect_llm_config,
-            bank_id=bank_id,
-            query=query,
-            bank_profile=profile,
-            search_mental_models_fn=search_mental_models_fn,
-            search_observations_fn=search_observations_fn,
-            recall_fn=recall_fn,
-            expand_fn=expand_fn,
-            context=context,
-            max_iterations=max_iterations,
-            max_tokens=max_tokens,
-            response_schema=response_schema,
-            directives=directives,
-            has_mental_models=has_mental_models,
-            budget=effective_budget,
-        )
+        # Run the agent with parent span for reflect operation
+        with create_operation_span("reflect", bank_id):
+            agent_result = await run_reflect_agent(
+                llm_config=self._reflect_llm_config,
+                bank_id=bank_id,
+                query=query,
+                bank_profile=profile,
+                search_mental_models_fn=search_mental_models_fn,
+                search_observations_fn=search_observations_fn,
+                recall_fn=recall_fn,
+                expand_fn=expand_fn,
+                context=context,
+                max_iterations=max_iterations,
+                max_tokens=max_tokens,
+                response_schema=response_schema,
+                directives=directives,
+                has_mental_models=has_mental_models,
+                budget=effective_budget,
+            )
 
         total_time = time.time() - reflect_start
         logger.info(
@@ -4738,64 +4745,66 @@ class MemoryEngine(MemoryEngineInterface):
         if not mental_model:
             return None
 
-        # SECURITY: If the mental model has tags, pass them to reflect with "all_strict" matching
-        # to ensure it can only access other mental models/memories with the SAME tags.
-        # This prevents cross-tenant/cross-user information leakage by excluding untagged content.
-        tags = mental_model.get("tags")
-        tags_match = "all_strict" if tags else "any"
+        # Create parent span for mental model refresh operation
+        with create_operation_span("mental_model_refresh", bank_id):
+            # SECURITY: If the mental model has tags, pass them to reflect with "all_strict" matching
+            # to ensure it can only access other mental models/memories with the SAME tags.
+            # This prevents cross-tenant/cross-user information leakage by excluding untagged content.
+            tags = mental_model.get("tags")
+            tags_match = "all_strict" if tags else "any"
 
-        # Run reflect with the source query, excluding the mental model being refreshed
-        reflect_result = await self.reflect_async(
-            bank_id=bank_id,
-            query=mental_model["source_query"],
-            request_context=request_context,
-            tags=tags,
-            tags_match=tags_match,
-            exclude_mental_model_ids=[mental_model_id],
-        )
+            # Run reflect with the source query, excluding the mental model being refreshed
+            reflect_result = await self.reflect_async(
+                bank_id=bank_id,
+                query=mental_model["source_query"],
+                request_context=request_context,
+                tags=tags,
+                tags_match=tags_match,
+                exclude_mental_model_ids=[mental_model_id],
+            )
 
-        # Build reflect_response payload to store
-        # based_on contains MemoryFact objects for most types, but plain dicts for directives
-        based_on_serialized_payload: dict[str, list[dict[str, Any]]] = {}
-        for fact_type, facts in reflect_result.based_on.items():
-            serialized_facts = []
-            for fact in facts:
-                if isinstance(fact, dict):
-                    # Plain dict (e.g., directives with id, name, content)
-                    serialized_facts.append(
-                        {
-                            "id": str(fact["id"]),
-                            "text": fact.get("text", fact.get("content", fact.get("name", ""))),
-                            "type": fact_type,
-                            "context": fact.get("context", None),
-                        }
-                    )
-                else:
-                    # MemoryFact object with .id, .text, .context attributes
-                    serialized_facts.append(
-                        {
-                            "id": str(fact.id),
-                            "text": fact.text,
-                            "type": fact_type,
-                            "context": fact.context,
-                        }
-                    )
-            based_on_serialized_payload[fact_type] = serialized_facts
+            # Build reflect_response payload to store
+            # based_on contains MemoryFact objects for most types, but plain dicts for directives
+            based_on_serialized_payload: dict[str, list[dict[str, Any]]] = {}
+            for fact_type, facts in reflect_result.based_on.items():
+                serialized_facts = []
+                for fact in facts:
+                    if isinstance(fact, dict):
+                        # Plain dict (e.g., directives with id, name, content)
+                        serialized_facts.append(
+                            {
+                                "id": str(fact["id"]),
+                                "text": fact.get("text", fact.get("content", fact.get("name", ""))),
+                                "type": fact_type,
+                                "context": fact.get("context", None),
+                            }
+                        )
+                    else:
+                        # MemoryFact object with .id, .text, .context attributes
+                        serialized_facts.append(
+                            {
+                                "id": str(fact.id),
+                                "text": fact.text,
+                                "type": fact_type,
+                                "context": fact.context,
+                            }
+                        )
+                based_on_serialized_payload[fact_type] = serialized_facts
 
-        reflect_response_payload = {
-            "text": reflect_result.text,
-            "based_on": based_on_serialized_payload,
-            "mental_models": [],  # Mental models are included in based_on["mental-models"]
-        }
+            reflect_response_payload = {
+                "text": reflect_result.text,
+                "based_on": based_on_serialized_payload,
+                "mental_models": [],  # Mental models are included in based_on["mental-models"]
+            }
 
-        # Update the mental model with new content and reflect_response
-        return await self.update_mental_model(
-            bank_id,
-            mental_model_id,
-            content=reflect_result.text,
-            reflect_response=reflect_response_payload,
-            request_context=request_context,
-        )
+            # Update the mental model with new content and reflect_response
+            return await self.update_mental_model(
+                bank_id,
+                mental_model_id,
+                content=reflect_result.text,
+                reflect_response=reflect_response_payload,
+                request_context=request_context,
+            )
 
     async def update_mental_model(
         self,
