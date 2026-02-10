@@ -14,8 +14,8 @@ services:
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
       - GF_AUTH_DISABLE_LOGIN_FORM=true
     volumes:
-      # Mount Prometheus config for scraping Hindsight API metrics
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Mount Prometheus config for scraping Hindsight API metrics (override LGTM default)
+      - ./prometheus.yml:/otel-lgtm/prometheus.yaml:ro
       # Mount Hindsight dashboards to LGTM directory (where default dashboards are)
       - ../../../monitoring/grafana/dashboards/hindsight-operations.json:/otel-lgtm/hindsight-operations.json:ro
       - ../../../monitoring/grafana/dashboards/hindsight-llm.json:/otel-lgtm/hindsight-llm.json:ro
