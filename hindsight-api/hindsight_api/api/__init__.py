@@ -6,34 +6,12 @@ Provides both HTTP REST API and MCP (Model Context Protocol) server.
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional
 
 from fastapi import FastAPI
-from starlette.types import ASGIApp, Receive, Scope, Send
 
 from hindsight_api import MemoryEngine
 
 logger = logging.getLogger(__name__)
-
-
-class _MCPPathRewriteMiddleware:
-    """Rewrite /mcp to /mcp/ to prevent Starlette's 307 redirect.
-
-    Starlette's Mount class redirects exact path matches (e.g., /mcp -> /mcp/)
-    with a 307 Temporary Redirect. Many MCP clients don't follow POST redirects,
-    which causes tool discovery to fail (0 tools). This middleware rewrites the
-    path before routing so the Mount matches directly.
-    """
-
-    def __init__(self, app: ASGIApp, mcp_path: str = "/mcp"):
-        self.app = app
-        self.mcp_path = mcp_path
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        if scope["type"] == "http" and scope.get("path") == self.mcp_path:
-            scope = dict(scope)
-            scope["path"] = self.mcp_path + "/"
-        await self.app(scope, receive, send)
 
 
 def create_app(
@@ -67,14 +45,14 @@ def create_app(
         # Both HTTP and MCP
         app = create_app(memory, mcp_api_enabled=True)
     """
-    mcp_app = None
+    mcp_servers = None
 
-    # Create MCP app first if enabled (we need its lifespan for chaining)
+    # Create MCP servers first if enabled (we need their lifespans for chaining)
     if mcp_api_enabled:
         try:
-            from .mcp import create_mcp_app
+            from .mcp import MCPMiddleware, create_mcp_servers
 
-            mcp_app = create_mcp_app(memory=memory)
+            mcp_servers = create_mcp_servers(memory=memory)
         except ImportError as e:
             logger.error(f"MCP server requested but dependencies not available: {e}")
             logger.error("Install with: pip install hindsight-api[mcp]")
@@ -91,11 +69,9 @@ def create_app(
         app = FastAPI(title="Hindsight API", version="0.0.7")
         logger.info("HTTP REST API disabled")
 
-    # Mount MCP server and chain its lifespan if enabled
-    if mcp_app is not None:
-        # Get both MCP apps' underlying Starlette apps for lifespan access
-        multi_bank_starlette_app = mcp_app.multi_bank_app
-        single_bank_starlette_app = mcp_app.single_bank_app
+    # Add MCP middleware and chain its lifespan if enabled
+    if mcp_servers is not None:
+        multi_bank_server, single_bank_server, multi_bank_starlette_app, single_bank_starlette_app = mcp_servers
 
         # Store the original lifespan
         original_lifespan = app.router.lifespan_context
@@ -115,11 +91,18 @@ def create_app(
         # Replace the app's lifespan with the chained version
         app.router.lifespan_context = chained_lifespan
 
-        # Mount the MCP middleware
-        app.mount(mcp_mount_path, mcp_app)
-
-        # Prevent 307 redirect for /mcp (no trailing slash) which breaks MCP clients
-        app.add_middleware(_MCPPathRewriteMiddleware, mcp_path=mcp_mount_path)
+        # Add MCP as a wrapping middleware — intercepts /mcp* requests directly,
+        # passes everything else through to the FastAPI app. No Starlette Mount
+        # means no 307 redirect for /mcp (no trailing slash).
+        app.add_middleware(
+            MCPMiddleware,
+            memory=memory,
+            prefix=mcp_mount_path,
+            multi_bank_app=multi_bank_starlette_app,
+            single_bank_app=single_bank_starlette_app,
+            multi_bank_server=multi_bank_server,
+            single_bank_server=single_bank_server,
+        )
 
         logger.info(f"MCP server enabled at {mcp_mount_path}/")
 
