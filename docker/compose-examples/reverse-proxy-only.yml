@@ -1,0 +1,24 @@
+version: '3.8'
+
+# Nginx reverse proxy only - for local development testing
+#
+# This is useful for local development when you want to:
+# - Run API and Control Plane manually (for faster iteration)
+# - Test the reverse proxy configuration
+# - Verify base path routing works correctly
+#
+# Usage:
+#   1. Start API: export HINDSIGHT_API_BASE_PATH=/hindsight && ./scripts/dev/start-api.sh
+#   2. Start Control Plane: export NEXT_PUBLIC_BASE_PATH=/hindsight && ./scripts/dev/start-control-plane.sh
+#   3. Start Nginx: docker-compose -f docker/compose-examples/reverse-proxy-only.yml up
+#   4. Access: http://localhost:8080/hindsight/docs
+
+services:
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./api-and-control-plane.conf:/etc/nginx/nginx.conf:ro
+    network_mode: host  # Use host network to access localhost services
+    restart: unless-stopped

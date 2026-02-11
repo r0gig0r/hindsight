@@ -211,6 +211,7 @@ def main():
             reranker_cohere_base_url=config.reranker_cohere_base_url,
             host=args.host,
             port=args.port,
+            base_path=config.base_path,
             log_level=args.log_level,
             log_format=config.log_format,
             mcp_enabled=config.mcp_enabled,
