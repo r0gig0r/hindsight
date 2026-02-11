@@ -93,7 +93,7 @@ async def test_mcp_no_trailing_slash_works(memory):
 
     Starlette's Mount class redirects /mcp to /mcp/ with a 307 Temporary Redirect.
     Many MCP clients don't follow POST redirects, causing 0 tools to be discovered.
-    The _MCPPathRewriteMiddleware fixes this by rewriting the path before routing.
+    MCPMiddleware wraps the app directly (no Mount), so the redirect never happens.
     """
     from hindsight_api.api import create_app
 
