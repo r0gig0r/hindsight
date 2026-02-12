@@ -337,6 +337,53 @@ async def retrieve_semantic_bm25_combined(
             UNION ALL
             SELECT * FROM bm25
         """
+    elif config.text_search_extension == "pg_textsearch":
+        # Timescale pg_textsearch: use <@> operator with to_bm25query
+        # Note: pg_textsearch scores are negative (lower/more negative = better, so -10 > -1)
+        # We negate the score to maintain API consistency (higher = better)
+        params = [query_emb_str, bank_id, fact_types, limit, query_text]
+        if tags:
+            params.append(tags)
+
+        query = f"""
+            WITH semantic_ranked AS (
+                SELECT id, text, context, event_date, occurred_start, occurred_end, mentioned_at, embedding, fact_type, document_id, chunk_id, tags,
+                       1 - (embedding <=> $1::vector) AS similarity,
+                       NULL::float AS bm25_score,
+                       'semantic' AS source,
+                       ROW_NUMBER() OVER (PARTITION BY fact_type ORDER BY embedding <=> $1::vector) AS rn
+                FROM {fq_table("memory_units")}
+                WHERE bank_id = $2
+                  AND embedding IS NOT NULL
+                  AND fact_type = ANY($3)
+                  AND (1 - (embedding <=> $1::vector)) >= 0.3
+                  {tags_clause}
+            ),
+            bm25_ranked AS (
+                SELECT id, text, context, event_date, occurred_start, occurred_end, mentioned_at, embedding, fact_type, document_id, chunk_id, tags,
+                       NULL::float AS similarity,
+                       -(text <@> to_bm25query($5, 'idx_memory_units_text_search')) AS bm25_score,
+                       'bm25' AS source,
+                       ROW_NUMBER() OVER (PARTITION BY fact_type ORDER BY text <@> to_bm25query($5, 'idx_memory_units_text_search') ASC) AS rn
+                FROM {fq_table("memory_units")}
+                WHERE bank_id = $2
+                  AND fact_type = ANY($3)
+                  {tags_clause}
+            ),
+            semantic AS (
+                SELECT id, text, context, event_date, occurred_start, occurred_end, mentioned_at, embedding, fact_type, document_id, chunk_id, tags,
+                       similarity, bm25_score, source
+                FROM semantic_ranked WHERE rn <= $4
+            ),
+            bm25 AS (
+                SELECT id, text, context, event_date, occurred_start, occurred_end, mentioned_at, embedding, fact_type, document_id, chunk_id, tags,
+                       similarity, bm25_score, source
+                FROM bm25_ranked WHERE rn <= $4
+            )
+            SELECT * FROM semantic
+            UNION ALL
+            SELECT * FROM bm25
+        """
     else:  # native
         # Native PostgreSQL: use ts_rank_cd with to_tsquery
         query_tsquery = " | ".join(tokens)
