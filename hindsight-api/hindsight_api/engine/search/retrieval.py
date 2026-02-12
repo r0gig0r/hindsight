@@ -84,6 +84,7 @@ def set_default_graph_retriever(retriever: GraphRetriever) -> None:
     global _default_graph_retriever
     _default_graph_retriever = retriever
 
+
 async def retrieve_semantic_bm25_combined(
     conn,
     query_emb_str: str,
