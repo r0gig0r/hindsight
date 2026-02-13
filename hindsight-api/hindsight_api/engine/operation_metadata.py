@@ -5,7 +5,7 @@ These dataclasses define the structure of result_metadata for different operatio
 The metadata is exposed in the API for debugging purposes and may change without notice.
 """
 
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from typing import Any
 
 

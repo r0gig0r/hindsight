@@ -322,7 +322,9 @@ export function BankOperationsView() {
                     </div>
                     <div>
                       <div className="text-sm font-medium text-muted-foreground">Type</div>
-                      <div className="mt-1 font-mono text-sm">{selectedOperation.operation_type}</div>
+                      <div className="mt-1 font-mono text-sm">
+                        {selectedOperation.operation_type}
+                      </div>
                     </div>
                     <div>
                       <div className="text-sm font-medium text-muted-foreground">Created</div>
@@ -369,59 +371,60 @@ export function BankOperationsView() {
                   )}
 
                   {/* Child Operations (for parent operations) */}
-                  {selectedOperation.child_operations && selectedOperation.child_operations.length > 0 && (
-                    <div>
-                      <div className="text-sm font-medium text-muted-foreground mb-2">
-                        Sub-batches ({selectedOperation.num_sub_batches})
-                      </div>
-                      <div className="rounded-lg border">
-                        <Table>
-                          <TableHeader>
-                            <TableRow>
-                              <TableHead className="w-[60px]">Index</TableHead>
-                              <TableHead className="w-[100px]">ID</TableHead>
-                              <TableHead className="w-[80px]">Items</TableHead>
-                              <TableHead>Status</TableHead>
-                            </TableRow>
-                          </TableHeader>
-                          <TableBody>
-                            {selectedOperation.child_operations.map((child: any) => (
-                              <TableRow key={child.operation_id}>
-                                <TableCell className="text-sm">{child.sub_batch_index}</TableCell>
-                                <TableCell className="font-mono text-xs text-muted-foreground">
-                                  {child.operation_id.substring(0, 8)}
-                                </TableCell>
-                                <TableCell className="text-sm">{child.items_count}</TableCell>
-                                <TableCell>
-                                  {child.status === "pending" && (
-                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-amber-500/10 text-amber-600 dark:text-amber-400">
-                                      <Clock className="w-3 h-3" />
-                                      pending
-                                    </span>
-                                  )}
-                                  {child.status === "failed" && (
-                                    <span
-                                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-red-500/10 text-red-600 dark:text-red-400"
-                                      title={child.error_message ?? undefined}
-                                    >
-                                      <AlertCircle className="w-3 h-3" />
-                                      failed
-                                    </span>
-                                  )}
-                                  {child.status === "completed" && (
-                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
-                                      <CheckCircle className="w-3 h-3" />
-                                      completed
-                                    </span>
-                                  )}
-                                </TableCell>
+                  {selectedOperation.child_operations &&
+                    selectedOperation.child_operations.length > 0 && (
+                      <div>
+                        <div className="text-sm font-medium text-muted-foreground mb-2">
+                          Sub-batches ({selectedOperation.num_sub_batches})
+                        </div>
+                        <div className="rounded-lg border">
+                          <Table>
+                            <TableHeader>
+                              <TableRow>
+                                <TableHead className="w-[60px]">Index</TableHead>
+                                <TableHead className="w-[100px]">ID</TableHead>
+                                <TableHead className="w-[80px]">Items</TableHead>
+                                <TableHead>Status</TableHead>
                               </TableRow>
-                            ))}
-                          </TableBody>
-                        </Table>
+                            </TableHeader>
+                            <TableBody>
+                              {selectedOperation.child_operations.map((child: any) => (
+                                <TableRow key={child.operation_id}>
+                                  <TableCell className="text-sm">{child.sub_batch_index}</TableCell>
+                                  <TableCell className="font-mono text-xs text-muted-foreground">
+                                    {child.operation_id.substring(0, 8)}
+                                  </TableCell>
+                                  <TableCell className="text-sm">{child.items_count}</TableCell>
+                                  <TableCell>
+                                    {child.status === "pending" && (
+                                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-amber-500/10 text-amber-600 dark:text-amber-400">
+                                        <Clock className="w-3 h-3" />
+                                        pending
+                                      </span>
+                                    )}
+                                    {child.status === "failed" && (
+                                      <span
+                                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-red-500/10 text-red-600 dark:text-red-400"
+                                        title={child.error_message ?? undefined}
+                                      >
+                                        <AlertCircle className="w-3 h-3" />
+                                        failed
+                                      </span>
+                                    )}
+                                    {child.status === "completed" && (
+                                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+                                        <CheckCircle className="w-3 h-3" />
+                                        completed
+                                      </span>
+                                    )}
+                                  </TableCell>
+                                </TableRow>
+                              ))}
+                            </TableBody>
+                          </Table>
+                        </div>
                       </div>
-                    </div>
-                  )}
+                    )}
                 </>
               )}
             </div>
