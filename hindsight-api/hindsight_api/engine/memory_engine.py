@@ -5672,8 +5672,6 @@ class MemoryEngine(MemoryEngineInterface):
                         "error_message": row["error_message"],
                         "result_metadata": result_metadata,
                         "child_operations": child_statuses,
-                        "total_items": result_metadata.get("items_count"),
-                        "num_sub_batches": result_metadata.get("num_sub_batches"),
                     }
                 else:
                     # Regular operation (not a parent)
