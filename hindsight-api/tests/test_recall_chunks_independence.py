@@ -14,7 +14,7 @@ from hindsight_api.engine.memory_engine import Budget
 
 
 @pytest.mark.asyncio
-async def test_recall_chunks_independent_of_max_tokens(memory):
+async def test_recall_chunks_independent_of_max_tokens(memory, request_context):
     """
     Test that chunks are fetched independently of max_tokens.
 
@@ -26,8 +26,6 @@ async def test_recall_chunks_independent_of_max_tokens(memory):
     bank_id = "test-chunks-independence"
 
     try:
-        # Create bank
-        await memory.create_bank(bank_id=bank_id)
 
         # Retain some test content with substantial size to generate chunks
         test_content = """
@@ -43,6 +41,7 @@ async def test_recall_chunks_independent_of_max_tokens(memory):
             bank_id=bank_id,
             content=test_content,
             context="research notes",
+            request_context=request_context,
         )
 
         # Test 1: Normal recall with both facts and chunks
@@ -53,6 +52,7 @@ async def test_recall_chunks_independent_of_max_tokens(memory):
             include_chunks=True,
             max_chunk_tokens=2000,
             budget=Budget.MID,
+            request_context=request_context,
         )
 
         assert len(result_normal.results) > 0, "Should return memory facts with normal max_tokens"
@@ -67,6 +67,7 @@ async def test_recall_chunks_independent_of_max_tokens(memory):
             include_chunks=True,
             max_chunk_tokens=2000,  # But allow chunks
             budget=Budget.MID,
+            request_context=request_context,
         )
 
         # Key assertions for new behavior
@@ -81,11 +82,11 @@ async def test_recall_chunks_independent_of_max_tokens(memory):
 
     finally:
         # Cleanup
-        await memory.delete_bank(bank_id=bank_id)
+        await memory.delete_bank(bank_id, request_context=request_context)
 
 
 @pytest.mark.asyncio
-async def test_recall_chunks_batching_with_varying_sizes(memory):
+async def test_recall_chunks_batching_with_varying_sizes(memory, request_context):
     """
     Test that chunk batching works correctly with varying chunk sizes.
 
@@ -97,29 +98,44 @@ async def test_recall_chunks_batching_with_varying_sizes(memory):
     bank_id = "test-chunks-batching"
 
     try:
-        # Create bank
-        await memory.create_bank(bank_id=bank_id)
 
         # Retain multiple documents with different content sizes
         # Document 1: Short content (small chunks)
         await memory.retain_async(
             bank_id=bank_id,
-            content="Short fact about Alice.",
+            content="Alice is a software engineer who specializes in Python programming and machine learning.",
             context="doc1",
+            request_context=request_context,
         )
 
         # Document 2: Medium content
+        content_bob = """
+        Bob works as a data scientist at a tech startup in San Francisco.
+        He has expertise in natural language processing and computer vision.
+        Bob completed his PhD at Stanford University in 2020.
+        He leads a team of five engineers working on AI-powered recommendation systems.
+        """ * 5
         await memory.retain_async(
             bank_id=bank_id,
-            content="Medium length content about Bob. " * 20,
+            content=content_bob,
             context="doc2",
+            request_context=request_context,
         )
 
         # Document 3: Long content (large chunks)
+        content_charlie = """
+        Charlie is the CTO of a growing AI company focused on healthcare applications.
+        He has over 15 years of experience in software architecture and distributed systems.
+        Charlie's team builds machine learning models for medical image analysis and diagnosis.
+        The company recently raised $50 million in Series B funding.
+        They have partnerships with major hospitals in the United States and Europe.
+        Charlie holds several patents in medical imaging and deep learning.
+        """ * 20
         await memory.retain_async(
             bank_id=bank_id,
-            content="Very long detailed content about Charlie. " * 100,
+            content=content_charlie,
             context="doc3",
+            request_context=request_context,
         )
 
         # Recall with modest chunk token budget
@@ -130,6 +146,7 @@ async def test_recall_chunks_batching_with_varying_sizes(memory):
             include_chunks=True,
             max_chunk_tokens=1000,  # Limited chunk budget
             budget=Budget.MID,
+            request_context=request_context,
         )
 
         assert len(result.results) == 0, "Should return 0 facts with max_tokens=0"
@@ -147,11 +164,11 @@ async def test_recall_chunks_batching_with_varying_sizes(memory):
 
     finally:
         # Cleanup
-        await memory.delete_bank(bank_id=bank_id)
+        await memory.delete_bank(bank_id, request_context=request_context)
 
 
 @pytest.mark.asyncio
-async def test_recall_chunks_ordering_by_relevance(memory):
+async def test_recall_chunks_ordering_by_relevance(memory, request_context):
     """
     Test that chunks are returned in order of fact relevance.
 
@@ -161,26 +178,27 @@ async def test_recall_chunks_ordering_by_relevance(memory):
     bank_id = "test-chunks-ordering"
 
     try:
-        # Create bank
-        await memory.create_bank(bank_id=bank_id)
 
         # Retain content with different relevance to query
         await memory.retain_async(
             bank_id=bank_id,
             content="The Python programming language is widely used for machine learning and data science applications.",
             context="topic: Python",
+            request_context=request_context,
         )
 
         await memory.retain_async(
             bank_id=bank_id,
             content="JavaScript is commonly used for web development and frontend applications.",
             context="topic: JavaScript",
+            request_context=request_context,
         )
 
         await memory.retain_async(
             bank_id=bank_id,
             content="Python's scikit-learn library is excellent for traditional machine learning tasks and model training.",
             context="topic: Python ML",
+            request_context=request_context,
         )
 
         # Query specifically about Python - should rank Python facts higher
@@ -191,6 +209,7 @@ async def test_recall_chunks_ordering_by_relevance(memory):
             include_chunks=True,
             max_chunk_tokens=5000,  # Enough for all chunks
             budget=Budget.HIGH,  # Use high budget for better recall
+            request_context=request_context,
         )
 
         assert len(result.results) == 0, "Should return 0 facts with max_tokens=0"
@@ -209,11 +228,11 @@ async def test_recall_chunks_ordering_by_relevance(memory):
 
     finally:
         # Cleanup
-        await memory.delete_bank(bank_id=bank_id)
+        await memory.delete_bank(bank_id, request_context=request_context)
 
 
 @pytest.mark.asyncio
-async def test_recall_chunks_without_include_flag(memory):
+async def test_recall_chunks_without_include_flag(memory, request_context):
     """
     Test that chunks are NOT returned when include_chunks=False (default).
 
@@ -222,20 +241,26 @@ async def test_recall_chunks_without_include_flag(memory):
     bank_id = "test-chunks-no-include"
 
     try:
-        # Create bank
-        await memory.create_bank(bank_id=bank_id)
 
         # Retain content
+        test_content = """
+        Sarah is a product manager at a fintech company in New York.
+        She specializes in user experience design and agile methodologies.
+        Sarah graduated from MIT with a degree in computer science.
+        She has led the development of three successful mobile banking applications.
+        """
         await memory.retain_async(
             bank_id=bank_id,
-            content="Test content for chunks.",
+            content=test_content,
+            request_context=request_context,
         )
 
         # Recall without include_chunks flag (default is False)
         result = await memory.recall_async(
             bank_id=bank_id,
-            query="test",
+            query="Sarah product manager",
             max_tokens=4096,
+            request_context=request_context,
             # include_chunks=False is the default
         )
 
@@ -246,4 +271,4 @@ async def test_recall_chunks_without_include_flag(memory):
 
     finally:
         # Cleanup
-        await memory.delete_bank(bank_id=bank_id)
+        await memory.delete_bank(bank_id, request_context=request_context)

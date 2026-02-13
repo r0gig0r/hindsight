@@ -2380,7 +2380,7 @@ class MemoryEngine(MemoryEngineInterface):
                     # Estimate batch size based on retain_chunk_size * 2 (rough estimate)
                     # Chunk sizes vary per document, so we fetch in batches until budget is exhausted
                     bank_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
-                    estimated_batch_size = (max_chunk_tokens // bank_config.retain_chunk_size) * 2
+                    estimated_batch_size = max(1, (max_chunk_tokens // bank_config.retain_chunk_size) * 2)
 
                     chunks_dict_prefetched = {}
                     encoding = _get_tiktoken_encoding()
@@ -2476,7 +2476,7 @@ class MemoryEngine(MemoryEngineInterface):
                     # Estimate batch size based on retain_chunk_size * 2 (rough estimate)
                     # Chunk sizes vary per document, so we fetch in batches until budget is exhausted
                     bank_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
-                    estimated_batch_size = (max_chunk_tokens // bank_config.retain_chunk_size) * 2
+                    estimated_batch_size = max(1, (max_chunk_tokens // bank_config.retain_chunk_size) * 2)
 
                     chunks_dict = {}
                     encoding = _get_tiktoken_encoding()
