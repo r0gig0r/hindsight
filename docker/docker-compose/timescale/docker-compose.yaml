@@ -72,14 +72,7 @@ services:
       - hindsight-net
 
   hindsight:
-    build:
-      context: ../../..
-      dockerfile: docker/standalone/Dockerfile
-      target: api-only
-      args:
-        INCLUDE_API: "true"
-        INCLUDE_CP: "false"
-        PRELOAD_ML_MODELS: "false"
+    image: ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION:-latest}
     container_name: hindsight-app-timescale
     ports:
       - "8888:8888"
