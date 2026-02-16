@@ -70,25 +70,11 @@ How it works:
 - **Status tracking**: Parent operation aggregates status from all sub-batches
 - **Token-based**: Batching uses tiktoken for accurate token counting, not character counts
 
-This means you can:
-- ✅ Send entire documents or datasets in one API call
-- ✅ Let Hindsight optimize the processing strategy
-- ✅ Track overall progress via the parent operation status
-- ❌ Don't manually split data into small batches yourself
-
-**Example:**
-```python
-# Good: Send everything at once with async
-await client.retain_async(
-    bank_id="my-bank",
-    contents=[{"content": doc} for doc in all_documents]  # Could be 1000+ items
-)
-# Hindsight automatically splits into optimized sub-batches
-
-# Not necessary: Manual batching
-for batch in chunks(all_documents, 50):  # You don't need to do this!
-    await client.retain_async(bank_id="my-bank", contents=batch)
-```
+Benefits:
+- Send entire documents or datasets in one API call
+- Let Hindsight optimize the processing strategy
+- Track overall progress via the parent operation status
+- No need to manually split data into small batches
 
 ### Throughput
 
