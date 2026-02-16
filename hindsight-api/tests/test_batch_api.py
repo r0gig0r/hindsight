@@ -58,7 +58,7 @@ def test_contents():
 def hindsight_config():
     """Create test config with batch API enabled."""
     config = HindsightConfig.from_env()
-    config.retain_use_batch_api = True
+    config.retain_batch_enabled = True
     config.retain_batch_poll_interval = 1  # Fast polling for tests
     config.retain_chunk_size = 4000
     config.retain_extraction_mode = "concise"
@@ -454,7 +454,7 @@ async def test_batch_api_via_extract_facts_from_contents(
 
     try:
         # Enable batch API in config
-        hindsight_config.retain_use_batch_api = True
+        hindsight_config.retain_batch_enabled = True
 
         # Mock batch API support
         mock_llm_config._provider_impl.supports_batch_api = AsyncMock(return_value=True)

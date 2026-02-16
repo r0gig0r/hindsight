@@ -96,8 +96,9 @@ class OpenAICompatibleLLM(LLMInterface):
         if self.provider in ("openai", "groq") and not self.api_key:
             raise ValueError(f"API key is required for {self.provider}")
 
-        # Groq service tier configuration
-        self.groq_service_tier = groq_service_tier or os.getenv("HINDSIGHT_API_LLM_GROQ_SERVICE_TIER", "auto")
+        # Service tier configuration (from config, not env vars)
+        self.groq_service_tier = groq_service_tier
+        self.openai_service_tier = kwargs.get("openai_service_tier")
 
         # Get timeout config
         self.timeout = timeout or float(os.getenv(ENV_LLM_TIMEOUT, str(DEFAULT_LLM_TIMEOUT)))

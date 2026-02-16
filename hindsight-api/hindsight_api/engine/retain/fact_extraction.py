@@ -1258,7 +1258,7 @@ async def extract_facts_from_contents_batch_api(
     Extract facts using LLM Batch API (OpenAI/Groq).
 
     Submits all chunks as a single batch, polls until complete, then processes results.
-    Only called when config.retain_use_batch_api=True.
+    Only called when config.retain_batch_enabled=True.
 
     Args:
         contents: List of RetainContent objects to process
@@ -1379,6 +1379,10 @@ Text:
             # Add max_completion_tokens if configured
             if config.retain_max_completion_tokens:
                 request_body["max_completion_tokens"] = config.retain_max_completion_tokens
+
+            # Add service_tier for OpenAI Flex Processing (50% cost savings)
+            if llm_config.provider == "openai" and llm_config._provider_impl.openai_service_tier:
+                request_body["service_tier"] = llm_config._provider_impl.openai_service_tier
 
             # Add response_format (JSON schema)
             schema = response_schema.model_json_schema()
@@ -1726,7 +1730,7 @@ async def extract_facts_from_contents(
     3. Adds time offsets to preserve fact ordering within each content
     4. Returns typed ExtractedFact and ChunkMetadata objects
 
-    Routes to batch API mode if config.retain_use_batch_api=True.
+    Routes to batch API mode if config.retain_batch_enabled=True.
 
     Args:
         contents: List of RetainContent objects to process
@@ -1744,7 +1748,7 @@ async def extract_facts_from_contents(
         return [], [], TokenUsage()
 
     # Route to batch API if enabled
-    if config.retain_use_batch_api:
+    if config.retain_batch_enabled:
         return await extract_facts_from_contents_batch_api(
             contents, llm_config, agent_name, config, pool, operation_id, schema
         )

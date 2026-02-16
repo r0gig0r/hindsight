@@ -107,7 +107,7 @@ def test_contents_real():
 def integration_config():
     """Create config for integration test."""
     config = HindsightConfig.from_env()
-    config.retain_use_batch_api = True
+    config.retain_batch_enabled = True
     config.retain_batch_poll_interval = 30  # Poll every 30 seconds (reasonable for real API)
     config.retain_chunk_size = 4000
     config.retain_extraction_mode = "concise"
