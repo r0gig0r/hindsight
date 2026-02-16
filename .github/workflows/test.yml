@@ -944,27 +944,93 @@ jobs:
     - name: Run Python doc examples
       working-directory: ./hindsight-clients/python
       run: |
+        FAILED=0
+        PASSED=0
+        FAILURES=""
+
         for f in ../../hindsight-docs/examples/api/*.py; do
           echo "Running $f..."
-          uv run python "$f"
+          if uv run python "$f"; then
+            echo "✓ PASSED: $f"
+            PASSED=$((PASSED + 1))
+          else
+            echo "✗ FAILED: $f"
+            FAILURES="$FAILURES\n  - $(basename $f)"
+            FAILED=$((FAILED + 1))
+          fi
+          echo ""
         done
+
+        echo "======================================"
+        echo "Python Examples Summary"
+        echo "======================================"
+        echo "Passed: $PASSED"
+        echo "Failed: $FAILED"
+        if [ $FAILED -gt 0 ]; then
+          echo "Failures:$FAILURES"
+          exit 1
+        fi
 
     - name: Run Node.js doc examples
       run: |
+        FAILED=0
+        PASSED=0
+        FAILURES=""
+
         for f in hindsight-docs/examples/api/*.mjs; do
           echo "Running $f..."
-          node "$f"
+          if node "$f"; then
+            echo "✓ PASSED: $f"
+            PASSED=$((PASSED + 1))
+          else
+            echo "✗ FAILED: $f"
+            FAILURES="$FAILURES\n  - $(basename $f)"
+            FAILED=$((FAILED + 1))
+          fi
+          echo ""
         done
+
+        echo "======================================"
+        echo "Node.js Examples Summary"
+        echo "======================================"
+        echo "Passed: $PASSED"
+        echo "Failed: $FAILED"
+        if [ $FAILED -gt 0 ]; then
+          echo "Failures:$FAILURES"
+          exit 1
+        fi
 
     - name: Configure CLI
       run: hindsight configure --api-url http://localhost:8888
 
     - name: Run CLI doc examples
       run: |
+        FAILED=0
+        PASSED=0
+        FAILURES=""
+
         for f in hindsight-docs/examples/api/*.sh; do
           echo "Running $f..."
-          bash "$f"
+          if bash "$f"; then
+            echo "✓ PASSED: $f"
+            PASSED=$((PASSED + 1))
+          else
+            echo "✗ FAILED: $f"
+            FAILURES="$FAILURES\n  - $(basename $f)"
+            FAILED=$((FAILED + 1))
+          fi
+          echo ""
         done
+
+        echo "======================================"
+        echo "CLI Examples Summary"
+        echo "======================================"
+        echo "Passed: $PASSED"
+        echo "Failed: $FAILED"
+        if [ $FAILED -gt 0 ]; then
+          echo "Failures:$FAILURES"
+          exit 1
+        fi
 
     - name: Show API server logs
       if: always()
