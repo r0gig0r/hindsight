@@ -39,24 +39,37 @@ interface ChildOperationStatus {
   error_message: string | null;
 }
 
-interface OperationDetails {
-  operation_id: string;
-  status: string;
-  operation_type: string | null;
-  created_at: string | null;
-  updated_at: string | null;
-  completed_at: string | null;
-  error_message: string | null;
-  result_metadata?: {
-    items_count?: number;
-    total_tokens?: number;
-    num_sub_batches?: number;
-    is_parent?: boolean;
-    [key: string]: any;
-  };
-  child_operations?: ChildOperationStatus[];
-  error?: string; // For error states when loading fails
-}
+type OperationDetails =
+  | {
+      operation_id: string;
+      status: string;
+      operation_type: string | null;
+      created_at: string | null;
+      updated_at: string | null;
+      completed_at: string | null;
+      error_message: string | null;
+      result_metadata?: {
+        items_count?: number;
+        total_tokens?: number;
+        num_sub_batches?: number;
+        is_parent?: boolean;
+        [key: string]: any;
+      };
+      child_operations?: ChildOperationStatus[];
+      error?: never; // Not present in success case
+    }
+  | {
+      error: string; // Error state when loading fails
+      operation_id?: never;
+      status?: never;
+      operation_type?: never;
+      created_at?: never;
+      updated_at?: never;
+      completed_at?: never;
+      error_message?: never;
+      result_metadata?: never;
+      child_operations?: never;
+    };
 
 export function BankOperationsView() {
   const { currentBank } = useBank();
