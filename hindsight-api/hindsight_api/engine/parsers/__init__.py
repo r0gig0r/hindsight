@@ -1,9 +1,10 @@
 """File parser implementations."""
 
 from .base import FileParser
+from .iris import IrisParser
 from .markitdown import MarkitdownParser
 
-__all__ = ["FileParser", "MarkitdownParser", "FileParserRegistry"]
+__all__ = ["FileParser", "IrisParser", "MarkitdownParser", "FileParserRegistry"]
 
 
 class FileParserRegistry:
