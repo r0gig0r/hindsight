@@ -1506,13 +1506,17 @@ class MemoryEngine(MemoryEngineInterface):
         embeddings: list[list[float]],
         event_date: datetime,
         time_window_hours: int = 24,
-        similarity_threshold: float = 0.95,
+        similarity_threshold: float = 0.92,
+        global_similarity_threshold: float = 0.98,
     ) -> list[bool]:
         """
-        Check which facts are duplicates using semantic similarity + temporal window.
+        Check which facts are duplicates using semantic similarity + temporal window,
+        with a global fallback for stable/biographical facts.
 
         For each new fact, checks if a semantically similar fact already exists
-        within the time window. Uses pgvector cosine similarity for efficiency.
+        within the time window. If not found, performs a global check (no time window)
+        with a higher threshold to catch recurring biographical facts like
+        "Igor is a CTO" that get extracted across different days.
 
         Args:
             conn: Database connection
@@ -1521,7 +1525,8 @@ class MemoryEngine(MemoryEngineInterface):
             embeddings: Corresponding embeddings
             event_date: Event date for temporal filtering
             time_window_hours: Hours before/after event_date to search (default: 24)
-            similarity_threshold: Minimum cosine similarity to consider duplicate (default: 0.95)
+            similarity_threshold: Minimum cosine similarity to consider duplicate (default: 0.92)
+            global_similarity_threshold: Higher threshold for global (no time window) check (default: 0.98)
 
         Returns:
             List of booleans - True if fact is a duplicate (should skip), False if new
@@ -1555,52 +1560,83 @@ class MemoryEngine(MemoryEngineInterface):
             time_upper,
         )
 
-        # If no existing facts, nothing is duplicate
+        # If no existing facts in time window, nothing is duplicate from time-window check
         if not existing_facts:
-            return [False] * len(texts)
+            time_window_results = [False] * len(texts)
+        else:
+            # Compute similarities in Python (vectorized with numpy)
+            time_window_results = []
 
-        # Compute similarities in Python (vectorized with numpy)
-        is_duplicate = []
+            # Convert existing embeddings to numpy for faster computation
+            embedding_arrays = self._parse_embedding_rows(existing_facts)
+            existing_embeddings = self._stack_embeddings(embedding_arrays)
 
-        # Convert existing embeddings to numpy for faster computation
+            for embedding in embeddings:
+                emb_array = np.array(embedding)
+                similarities = np.dot(existing_embeddings, emb_array)
+                max_similarity = np.max(similarities) if len(similarities) > 0 else 0
+                time_window_results.append(max_similarity > similarity_threshold)
+
+        # Global fallback: for facts NOT caught by time-window check,
+        # do a global search with higher threshold to catch recurring stable facts
+        is_duplicate = list(time_window_results)
+        non_dup_indices = [i for i, dup in enumerate(is_duplicate) if not dup]
+
+        if non_dup_indices:
+            # Fetch a sample of ALL existing facts (no time window) for global dedup
+            # Use pgvector nearest-neighbor search for efficiency
+            global_dup_count = 0
+            for i in non_dup_indices:
+                emb_array = np.array(embeddings[i])
+                # Use pgvector cosine distance operator for fast nearest-neighbor
+                nearest = await conn.fetchrow(
+                    f"""
+                    SELECT id, 1 - (embedding <=> $1::vector) as similarity
+                    FROM {fq_table("memory_units")}
+                    WHERE bank_id = $2
+                      AND (event_date < $3 OR event_date > $4)
+                    ORDER BY embedding <=> $1::vector
+                    LIMIT 1
+                    """,
+                    str(emb_array.tolist()),
+                    bank_id,
+                    time_lower,
+                    time_upper,
+                )
+                if nearest and nearest["similarity"] > global_similarity_threshold:
+                    is_duplicate[i] = True
+                    global_dup_count += 1
+
+            if global_dup_count > 0:
+                logger.info(f"Global dedup caught {global_dup_count} cross-day duplicates")
+
+        return is_duplicate
+
+    @staticmethod
+    def _parse_embedding_rows(rows) -> list[np.ndarray]:
+        """Parse embedding values from database rows into numpy arrays."""
         embedding_arrays = []
-        for row in existing_facts:
+        for row in rows:
             raw_emb = row["embedding"]
-            # Handle different pgvector formats
             if isinstance(raw_emb, str):
-                # Parse string format: "[1.0, 2.0, ...]"
                 import json
-
                 emb = np.array(json.loads(raw_emb), dtype=np.float32)
             elif isinstance(raw_emb, (list, tuple)):
                 emb = np.array(raw_emb, dtype=np.float32)
             else:
-                # Try direct conversion
                 emb = np.array(raw_emb, dtype=np.float32)
             embedding_arrays.append(emb)
+        return embedding_arrays
 
+    @staticmethod
+    def _stack_embeddings(embedding_arrays: list[np.ndarray]) -> np.ndarray:
+        """Stack a list of embedding arrays into a matrix."""
         if not embedding_arrays:
-            existing_embeddings = np.array([])
+            return np.array([])
         elif len(embedding_arrays) == 1:
-            # Single embedding: reshape to (1, dim)
-            existing_embeddings = embedding_arrays[0].reshape(1, -1)
+            return embedding_arrays[0].reshape(1, -1)
         else:
-            # Multiple embeddings: vstack
-            existing_embeddings = np.vstack(embedding_arrays)
-
-        comp_start = time_mod.time()
-        for embedding in embeddings:
-            # Compute cosine similarity with all existing facts
-            emb_array = np.array(embedding)
-            # Cosine similarity = 1 - cosine distance
-            # For normalized vectors: cosine_sim = dot product
-            similarities = np.dot(existing_embeddings, emb_array)
-
-            # Check if any existing fact is too similar
-            max_similarity = np.max(similarities) if len(similarities) > 0 else 0
-            is_duplicate.append(max_similarity > similarity_threshold)
-
-        return is_duplicate
+            return np.vstack(embedding_arrays)
 
     def retain(
         self,
