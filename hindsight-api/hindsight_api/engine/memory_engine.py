@@ -1620,6 +1620,7 @@ class MemoryEngine(MemoryEngineInterface):
             raw_emb = row["embedding"]
             if isinstance(raw_emb, str):
                 import json
+
                 emb = np.array(json.loads(raw_emb), dtype=np.float32)
             elif isinstance(raw_emb, (list, tuple)):
                 emb = np.array(raw_emb, dtype=np.float32)

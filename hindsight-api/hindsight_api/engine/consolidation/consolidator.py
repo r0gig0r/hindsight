@@ -141,6 +141,7 @@ async def run_consolidation_job(
         "observations_merged": 0,
         "actions_executed": 0,
         "skipped": 0,
+        "errors": 0,
     }
 
     # Track all unique tags from consolidated memories for mental model refresh filtering
@@ -196,22 +197,30 @@ async def run_consolidation_job(
                     perf=perf,
                 )
 
-                # Mark memory as consolidated (committed immediately)
-                await conn.execute(
-                    f"""
-                    UPDATE {fq_table("memory_units")}
-                    SET consolidated_at = NOW()
-                    WHERE id = $1
-                    """,
-                    memory["id"],
-                )
+                action = result.get("action")
+
+                if action == "error":
+                    # LLM/parse failure — do NOT mark as consolidated so it retries next run
+                    logger.warning(
+                        f"[CONSOLIDATION] bank={bank_id} memory={memory['id']} "
+                        f"skipped consolidated_at update due to error: {result.get('reason')}"
+                    )
+                else:
+                    # Mark memory as consolidated (committed immediately)
+                    await conn.execute(
+                        f"""
+                        UPDATE {fq_table("memory_units")}
+                        SET consolidated_at = NOW()
+                        WHERE id = $1
+                        """,
+                        memory["id"],
+                    )
 
             mem_time = time.time() - mem_start
             perf.record_timing("process_memory_total", mem_time)
 
             stats["memories_processed"] += 1
 
-            action = result.get("action")
             if action == "created":
                 stats["observations_created"] += 1
                 stats["actions_executed"] += 1
@@ -228,6 +237,8 @@ async def run_consolidation_job(
                 stats["actions_executed"] += result.get("total_actions", 0)
             elif action == "skipped":
                 stats["skipped"] += 1
+            elif action == "error":
+                stats["errors"] += 1
 
             # Log progress periodically with timing breakdown
             if stats["memories_processed"] % 10 == 0:
@@ -467,6 +478,10 @@ async def _process_memory(
         )
         if perf:
             perf.record_timing("llm", time.time() - t0)
+
+        if actions is None:
+            # LLM call failed or JSON was unparseable — do not mark as consolidated
+            return {"action": "error", "reason": "llm_parse_error"}
 
         if not actions:
             # LLM returned empty array - fact is purely ephemeral, skip
@@ -957,7 +972,28 @@ Focus on DURABLE knowledge that serves this mission, not ephemeral state.
                 if clean.endswith("```"):
                     clean = clean[:-3]
                 clean = clean.strip()
-            result = json.loads(clean)
+            try:
+                result = json.loads(clean)
+            except json.JSONDecodeError:
+                # Fallback: try parsing as NDJSON (one JSON object per line)
+                parsed_items = []
+                ndjson_failed = False
+                for line in clean.splitlines():
+                    line = line.strip().rstrip(",")
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                        if isinstance(item, list):
+                            parsed_items.extend(item)
+                        elif isinstance(item, dict):
+                            parsed_items.append(item)
+                    except json.JSONDecodeError:
+                        ndjson_failed = True
+                        break
+                if ndjson_failed:
+                    raise  # Re-raise original JSONDecodeError
+                result = parsed_items
         # Ensure result is a list
         if isinstance(result, list):
             return result
@@ -977,7 +1013,7 @@ Focus on DURABLE knowledge that serves this mission, not ephemeral state.
         return []
     except Exception as e:
         logger.warning(f"Error in consolidation LLM call: {e}")
-        return []
+        return None
 
 
 async def _create_observation_directly(

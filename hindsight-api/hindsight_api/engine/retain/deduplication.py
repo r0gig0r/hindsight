@@ -65,8 +65,7 @@ def _check_within_batch_duplicates(
                 result[i] = True
                 dup_of_idx = approved_indices[int(np.argmax(similarities))]
                 logger.debug(
-                    f"Within-batch duplicate: fact[{i}] is duplicate of fact[{dup_of_idx}] "
-                    f"(similarity={max_sim:.4f})"
+                    f"Within-batch duplicate: fact[{i}] is duplicate of fact[{dup_of_idx}] (similarity={max_sim:.4f})"
                 )
                 continue
 
