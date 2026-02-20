@@ -514,11 +514,13 @@ DO NOT extract:
 ❌ Pure filler: "thanks", "sounds good", "ok", "got it", "sure"
 ❌ Process chatter: "let me check", "one moment", "I'll look into it"
 ❌ Repeated info: if already stated, don't extract again
-❌ Assistant actions: "assistant greeted", "assistant will check", "assistant reports", session management
+❌ Assistant narration: ANY fact starting with "Assistant..." or describing what the assistant did/said/created/checked. Only extract the SUBSTANTIVE answer content, not the assistant's actions.
 ❌ Tool/file operations: file writes, edits, replacements, command executions, tool outputs
-❌ System metadata: message IDs, send statuses, version numbers, error traces, log entries
+❌ System metadata: message IDs, send statuses, version numbers, error traces, log entries, health check results
 ❌ Workflow/process descriptions: step-by-step instructions, email filtering rules, output format specs
-❌ Transient status: "nothing to do", "running latest version", "check complete", health checks
+❌ Transient status: "nothing to do", "running latest version", "check complete", health checks, "no updates available", system operational status
+❌ API response data dumps: ANY raw API output including GUIDs, UUIDs, objectIds, parentFolderIds, displayName fields, resource URIs, odata metadata, email folder structures, unread counts. If it looks like a machine returned it, skip it entirely.
+❌ Version/build info: software version numbers, build identifiers, release notes, update status
 
 CONSOLIDATE related statements into ONE fact when possible."""
 
@@ -543,11 +545,18 @@ Output: ONLY 2 facts (skip coffee preference - too trivial):
 1. what="Alice has 5 years Kubernetes experience, CKA certified", who="Alice", entities=["Alice", "Kubernetes", "CKA"]
 2. what="Alice leads infrastructure team since March", who="Alice", entities=["Alice", "infrastructure"]
 
-Example 3 - AI agent conversation (skip most assistant actions):
-Input: "Assistant: Good morning Igor! Let me check your calendar... I found 3 meetings today. Also, I wrote the report to /tmp/report.md (2,340 bytes). Your meeting with Tom about Pulsar latency was rescheduled to Thursday."
+Example 3 - AI agent conversation (AGGRESSIVELY skip assistant narration and API metadata):
+Input: "Assistant: Good morning Igor! Let me check your calendar... I found 3 meetings today. I wrote the report to /tmp/report.md (2,340 bytes). The Pulsar latency meeting with Tom was rescheduled to Thursday. Azure AD query returned objectId='a1b2c3d4-e5f6'."
 
-Output: ONLY 1 fact (skip greeting, file write, calendar check):
+Output: ONLY 1 fact (skip greeting, calendar check, file write, Azure AD metadata):
 1. what="Meeting with Tom about Pulsar latency rescheduled to Thursday", who="Tom, user", fact_type="world", entities=["Tom", "Pulsar", "user"]
+
+NOT extracted: "Assistant greeted Igor" / "Assistant wrote report" / "Azure AD objectId is a1b2c3d4..."
+
+Example 4 - System status and API data (extract NOTHING):
+Input: "Assistant: OpenClaw version 2026.2.19-2. Health check complete - all services operational. displayName: Igor, objectId: a1b2c3d4, parentFolderId: AAMkAGEw. User has 15 unread emails."
+
+Output: [] (ZERO facts - all system status, version info, API data dumps, and unread counts are ephemeral machine output)
 
 ══════════════════════════════════════════════════════════════════════════
 QUALITY OVER QUANTITY

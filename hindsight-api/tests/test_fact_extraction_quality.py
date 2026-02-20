@@ -969,3 +969,178 @@ so the algorithm learns to box out. See you next week!
                     raise e
 
 
+# =============================================================================
+# METADATA FILTERING TESTS
+# =============================================================================
+
+class TestMetadataFiltering:
+    """Tests that API metadata, workflow instructions, and assistant narration are filtered out."""
+
+    @pytest.mark.asyncio
+    async def test_api_data_dump_not_extracted(self):
+        """Raw API response data dumps should not become facts."""
+        text = """
+Assistant: Here's the result from the Microsoft Graph API query.
+{"displayName": "Igor Vaisman", "objectId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890", "parentFolderId": "AAMkAGEwYTcyNTI0LTM1M2EtNDFhZS1hMjliLWJjMTM1ODI", "mail": "igor@company.com", "userPrincipalName": "igor@company.onmicrosoft.com"}
+Total items in mailbox: 1,247. Unread count: 15. Folder count: 8.
+"""
+        llm_config = LLMConfig.for_memory()
+        # Use bank mission matching production (openclaw bank has strong machine-output filtering)
+        bank_mission = "Did a human say or decide this, or did a machine log it? If a MACHINE logged it, return []."
+
+        # Higher retries: gpt-5-nano sometimes copies raw JSON data verbatim
+        # despite filtering instructions. It does comply ~40% of the time.
+        max_retries = 5
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                facts, _, _ = await extract_facts_from_text(
+                    text=text,
+                    event_date=datetime(2024, 11, 13),
+                    context="Teams assistant session",
+                    llm_config=llm_config,
+                    agent_name="TestUser",
+                    config=_get_raw_config(),
+                    bank_mission=bank_mission,
+                )
+
+                all_text = " ".join([f.fact.lower() for f in facts])
+
+                # Should NOT contain raw GUIDs or parentFolderIds
+                assert "a1b2c3d4" not in all_text, (
+                    f"GUIDs should not be extracted. Facts: {[f.fact for f in facts]}"
+                )
+                assert "parentfolderid" not in all_text, (
+                    f"Folder IDs should not be extracted. Facts: {[f.fact for f in facts]}"
+                )
+                assert "aamkage" not in all_text, (
+                    f"Raw folder IDs should not be extracted. Facts: {[f.fact for f in facts]}"
+                )
+                return  # Test passed
+
+            except AssertionError as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    continue
+                raise
+
+    @pytest.mark.asyncio
+    async def test_workflow_instructions_not_extracted(self):
+        """Workflow/prompt instructions should not be stored as facts."""
+        text = """
+Step 1: Check the inbox for new emails
+Step 2: Emails from reports@company.com are filtered out automatically
+Step 3: Forward urgent emails to the manager
+Output format: JSON with subject, sender, timestamp fields
+"""
+        llm_config = LLMConfig.for_memory()
+
+        max_retries = 3
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                facts, _, _ = await extract_facts_from_text(
+                    text=text,
+                    event_date=datetime(2024, 11, 13),
+                    context="Workflow configuration",
+                    llm_config=llm_config,
+                    agent_name="TestUser",
+                    config=_get_raw_config(),
+                )
+
+                # Workflow instructions should mostly be skipped.
+                # Allow up to 2 since model may consolidate steps into one
+                # summary fact. In production, bank_mission filters these further.
+                assert len(facts) <= 2, (
+                    f"Workflow instructions should not become many facts. Got {len(facts)}: "
+                    f"{[f.fact for f in facts]}"
+                )
+                return
+
+            except AssertionError as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    continue
+                raise
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_version_not_extracted(self):
+        """Ephemeral version observations should not become facts."""
+        text = """
+Assistant: OpenClaw 2026.2.19-2 version observed. System is running normally.
+Health check complete - all services operational.
+Current build: v3.14.159-beta. No updates available.
+"""
+        llm_config = LLMConfig.for_memory()
+
+        max_retries = 3
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                facts, _, _ = await extract_facts_from_text(
+                    text=text,
+                    event_date=datetime(2024, 11, 13),
+                    context="System status check",
+                    llm_config=llm_config,
+                    agent_name="TestUser",
+                    config=_get_raw_config(),
+                )
+
+                # Should extract 0 facts (all ephemeral)
+                assert len(facts) == 0, (
+                    f"Version observations and health checks should not become facts. "
+                    f"Got {len(facts)}: {[f.fact for f in facts]}"
+                )
+                return
+
+            except AssertionError as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    continue
+                raise
+
+    @pytest.mark.asyncio
+    async def test_assistant_narration_not_extracted(self):
+        """Pure assistant narration should not become experience facts."""
+        text = """
+Assistant: Good morning! Let me check your calendar for today.
+Assistant: I found 3 meetings scheduled.
+Assistant: I'll prepare a summary of yesterday's emails.
+Assistant: Here's what I found - you have a meeting with Tom at 2pm about the API redesign.
+"""
+        llm_config = LLMConfig.for_memory()
+
+        max_retries = 3
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                facts, _, _ = await extract_facts_from_text(
+                    text=text,
+                    event_date=datetime(2024, 11, 13),
+                    context="Daily assistant session",
+                    llm_config=llm_config,
+                    agent_name="TestUser",
+                    config=_get_raw_config(),
+                )
+
+                all_text = " ".join([f.fact.lower() for f in facts])
+
+                # Should not start with "Assistant"
+                assistant_narration = [f for f in facts if f.fact.lower().startswith("assistant")]
+                assert len(assistant_narration) == 0, (
+                    f"Facts should not start with 'Assistant'. "
+                    f"Got: {[f.fact for f in assistant_narration]}"
+                )
+
+                # Should extract the substantive content (meeting with Tom) if anything
+                if facts:
+                    assert "tom" in all_text or "meeting" in all_text or "api" in all_text, (
+                        f"Should extract substantive content. Got: {[f.fact for f in facts]}"
+                    )
+                return
+
+            except AssertionError as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    continue
+                raise

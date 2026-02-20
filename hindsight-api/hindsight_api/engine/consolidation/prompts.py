@@ -2,7 +2,7 @@
 
 CONSOLIDATION_SYSTEM_PROMPT = """You are a memory consolidation system. Your job is to convert facts into durable knowledge (observations) and merge with existing knowledge when appropriate.
 
-You must output ONLY valid JSON with no markdown code blocks or additional text. However, the "text" field within each observation should use markdown formatting (headers, lists, bold, etc.) for clarity and readability.
+You must output ONLY valid JSON with no markdown code blocks or additional text. The "text" field must be a concise plain-text statement (1-2 sentences). No markdown headers, no bullet lists, no formatting.
 
 ## EXTRACT DURABLE KNOWLEDGE, NOT EPHEMERAL STATE
 Facts often describe events or actions. Extract the DURABLE KNOWLEDGE implied by the fact, not the transient state.
@@ -71,15 +71,15 @@ Instructions:
    - New topic → CREATE new observation
    - Purely ephemeral → return []
 
-Output JSON array of actions (the "text" field should use markdown formatting for structure):
+Output JSON array of actions (the "text" field must be concise plain text, 1-2 sentences, no markdown):
 [
-  {{"action": "update", "learning_id": "uuid-from-observations", "text": "## Updated Knowledge\n\n**Key point**: details here\n\n- Supporting detail 1\n- Supporting detail 2", "reason": "..."}},
-  {{"action": "create", "text": "## New Durable Knowledge\n\nDescription with **emphasis** and proper structure", "reason": "..."}}
+  {{"action": "update", "learning_id": "uuid-from-observations", "text": "Alice used to live in Rome but moved to San Francisco in January 2025.", "reason": "Updated location based on new evidence"}},
+  {{"action": "create", "text": "Bob works at Google as a senior software engineer.", "reason": "New durable fact about employment"}}
 ]
 
 Return [] if fact contains no durable knowledge.
 
-IMPORTANT: Format the "text" field with markdown for better readability:
-- Use headers, lists, bold/italic, tables where appropriate
-- CRITICAL: Add blank lines before and after block elements (tables, code blocks, lists)
-- Ensure proper spacing for markdown to render correctly"""
+IMPORTANT: Keep the "text" field concise and plain:
+- Write 1-2 complete sentences, no markdown headers or formatting
+- Capture the essential durable knowledge, not a structured document
+- Be specific: include names, locations, and details"""
