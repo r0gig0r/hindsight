@@ -1,6 +1,7 @@
 import type { MoltbotPluginAPI, PluginConfig } from './types.js';
 import { HindsightEmbedManager } from './embed-manager.js';
 import { HindsightClient, type HindsightClientOptions } from './client.js';
+import { deduplicateByJaccard, formatMemoriesCompact } from './memory-formatter.js';
 import { dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -782,14 +783,13 @@ export default function (api: MoltbotPluginAPI) {
           return;
         }
 
-        // Format memories as JSON with all fields from recall
-        const memoriesJson = JSON.stringify(response.results, null, 2);
+        // Deduplicate near-identical results and format compactly
+        const dedupedResults = deduplicateByJaccard(response.results);
+        const memoriesText = formatMemoriesCompact(dedupedResults);
 
         const contextMessage = `<hindsight_memories>
-Relevant memories from past conversations (prioritize recent when conflicting):
-${memoriesJson}
-
-User message: ${prompt}
+These are your memories from past conversations. Use them as context. Prefer recent over old when conflicting:
+${memoriesText}
 </hindsight_memories>`;
 
         console.log(`[Hindsight] Auto-recall: Injecting ${response.results.length} memories from bank ${bankId}`);
