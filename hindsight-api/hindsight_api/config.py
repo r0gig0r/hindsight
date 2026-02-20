@@ -233,8 +233,6 @@ ENV_GRAPH_RETRIEVER = "HINDSIGHT_API_GRAPH_RETRIEVER"
 ENV_MPFP_TOP_K_NEIGHBORS = "HINDSIGHT_API_MPFP_TOP_K_NEIGHBORS"
 ENV_RECALL_MAX_CONCURRENT = "HINDSIGHT_API_RECALL_MAX_CONCURRENT"
 ENV_RECALL_CONNECTION_BUDGET = "HINDSIGHT_API_RECALL_CONNECTION_BUDGET"
-ENV_MCP_LOCAL_BANK_ID = "HINDSIGHT_API_MCP_LOCAL_BANK_ID"
-ENV_MCP_INSTRUCTIONS = "HINDSIGHT_API_MCP_INSTRUCTIONS"
 ENV_MENTAL_MODEL_REFRESH_CONCURRENCY = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_CONCURRENCY"
 
 # OpenTelemetry tracing configuration
@@ -316,18 +314,18 @@ DEFAULT_LLM_PROVIDER = "openai"
 
 # Provider-specific default models
 PROVIDER_DEFAULT_MODELS = {
-    "openai": "o3-mini",
+    "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5-20251001",
     "gemini": "gemini-2.5-flash",
     "groq": "openai/gpt-oss-120b",
     "ollama": "gemma3:12b",
     "lmstudio": "local-model",
-    "vertexai": "gemini-2.0-flash-001",
+    "vertexai": "google/gemini-2.5-flash-lite",
     "openai-codex": "gpt-5.2-codex",
     "claude-code": "claude-sonnet-4-5-20250929",
     "mock": "mock-model",
 }
-DEFAULT_LLM_MODEL = "o3-mini"  # Fallback if provider not in table
+DEFAULT_LLM_MODEL = "gpt-4o-mini"  # Fallback if provider not in table
 DEFAULT_LLM_MAX_CONCURRENT = 32
 DEFAULT_LLM_MAX_RETRIES = 10  # Max retry attempts for LLM API calls
 DEFAULT_LLM_INITIAL_BACKOFF = 1.0  # Initial backoff in seconds for retry exponential backoff
@@ -389,7 +387,6 @@ DEFAULT_GRAPH_RETRIEVER = "link_expansion"  # Options: "link_expansion", "mpfp",
 DEFAULT_MPFP_TOP_K_NEIGHBORS = 20  # Fan-out limit per node in MPFP graph traversal
 DEFAULT_RECALL_MAX_CONCURRENT = 32  # Max concurrent recall operations per worker
 DEFAULT_RECALL_CONNECTION_BUDGET = 4  # Max concurrent DB connections per recall operation
-DEFAULT_MCP_LOCAL_BANK_ID = "mcp"
 DEFAULT_MENTAL_MODEL_REFRESH_CONCURRENCY = 8  # Max concurrent mental model refreshes
 
 # Retain settings

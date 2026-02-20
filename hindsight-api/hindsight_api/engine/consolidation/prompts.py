@@ -2,7 +2,7 @@
 
 CONSOLIDATION_SYSTEM_PROMPT = """You are a memory consolidation system. Your job is to convert facts into durable knowledge (observations) and merge with existing knowledge when appropriate.
 
-You must output ONLY valid JSON with no markdown code blocks or additional text. The "text" field must be a concise plain-text statement (1-2 sentences). No markdown headers, no bullet lists, no formatting.
+You must output a JSON object with an "actions" array. The "text" field must be a concise plain-text statement (1-2 sentences). No markdown headers, no bullet lists, no formatting.
 
 ## EXTRACT DURABLE KNOWLEDGE, NOT EPHEMERAL STATE
 Facts often describe events or actions. Extract the DURABLE KNOWLEDGE implied by the fact, not the transient state.
@@ -58,7 +58,6 @@ Each observation includes:
 - text: the observation content
 - proof_count: number of supporting memories
 - tags: visibility scope (handled automatically)
-- created_at/updated_at: when observation was created/modified
 - occurred_start/occurred_end: temporal range of source facts
 - source_memories: array of supporting facts with their text and dates
 
@@ -69,15 +68,15 @@ Instructions:
 4. Compare with observations:
    - Same topic → UPDATE with learning_id
    - New topic → CREATE new observation
-   - Purely ephemeral → return []
+   - Purely ephemeral → return empty actions list
 
-Output JSON array of actions (the "text" field must be concise plain text, 1-2 sentences, no markdown):
-[
+Output a JSON object with an "actions" array (the "text" field must be concise plain text, 1-2 sentences, no markdown):
+{{"actions": [
   {{"action": "update", "learning_id": "uuid-from-observations", "text": "Alice used to live in Rome but moved to San Francisco in January 2025.", "reason": "Updated location based on new evidence"}},
   {{"action": "create", "text": "Bob works at Google as a senior software engineer.", "reason": "New durable fact about employment"}}
-]
+]}}
 
-Return [] if fact contains no durable knowledge.
+Return {{"actions": []}} if fact contains no durable knowledge.
 
 IMPORTANT: Keep the "text" field concise and plain:
 - Write 1-2 complete sentences, no markdown headers or formatting

@@ -19,6 +19,7 @@ from hindsight_client_api.models import (
     reflect_request,
     retain_request,
 )
+from hindsight_client_api.models.reflect_include_options import ReflectIncludeOptions
 from hindsight_client_api.models.bank_profile_response import BankProfileResponse
 from hindsight_client_api.models.file_retain_response import FileRetainResponse
 from hindsight_client_api.models.list_memory_units_response import ListMemoryUnitsResponse
@@ -66,14 +67,14 @@ class Hindsight:
         ```
     """
 
-    def __init__(self, base_url: str, api_key: str | None = None, timeout: float = 30.0):
+    def __init__(self, base_url: str, api_key: str | None = None, timeout: float = 300.0):
         """
         Initialize the Hindsight client.
 
         Args:
             base_url: The base URL of the Hindsight API server
             api_key: Optional API key for authentication (sent as Bearer token)
-            timeout: Request timeout in seconds (default: 30.0)
+            timeout: Request timeout in seconds (default: 300.0)
         """
         config = hindsight_client_api.Configuration(host=base_url, access_token=api_key)
         self._api_client = hindsight_client_api.ApiClient(config)
@@ -322,6 +323,7 @@ class Hindsight:
         response_schema: dict[str, Any] | None = None,
         tags: list[str] | None = None,
         tags_match: Literal["any", "all", "any_strict", "all_strict"] = "any",
+        include_facts: bool = False,
     ) -> ReflectResponse:
         """
         Generate a contextual answer based on bank identity and memories.
@@ -338,11 +340,14 @@ class Hindsight:
             tags: Optional list of tags to filter memories by
             tags_match: How to match tags - "any" (OR, includes untagged), "all" (AND, includes untagged),
                 "any_strict" (OR, excludes untagged), "all_strict" (AND, excludes untagged). Default: "any"
+            include_facts: If True, the response will include a 'based_on' field listing
+                the memories, mental models, and directives used to construct the answer.
 
         Returns:
             ReflectResponse with answer text, optionally facts used, and optionally
             structured_output if response_schema was provided
         """
+        include = ReflectIncludeOptions(facts={}) if include_facts else None
         request_obj = reflect_request.ReflectRequest(
             query=query,
             budget=budget,
@@ -351,6 +356,7 @@ class Hindsight:
             response_schema=response_schema,
             tags=tags,
             tags_match=tags_match,
+            include=include,
         )
 
         return _run_async(self._memory_api.reflect(bank_id, request_obj, _request_timeout=self._timeout))
