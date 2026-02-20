@@ -439,7 +439,7 @@ def _chunk_conversation(turns: list[dict], max_chars: int) -> list[str]:
 # Base prompt template (shared by concise and custom modes)
 # Uses {extraction_guidelines} placeholder for mode-specific instructions
 _BASE_FACT_EXTRACTION_PROMPT = """Extract SIGNIFICANT facts from text. Be SELECTIVE - only extract facts worth remembering long-term.
-
+{mission_section}
 LANGUAGE REQUIREMENT: Detect the language of the input text. All extracted facts, entity names, descriptions, and other output MUST be in the SAME language as the input. Do not translate to another language.
 
 {fact_types_instruction}
@@ -476,7 +476,7 @@ fact_kind:
 
 fact_type:
 - "world": About user's life, other people, external events
-- "assistant": Interactions with assistant (requests, recommendations)
+- "assistant": ONLY when the assistant provided a substantive recommendation, solution, or piece of information the user would want to recall later. DO NOT extract: greetings, status reports, session management, "I'll check...", "here's what I found" without the actual finding.
 
 ══════════════════════════════════════════════════════════════════════════
 TEMPORAL HANDLING
@@ -514,6 +514,11 @@ DO NOT extract:
 ❌ Pure filler: "thanks", "sounds good", "ok", "got it", "sure"
 ❌ Process chatter: "let me check", "one moment", "I'll look into it"
 ❌ Repeated info: if already stated, don't extract again
+❌ Assistant actions: "assistant greeted", "assistant will check", "assistant reports", session management
+❌ Tool/file operations: file writes, edits, replacements, command executions, tool outputs
+❌ System metadata: message IDs, send statuses, version numbers, error traces, log entries
+❌ Workflow/process descriptions: step-by-step instructions, email filtering rules, output format specs
+❌ Transient status: "nothing to do", "running latest version", "check complete", health checks
 
 CONSOLIDATE related statements into ONE fact when possible."""
 
@@ -538,6 +543,12 @@ Output: ONLY 2 facts (skip coffee preference - too trivial):
 1. what="Alice has 5 years Kubernetes experience, CKA certified", who="Alice", entities=["Alice", "Kubernetes", "CKA"]
 2. what="Alice leads infrastructure team since March", who="Alice", entities=["Alice", "infrastructure"]
 
+Example 3 - AI agent conversation (skip most assistant actions):
+Input: "Assistant: Good morning Igor! Let me check your calendar... I found 3 meetings today. Also, I wrote the report to /tmp/report.md (2,340 bytes). Your meeting with Tom about Pulsar latency was rescheduled to Thursday."
+
+Output: ONLY 1 fact (skip greeting, file write, calendar check):
+1. what="Meeting with Tom about Pulsar latency rescheduled to Thursday", who="Tom, user", fact_type="world", entities=["Tom", "Pulsar", "user"]
+
 ══════════════════════════════════════════════════════════════════════════
 QUALITY OVER QUANTITY
 ══════════════════════════════════════════════════════════════════════════
@@ -552,6 +563,7 @@ an experience or person."""
 # Assembled concise prompt (backward compatible - exact same output as before)
 CONCISE_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
     fact_types_instruction="{fact_types_instruction}",
+    mission_section="{mission_section}",
     extraction_guidelines=_CONCISE_GUIDELINES,
     examples=_CONCISE_EXAMPLES,
 )
@@ -559,6 +571,7 @@ CONCISE_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
 # Custom prompt uses same base but without examples
 CUSTOM_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
     fact_types_instruction="{fact_types_instruction}",
+    mission_section="{mission_section}",
     extraction_guidelines="{custom_instructions}",
     examples="",  # No examples for custom mode
 )
@@ -695,9 +708,13 @@ Example: "Lost job → couldn't pay rent → moved apartment"
 - Fact 2: Moved apartment, causal_relations: [{target_index: 1, relation_type: "caused_by"}]"""
 
 
-def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
+def _build_extraction_prompt_and_schema(config, bank_mission: str | None = None) -> tuple[str, type]:
     """
     Build extraction prompt and response schema based on config.
+
+    Args:
+        config: Resolved HindsightConfig for this bank
+        bank_mission: Optional bank mission text to inject into the prompt
 
     Returns:
         Tuple of (prompt, response_schema)
@@ -706,23 +723,33 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
     extraction_mode = config.retain_extraction_mode
     extract_causal_links = config.retain_extract_causal_links
 
+    # Build mission section (same pattern as consolidation)
+    mission_section = ""
+    if bank_mission and bank_mission != "General memory consolidation":
+        mission_section = f"""
+MISSION CONTEXT: {bank_mission}
+
+Only extract facts that serve this mission. Skip ephemeral operational noise.
+"""
+
     # Select base prompt based on extraction mode
     if extraction_mode == "custom":
         if not config.retain_custom_instructions:
             base_prompt = CONCISE_FACT_EXTRACTION_PROMPT
-            prompt = base_prompt.format(fact_types_instruction=fact_types_instruction)
+            prompt = base_prompt.format(fact_types_instruction=fact_types_instruction, mission_section=mission_section)
         else:
             base_prompt = CUSTOM_FACT_EXTRACTION_PROMPT
             prompt = base_prompt.format(
                 fact_types_instruction=fact_types_instruction,
                 custom_instructions=config.retain_custom_instructions,
+                mission_section=mission_section,
             )
     elif extraction_mode == "verbose":
         base_prompt = VERBOSE_FACT_EXTRACTION_PROMPT
         prompt = base_prompt.format(fact_types_instruction=fact_types_instruction)
     else:
         base_prompt = CONCISE_FACT_EXTRACTION_PROMPT
-        prompt = base_prompt.format(fact_types_instruction=fact_types_instruction)
+        prompt = base_prompt.format(fact_types_instruction=fact_types_instruction, mission_section=mission_section)
 
     # Add causal relationships section if enabled
     if extract_causal_links:
@@ -789,6 +816,7 @@ async def _extract_facts_from_chunk(
     llm_config: "LLMConfig",
     config,
     agent_name: str = None,
+    bank_mission: str | None = None,
 ) -> tuple[list[dict[str, str]], TokenUsage]:
     """
     Extract facts from a single chunk (internal helper for parallel processing).
@@ -803,7 +831,7 @@ async def _extract_facts_from_chunk(
     logger = logging.getLogger(__name__)
 
     # Build prompt and schema using helper function
-    prompt, response_schema = _build_extraction_prompt_and_schema(config)
+    prompt, response_schema = _build_extraction_prompt_and_schema(config, bank_mission=bank_mission)
 
     # Check config for extraction mode and causal link extraction
     extraction_mode = config.retain_extraction_mode
@@ -1090,6 +1118,7 @@ async def _extract_facts_with_auto_split(
     llm_config: LLMConfig,
     config,
     agent_name: str = None,
+    bank_mission: str | None = None,
 ) -> tuple[list[dict[str, str]], TokenUsage]:
     """
     Extract facts from a chunk with automatic splitting if output exceeds token limits.
@@ -1106,6 +1135,7 @@ async def _extract_facts_with_auto_split(
         llm_config: LLM configuration to use
         config: Resolved HindsightConfig for this bank
         agent_name: Optional agent name (memory owner)
+        bank_mission: Optional bank mission text for prompt filtering
 
     Returns:
         Tuple of (facts list, token usage) extracted from the chunk (possibly from sub-chunks)
@@ -1125,6 +1155,7 @@ async def _extract_facts_with_auto_split(
             llm_config=llm_config,
             config=config,
             agent_name=agent_name,
+            bank_mission=bank_mission,
         )
     except OutputTooLongError:
         # Output exceeded token limits - split the chunk in half and retry
@@ -1170,6 +1201,7 @@ async def _extract_facts_with_auto_split(
                 llm_config=llm_config,
                 config=config,
                 agent_name=agent_name,
+                bank_mission=bank_mission,
             ),
             _extract_facts_with_auto_split(
                 chunk=second_half,
@@ -1180,6 +1212,7 @@ async def _extract_facts_with_auto_split(
                 llm_config=llm_config,
                 config=config,
                 agent_name=agent_name,
+                bank_mission=bank_mission,
             ),
         ]
 
@@ -1204,6 +1237,7 @@ async def extract_facts_from_text(
     agent_name: str,
     config,
     context: str = "",
+    bank_mission: str | None = None,
 ) -> tuple[list[Fact], list[tuple[str, int]], TokenUsage]:
     """
     Extract semantic facts from conversational or narrative text using LLM.
@@ -1221,6 +1255,7 @@ async def extract_facts_from_text(
         agent_name: Agent name (memory owner)
         config: Resolved HindsightConfig for this bank
         context: Context about the conversation/document
+        bank_mission: Optional bank mission text for prompt filtering
 
     Returns:
         Tuple of (facts, chunks, usage) where:
@@ -1248,6 +1283,7 @@ async def extract_facts_from_text(
             llm_config=llm_config,
             config=config,
             agent_name=agent_name,
+            bank_mission=bank_mission,
         )
         for i, chunk in enumerate(chunks)
     ]
@@ -1286,6 +1322,7 @@ async def extract_facts_from_contents_batch_api(
     pool=None,
     operation_id: str | None = None,
     schema: str | None = None,
+    bank_mission: str | None = None,
 ) -> tuple[list[ExtractedFactType], list[ChunkMetadata], TokenUsage]:
     """
     Extract facts using LLM Batch API (OpenAI/Groq).
@@ -1301,6 +1338,7 @@ async def extract_facts_from_contents_batch_api(
         pool: Database connection pool (for storing batch state)
         operation_id: Async operation ID (for crash recovery)
         schema: Database schema (for multi-tenant support)
+        bank_mission: Optional bank mission text for prompt filtering
 
     Returns:
         Tuple of (extracted_facts, chunks_metadata, usage)
@@ -1317,7 +1355,9 @@ async def extract_facts_from_contents_batch_api(
     # Check if provider supports batch API
     if not await llm_config._provider_impl.supports_batch_api():
         logger.warning(f"Batch API not supported for provider {llm_config.provider}, falling back to sync mode")
-        return await extract_facts_from_contents(contents, llm_config, agent_name, config, pool, operation_id, schema)
+        return await extract_facts_from_contents(
+            contents, llm_config, agent_name, config, pool, operation_id, schema, bank_mission=bank_mission
+        )
 
     # Check if we're resuming an existing batch (crash recovery)
     batch_id = None
@@ -1344,7 +1384,7 @@ async def extract_facts_from_contents_batch_api(
     batch_requests = []
 
     # Build prompt and schema once (same for all chunks)
-    prompt, response_schema = _build_extraction_prompt_and_schema(config)
+    prompt, response_schema = _build_extraction_prompt_and_schema(config, bank_mission=bank_mission)
 
     for content_index, item in enumerate(contents):
         chunks = chunk_text(item.content, max_chars=config.retain_chunk_size)
@@ -1692,6 +1732,7 @@ async def extract_facts_from_contents(
     pool=None,
     operation_id: str | None = None,
     schema: str | None = None,
+    bank_mission: str | None = None,
 ) -> tuple[list[ExtractedFactType], list[ChunkMetadata], TokenUsage]:
     """
     Extract facts from multiple content items in parallel.
@@ -1712,6 +1753,7 @@ async def extract_facts_from_contents(
         pool: Database connection pool (passed to batch API for state storage)
         operation_id: Async operation ID (passed to batch API for crash recovery)
         schema: Database schema (passed to batch API for multi-tenant support)
+        bank_mission: Optional bank mission text for prompt filtering
 
     Returns:
         Tuple of (extracted_facts, chunks_metadata, usage)
@@ -1722,7 +1764,7 @@ async def extract_facts_from_contents(
     # Route to batch API if enabled
     if config.retain_batch_enabled:
         return await extract_facts_from_contents_batch_api(
-            contents, llm_config, agent_name, config, pool, operation_id, schema
+            contents, llm_config, agent_name, config, pool, operation_id, schema, bank_mission=bank_mission
         )
 
     # Step 1: Create parallel fact extraction tasks
@@ -1737,6 +1779,7 @@ async def extract_facts_from_contents(
             llm_config=llm_config,
             agent_name=agent_name,
             config=config,
+            bank_mission=bank_mission,
         )
         fact_extraction_tasks.append(task)
 
