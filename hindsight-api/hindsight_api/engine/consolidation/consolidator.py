@@ -593,6 +593,9 @@ async def _execute_update_action(
     if not learning_id or not new_text:
         return {"action": "skipped", "reason": "missing_learning_id_or_text"}
 
+    # Sanitize LLM output: remove null bytes (invalid in PostgreSQL UTF-8)
+    new_text = new_text.replace("\x00", "")
+
     # Find the observation
     model = next((m for m in observations if m.id == learning_id), None)
     if not model:
@@ -704,6 +707,9 @@ async def _execute_create_action(
 
     if not text:
         return {"action": "skipped", "reason": "missing_text"}
+
+    # Sanitize LLM output: remove null bytes (invalid in PostgreSQL UTF-8)
+    text = text.replace("\x00", "")
 
     # Use text directly from classify - skip the redundant LLM call
     result = await _create_observation_directly(
