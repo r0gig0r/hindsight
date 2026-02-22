@@ -352,7 +352,7 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
         self._async_client = httpx.AsyncClient(timeout=self.timeout)
 
         # Verify server is reachable and get model info
-        # Use a temporary semaphore for initialization
+        # Try /info (TEI) first, fall back to /models (Infinity)
         init_semaphore = asyncio.Semaphore(1)
         try:
             response = await self._async_request_with_retry(
@@ -360,10 +360,18 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
             )
             info = response.json()
             self._model_id = info.get("model_id", "unknown")
-            logger.info(f"Reranker: TEI provider initialized (model: {self._model_id})")
-        except httpx.HTTPError as e:
-            self._async_client = None
-            raise RuntimeError(f"Failed to connect to TEI server at {self.base_url}: {e}")
+        except httpx.HTTPError:
+            try:
+                response = await self._async_request_with_retry(
+                    self._async_client, init_semaphore, "GET", f"{self.base_url}/models"
+                )
+                models = response.json()
+                model_data = models.get("data", [{}])
+                self._model_id = model_data[0].get("id", "unknown") if model_data else "unknown"
+            except httpx.HTTPError as e:
+                self._async_client = None
+                raise RuntimeError(f"Failed to connect to reranker at {self.base_url}: {e}")
+        logger.info(f"Reranker: TEI provider initialized (model: {self._model_id})")
 
     async def _rerank_query_group(
         self,
@@ -382,12 +390,15 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
                 json={
                     "query": query,
                     "texts": texts,
+                    "documents": texts,
                     "return_text": False,
                 },
             )
             results = response.json()
-            # TEI returns results sorted by score descending, with original index
-            return [(result["index"], result["score"]) for result in results]
+            # Handle both TEI (flat array, "score") and Infinity (nested "results", "relevance_score")
+            if isinstance(results, dict) and "results" in results:
+                results = results["results"]
+            return [(result["index"], result.get("score", result.get("relevance_score", 0.0))) for result in results]
         except httpx.HTTPError as e:
             raise RuntimeError(f"TEI rerank request failed: {e}")
 

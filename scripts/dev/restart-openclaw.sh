@@ -158,6 +158,36 @@ else
     ok "No daemon was running"
 fi
 
+# --- Step 3.5: Restart Infinity reranker sidecar ---
+INFINITY_PLIST="$HOME/Library/LaunchAgents/ai.openclaw.infinity-reranker.plist"
+INFINITY_LABEL="ai.openclaw.infinity-reranker"
+INFINITY_PORT=7997
+if [[ -f "$INFINITY_PLIST" ]]; then
+    step "Restarting Infinity reranker sidecar..."
+    if launchctl list "$INFINITY_LABEL" &>/dev/null; then
+        run launchctl bootout "gui/$(id -u)/$INFINITY_LABEL" 2>/dev/null || true
+        sleep 2
+    fi
+    run launchctl bootstrap "gui/$(id -u)" "$INFINITY_PLIST"
+    # Wait for Infinity health
+    if ! $DRY_RUN; then
+        INF_ELAPSED=0
+        while [[ $INF_ELAPSED -lt 30 ]]; do
+            if curl -s --max-time 2 "http://127.0.0.1:${INFINITY_PORT}/models" &>/dev/null; then
+                ok "Infinity sidecar healthy on :${INFINITY_PORT}"
+                break
+            fi
+            sleep 2
+            INF_ELAPSED=$((INF_ELAPSED + 2))
+        done
+        if [[ $INF_ELAPSED -ge 30 ]]; then
+            warn "Infinity sidecar did not become healthy in 30s (recall will use lazy init)"
+        fi
+    fi
+else
+    warn "Infinity LaunchAgent plist not found, skipping"
+fi
+
 # --- Step 4: Rebuild venv ---
 if $SKIP_VENV; then
     step "Skipping venv rebuild (--skip-venv)"
@@ -231,6 +261,14 @@ if ! $DRY_RUN; then
     DAEMON_PID=$(pgrep -f "hindsight-api.*--daemon" 2>/dev/null | head -1 || echo "none")
     DAEMON_PY=$("$REPO_DIR/.venv/bin/python" --version 2>&1 || echo "unknown")
     echo -e "  Daemon:   pid ${CYAN}${DAEMON_PID}${NC} on :${DAEMON_PORT} (${DAEMON_PY})"
+
+    # Infinity sidecar (check via health endpoint)
+    if curl -s --max-time 2 "http://127.0.0.1:${INFINITY_PORT}/models" &>/dev/null; then
+        INFINITY_PID=$(lsof -iTCP:"${INFINITY_PORT}" -sTCP:LISTEN -t 2>/dev/null | head -1 || echo "?")
+        echo -e "  Infinity: pid ${CYAN}${INFINITY_PID}${NC} on :${INFINITY_PORT}"
+    else
+        echo -e "  Infinity: ${YELLOW}not running${NC}"
+    fi
 
     # Health
     echo -e "  Health:   ${GREEN}$(curl -s "$HEALTH_URL" 2>/dev/null)${NC}"
