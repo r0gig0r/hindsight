@@ -257,4 +257,36 @@ export class HindsightClient {
       throw new Error(`Failed to recall memories: ${error}`, { cause: error });
     }
   }
+
+  // --- recallExp (HTTP-only, diversity clustering) ---
+
+  async recallExp(request: RecallRequest, timeoutMs?: number): Promise<RecallResponse> {
+    if (!this.httpMode) {
+      throw new Error('recallExp requires HTTP mode (apiUrl must be set)');
+    }
+    const url = `${this.apiUrl}/v1/default/banks/${encodeURIComponent(this.bankId)}/memories/recall_exp`;
+    const MAX_QUERY_CHARS = 800;
+    const query = request.query.length > MAX_QUERY_CHARS
+      ? (console.warn(`[Hindsight] Truncating recall_exp query from ${request.query.length} to ${MAX_QUERY_CHARS} chars`),
+         request.query.substring(0, MAX_QUERY_CHARS))
+      : request.query;
+    const body = {
+      query,
+      max_tokens: request.max_tokens || 1024,
+    };
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: this.httpHeaders(),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs ?? DEFAULT_TIMEOUT_MS),
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Failed to recall_exp memories (HTTP ${res.status}): ${text}`);
+    }
+
+    return res.json() as Promise<RecallResponse>;
+  }
 }

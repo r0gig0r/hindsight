@@ -547,9 +547,10 @@ export default function (api: MoltbotPluginAPI) {
           console.log('[Hindsight] Starting embedded server...');
           await embedManager.start();
 
-          // Initialize client (local daemon mode — no apiUrl)
-          console.log('[Hindsight] Creating HindsightClient (subprocess mode)...');
-          client = new HindsightClient(buildClientOptions(llmConfig, pluginConfig, { apiUrl: null, apiToken: null }));
+          // Initialize client (local daemon mode — use daemon's HTTP API)
+          const daemonUrl = `http://127.0.0.1:${apiPort}`;
+          console.log(`[Hindsight] Creating HindsightClient (HTTP mode via daemon: ${daemonUrl})...`);
+          client = new HindsightClient(buildClientOptions(llmConfig, pluginConfig, { apiUrl: daemonUrl, apiToken: null }));
 
           // Set default bank (will be overridden per-request when dynamic bank IDs are enabled)
           const defaultBankId = deriveBankId(undefined, pluginConfig);
@@ -668,7 +669,8 @@ export default function (api: MoltbotPluginAPI) {
 
             await embedManager.start();
 
-            client = new HindsightClient(buildClientOptions(llmConfig, reinitPluginConfig, { apiUrl: null, apiToken: null }));
+            const daemonUrl = `http://127.0.0.1:${apiPort}`;
+            client = new HindsightClient(buildClientOptions(llmConfig, reinitPluginConfig, { apiUrl: daemonUrl, apiToken: null }));
             const defaultBankId = deriveBankId(undefined, reinitPluginConfig);
             client.setBankId(defaultBankId);
 
@@ -778,7 +780,11 @@ export default function (api: MoltbotPluginAPI) {
           console.log(`[Hindsight] Reusing in-flight recall for bank ${bankId}`);
           recallPromise = existing;
         } else {
-          recallPromise = client.recall({ query: prompt, max_tokens: 2048 }, RECALL_TIMEOUT_MS);
+          recallPromise = client.recallExp({ query: prompt, max_tokens: 2048 }, RECALL_TIMEOUT_MS)
+            .catch((err: unknown) => {
+              console.warn(`[Hindsight] recall_exp failed, falling back: ${err}`);
+              return client.recall({ query: prompt, max_tokens: 2048 }, RECALL_TIMEOUT_MS);
+            });
           inflightRecalls.set(recallKey, recallPromise);
           void recallPromise.catch(() => {}).finally(() => inflightRecalls.delete(recallKey));
         }
@@ -853,8 +859,24 @@ ${memoriesText}
           return;
         }
 
+        // For cron sessions, only retain assistant output — system/user prompts
+        // contain workflow instructions that pollute the memory bank as "facts".
+        const isCron = effectiveCtx?.sessionKey?.includes('cron') ||
+          effectiveCtx?.messageProvider === 'cron-event';
+
         // Format messages into a transcript
         const transcript = event.messages
+          .filter((msg: any) => {
+            const role = msg.role || 'unknown';
+            if (isCron) {
+              // Cron sessions: only keep assistant output.
+              // Both system and user messages contain workflow instructions
+              // (step-by-step task definitions) that pollute memory as "facts".
+              // The assistant response contains the actual results/digests.
+              return role === 'assistant';
+            }
+            return true;
+          })
           .map((msg: any) => {
             const role = msg.role || 'unknown';
             let content = '';
