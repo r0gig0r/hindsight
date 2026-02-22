@@ -3138,6 +3138,265 @@ class MemoryEngine(MemoryEngineInterface):
 
         return filtered_results, total_tokens
 
+    async def recall_exp_async(
+        self,
+        bank_id: str,
+        query: str,
+        *,
+        max_tokens: int = 4096,
+        fact_type: list[str] | None = None,
+        request_context: "RequestContext",
+        tags: list[str] | None = None,
+        tags_match: TagsMatch = "any",
+        cluster_threshold: float = 0.85,
+    ) -> RecallResultModel:
+        """
+        Experimental recall: full pipeline + entity enrichment + diversity clustering.
+
+        Pipeline:
+        1. Run full recall (4-way retrieval + RRF + cross-encoder) with inflated budget
+        2. Entity enrichment: keyword-match entities from query, fetch their facts
+        3. Merge recall results + entity facts into unified pool
+        4. KNN cluster at threshold and pick one representative per cluster
+        5. Strip pipe metadata, apply actual token budget
+
+        Args:
+            bank_id: Bank ID to recall from.
+            query: Recall query.
+            max_tokens: Maximum tokens for results.
+            fact_type: Fact types to include (defaults to world, experience, observation).
+            request_context: Request context for authentication.
+            tags: Optional tag filters.
+            tags_match: Tag matching mode.
+            cluster_threshold: Cosine similarity threshold for clustering (0.85 default).
+
+        Returns:
+            RecallResultModel with diverse, deduplicated results.
+        """
+        from .search.diversity import ClusterRepresentative, cluster_and_select, strip_pipe_metadata
+        from .search.types import RetrievalResult
+
+        recall_start = time.time()
+        recall_id = str(uuid.uuid4())[:8]
+
+        await self._authenticate_tenant(request_context)
+        pool = await self._get_pool()
+
+        if fact_type is None:
+            fact_type = ["world", "experience", "observation"]
+
+        logger.info(f"[RECALL_EXP {recall_id}] Query: '{query[:50]}' bank={bank_id}")
+
+        try:
+            # STEP 1: Full recall pipeline with inflated budget
+            t0 = time.time()
+            base_result = await self.recall_async(
+                bank_id=bank_id,
+                query=query,
+                max_tokens=max_tokens * 4,
+                include_entities=False,
+                include_chunks=False,
+                include_source_facts=False,
+                fact_type=fact_type,
+                request_context=request_context,
+                tags=tags,
+                tags_match=tags_match,
+                _quiet=True,
+            )
+            recall_facts = base_result.results or []
+            recall_ids = {f.id for f in recall_facts}
+            t_recall = time.time() - t0
+
+            logger.info(f"[RECALL_EXP {recall_id}] [1] Base recall: {len(recall_facts)} facts in {t_recall:.3f}s")
+
+            if not recall_facts:
+                return RecallResultModel(results=[])
+
+            # STEP 2: Entity enrichment — find entities named in the query
+            t0 = time.time()
+            entity_fact_dicts: list[dict[str, Any]] = []
+            matched_entity_count = 0
+
+            async with acquire_with_retry(pool) as conn:
+                # Keyword match: entity canonical_name is a substring of the query.
+                # Skip very short names (<3 chars) and overly generic entities (>200 linked facts).
+                matched_entities = await conn.fetch(
+                    f"""
+                    SELECT e.id, e.canonical_name, COUNT(ue.unit_id) AS fact_count
+                    FROM {fq_table("entities")} e
+                    JOIN {fq_table("unit_entities")} ue ON ue.entity_id = e.id
+                    WHERE e.bank_id = $1
+                      AND LENGTH(e.canonical_name) >= 3
+                      AND POSITION(LOWER(e.canonical_name) IN LOWER($2)) > 0
+                    GROUP BY e.id, e.canonical_name
+                    HAVING COUNT(ue.unit_id) BETWEEN 1 AND 200
+                    ORDER BY LENGTH(e.canonical_name) DESC, COUNT(ue.unit_id) DESC
+                    LIMIT 10
+                    """,
+                    bank_id,
+                    query,
+                )
+                matched_entity_count = len(matched_entities)
+
+                if matched_entities:
+                    entity_ids = [r["id"] for r in matched_entities]
+                    recall_uuid_list = [uuid.UUID(rid) for rid in recall_ids]
+
+                    entity_rows = await conn.fetch(
+                        f"""
+                        SELECT DISTINCT ON (mu.id)
+                            mu.id, mu.text, mu.fact_type, mu.context,
+                            mu.event_date, mu.occurred_start, mu.occurred_end,
+                            mu.mentioned_at, mu.embedding, mu.tags,
+                            mu.document_id, mu.chunk_id
+                        FROM {fq_table("unit_entities")} ue
+                        JOIN {fq_table("memory_units")} mu ON ue.unit_id = mu.id
+                        WHERE ue.entity_id = ANY($1::uuid[])
+                          AND mu.bank_id = $2
+                          AND mu.fact_type = ANY($3::text[])
+                          AND mu.embedding IS NOT NULL
+                          AND mu.id != ALL($4::uuid[])
+                        ORDER BY mu.id, mu.mentioned_at DESC NULLS LAST
+                        LIMIT 200
+                        """,
+                        entity_ids,
+                        bank_id,
+                        fact_type,
+                        recall_uuid_list,
+                    )
+                    entity_fact_dicts = [dict(r) for r in entity_rows]
+
+            t_entity = time.time() - t0
+            entity_names_str = ", ".join(r["canonical_name"] for r in matched_entities) if matched_entities else "none"
+            logger.info(
+                f"[RECALL_EXP {recall_id}] [2] Entity enrichment: {matched_entity_count} entities "
+                f"({entity_names_str}), {len(entity_fact_dicts)} new facts in {t_entity:.3f}s"
+            )
+
+            # STEP 3: Fetch embeddings for recall results and build unified candidate pool
+            t0 = time.time()
+            recall_uuid_list = [uuid.UUID(rid) for rid in recall_ids]
+
+            async with acquire_with_retry(pool) as conn:
+                emb_rows = await conn.fetch(
+                    f"""
+                    SELECT id, text, fact_type, context, event_date,
+                           occurred_start, occurred_end, mentioned_at,
+                           embedding, tags, document_id, chunk_id
+                    FROM {fq_table("memory_units")}
+                    WHERE id = ANY($1::uuid[]) AND embedding IS NOT NULL
+                    """,
+                    recall_uuid_list,
+                )
+
+            # Build candidates: recall facts (with DB-fetched embeddings) + entity facts
+            all_candidates: list[RetrievalResult] = []
+            for row in emb_rows:
+                all_candidates.append(RetrievalResult.from_db_row(dict(row)))
+            for ef in entity_fact_dicts:
+                all_candidates.append(RetrievalResult.from_db_row(ef))
+
+            t_merge = time.time() - t0
+            logger.info(
+                f"[RECALL_EXP {recall_id}] [3] Merged pool: {len(emb_rows)} recall + "
+                f"{len(entity_fact_dicts)} entity = {len(all_candidates)} candidates in {t_merge:.3f}s"
+            )
+
+            # STEP 4: Generate query embedding and cluster
+            t0 = time.time()
+            query_embedding = embedding_utils.generate_embedding(self.embeddings, query)
+            representatives: list[ClusterRepresentative] = cluster_and_select(
+                all_candidates, query_embedding, cluster_threshold
+            )
+            t_cluster = time.time() - t0
+            logger.info(
+                f"[RECALL_EXP {recall_id}] [4] Clustering ({cluster_threshold}): "
+                f"{len(all_candidates)} → {len(representatives)} clusters in {t_cluster:.3f}s"
+            )
+
+            # STEP 5: Strip pipe metadata and apply token budget
+            result_dicts = []
+            for rep in representatives:
+                r = rep.result
+                result_dicts.append(
+                    {
+                        "id": r.id,
+                        "text": strip_pipe_metadata(r.text),
+                        "fact_type": r.fact_type,
+                        "context": r.context,
+                        "event_date": r.event_date,
+                        "occurred_start": r.occurred_start,
+                        "occurred_end": r.occurred_end,
+                        "mentioned_at": r.mentioned_at,
+                        "document_id": r.document_id,
+                        "chunk_id": r.chunk_id,
+                        "tags": r.tags,
+                    }
+                )
+
+            filtered_dicts, total_tokens = self._filter_by_token_budget(result_dicts, max_tokens)
+
+            # STEP 6: Fetch entities for filtered results
+            filtered_ids = [uuid.UUID(d["id"]) for d in filtered_dicts]
+            fact_entity_map: dict[str, list[dict[str, str]]] = {}
+            if filtered_ids:
+                async with acquire_with_retry(pool) as conn:
+                    entity_rows = await conn.fetch(
+                        f"""
+                        SELECT ue.unit_id, e.id as entity_id, e.canonical_name
+                        FROM {fq_table("unit_entities")} ue
+                        JOIN {fq_table("entities")} e ON ue.entity_id = e.id
+                        WHERE ue.unit_id = ANY($1::uuid[])
+                        """,
+                        filtered_ids,
+                    )
+                    for row in entity_rows:
+                        unit_id = str(row["unit_id"])
+                        if unit_id not in fact_entity_map:
+                            fact_entity_map[unit_id] = []
+                        fact_entity_map[unit_id].append(
+                            {"entity_id": str(row["entity_id"]), "canonical_name": row["canonical_name"]}
+                        )
+
+            # Build MemoryFact list
+            memory_facts = []
+            for d in filtered_dicts:
+                rid = str(d["id"])
+                entity_names = None
+                if rid in fact_entity_map:
+                    entity_names = [e["canonical_name"] for e in fact_entity_map[rid]]
+
+                memory_facts.append(
+                    MemoryFact(
+                        id=rid,
+                        text=d["text"],
+                        fact_type=d.get("fact_type", "world"),
+                        entities=entity_names,
+                        context=d.get("context"),
+                        occurred_start=d["occurred_start"].isoformat() if d.get("occurred_start") else None,
+                        occurred_end=d["occurred_end"].isoformat() if d.get("occurred_end") else None,
+                        mentioned_at=d["mentioned_at"].isoformat() if d.get("mentioned_at") else None,
+                        document_id=d.get("document_id"),
+                        chunk_id=str(d["chunk_id"]) if d.get("chunk_id") else None,
+                        tags=d.get("tags") or None,
+                    )
+                )
+
+            total_time = time.time() - recall_start
+            from_entities = sum(1 for d in filtered_dicts if d["id"] not in recall_ids)
+            logger.info(
+                f"[RECALL_EXP {recall_id}] Complete: {len(memory_facts)} facts ({total_tokens} tok) | "
+                f"from_recall={len(memory_facts) - from_entities} from_entities={from_entities} | "
+                f"{total_time:.3f}s (recall={t_recall:.3f} entity={t_entity:.3f} "
+                f"cluster={t_cluster:.3f})"
+            )
+
+            return RecallResultModel(results=memory_facts)
+
+        except Exception as e:
+            logger.error(f"[RECALL_EXP {recall_id}] ERROR after {time.time() - recall_start:.3f}s: {e}")
+            raise Exception(f"Failed to search memories (exp): {e}")
+
     async def get_document(
         self,
         document_id: str,
@@ -3647,9 +3906,25 @@ class MemoryEngine(MemoryEngineInterface):
             )
 
         # Build edges (combine direct links and copied links from sources)
-        edges = []
+        # Deduplicate: observations inherit links from multiple source memories,
+        # which can produce many duplicate edges between the same node pair.
+        # Keep one edge per (normalized_pair, link_type), highest weight wins.
         all_links = direct_links + copied_links
+        deduped_links: dict[tuple, dict] = {}
         for row in all_links:
+            from_id = row["from_unit_id"]
+            to_id = row["to_unit_id"]
+            if from_id == to_id:
+                continue  # Skip self-links
+            # Normalize direction so A→B and B→A collapse
+            pair = (min(str(from_id), str(to_id)), max(str(from_id), str(to_id)))
+            key = (*pair, row["link_type"])
+            existing = deduped_links.get(key)
+            if existing is None or row["weight"] > existing["weight"]:
+                deduped_links[key] = row
+
+        edges = []
+        for row in deduped_links.values():
             from_id = str(row["from_unit_id"])
             to_id = str(row["to_unit_id"])
             link_type = row["link_type"]

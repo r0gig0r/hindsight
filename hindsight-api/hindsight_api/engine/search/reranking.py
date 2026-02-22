@@ -2,6 +2,8 @@
 Cross-encoder neural reranking for search results.
 """
 
+import numpy as np
+
 from .types import MergedCandidate, ScoredResult
 
 
@@ -87,14 +89,8 @@ class CrossEncoderReranker:
         # Get cross-encoder scores
         scores = await self.cross_encoder.predict(pairs)
 
-        # Normalize scores using sigmoid to [0, 1] range
-        # Cross-encoder returns logits which can be negative
-        import numpy as np
-
-        def sigmoid(x):
-            return 1 / (1 + np.exp(-x))
-
-        normalized_scores = [sigmoid(score) for score in scores]
+        # Normalize scores using vectorized sigmoid to [0, 1] range
+        normalized_scores = (1 / (1 + np.exp(-np.array(scores)))).tolist()
 
         # Create ScoredResult objects with cross-encoder scores
         scored_results = []

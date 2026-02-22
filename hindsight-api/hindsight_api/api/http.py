@@ -2101,6 +2101,97 @@ def _register_routes(app: FastAPI):
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post(
+        "/v1/default/banks/{bank_id}/memories/recall_exp",
+        response_model=RecallResponse,
+        summary="Recall memories (experimental - diversity + entity enrichment)",
+        description="Experimental recall: full pipeline + entity enrichment + diversity clustering.\n\n"
+        "Runs the standard 4-way recall pipeline (semantic, BM25, graph, temporal + cross-encoder), "
+        "then enriches with facts from query-related entities, clusters semantically similar results "
+        "at cosine 0.85, picks one representative per cluster, strips pipe metadata, and applies "
+        "token budget. Delivers more diverse results with less redundancy.",
+        operation_id="recall_memories_exp",
+        tags=["Memory"],
+    )
+    async def api_recall_exp(
+        bank_id: str, request: RecallRequest, request_context: RequestContext = Depends(get_request_context)
+    ):
+        """Run experimental recall with diversity clustering."""
+        import time
+
+        handler_start = time.time()
+        metrics = get_metrics_collector()
+
+        encoding = _get_tiktoken_encoding()
+        query_tokens = len(encoding.encode(request.query))
+        if query_tokens > MAX_QUERY_TOKENS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Query too long: {query_tokens} tokens exceeds maximum of {MAX_QUERY_TOKENS}.",
+            )
+
+        try:
+            fact_types = request.types if request.types else list(VALID_RECALL_FACT_TYPES)
+
+            with metrics.record_operation("recall_exp", bank_id=bank_id, source="api", max_tokens=request.max_tokens):
+                recall_start = time.time()
+                core_result = await app.state.memory.recall_exp_async(
+                    bank_id=bank_id,
+                    query=request.query,
+                    max_tokens=request.max_tokens,
+                    fact_type=fact_types,
+                    request_context=request_context,
+                    tags=request.tags,
+                    tags_match=request.tags_match,
+                )
+
+            def _fact_to_result(fact: "MemoryFact") -> RecallResult:
+                return RecallResult(
+                    id=fact.id,
+                    text=fact.text,
+                    type=fact.fact_type,
+                    entities=fact.entities,
+                    context=fact.context,
+                    occurred_start=fact.occurred_start,
+                    occurred_end=fact.occurred_end,
+                    mentioned_at=fact.mentioned_at,
+                    document_id=fact.document_id,
+                    chunk_id=fact.chunk_id,
+                    tags=fact.tags,
+                    source_fact_ids=fact.source_fact_ids,
+                )
+
+            recall_results = [_fact_to_result(fact) for fact in core_result.results]
+
+            handler_duration = time.time() - handler_start
+            recall_duration = time.time() - recall_start
+            if handler_duration > 0.5:
+                logging.info(
+                    f"[RECALL_EXP HTTP] bank={bank_id} total={handler_duration:.3f}s "
+                    f"recall={recall_duration:.3f}s results={len(recall_results)}"
+                )
+
+            return RecallResponse(results=recall_results)
+
+        except HTTPException:
+            raise
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (asyncio.TimeoutError, TimeoutError):
+            raise HTTPException(
+                status_code=504,
+                detail="Request timed out while searching memories.",
+            )
+        except Exception as e:
+            import traceback
+
+            handler_duration = time.time() - handler_start
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(
+                f"[RECALL_EXP ERROR] bank={bank_id} duration={handler_duration:.3f}s error={str(e)}\n{error_detail}"
+            )
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post(
         "/v1/default/banks/{bank_id}/reflect",
         response_model=ReflectResponse,
         summary="Reflect and generate answer",

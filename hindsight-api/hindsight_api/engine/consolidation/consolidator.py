@@ -737,22 +737,37 @@ async def _create_memory_links(
     observation_id: uuid.UUID,
 ) -> None:
     """
-    Placeholder for observation link creation.
+    Create entity associations and a semantic link for an observation.
 
-    Observations do NOT get any memory_links copied from their source facts.
-    Instead, retrieval uses source_memory_ids to traverse:
-    - Entity connections: observation → source_memory_ids → unit_entities
-    - Semantic similarity: observations have their own embeddings
-    - Temporal proximity: observations have their own temporal fields
-
-    This avoids data duplication and ensures observations are always
-    connected via their source facts' relationships.
-
-    The memory_id and observation_id parameters are kept for interface
-    compatibility but no links are created.
+    Observations need their own direct links because source_memory_ids
+    can become stale when source facts are deleted by deduplication.
+    This ensures observations remain connected in the graph even after
+    their source facts are cleaned up.
     """
-    # No links are created - observations rely on source_memory_ids for traversal
-    pass
+    schema = fq_table("unit_entities")
+    link_table = fq_table("memory_links")
+
+    # 1. Inherit entity associations from the source memory
+    await conn.execute(
+        f"""
+        INSERT INTO {schema} (unit_id, entity_id)
+        SELECT $1, entity_id FROM {schema} WHERE unit_id = $2
+        ON CONFLICT DO NOTHING
+        """,
+        observation_id,
+        memory_id,
+    )
+
+    # 2. Create a semantic link to the source memory
+    await conn.execute(
+        f"""
+        INSERT INTO {link_table} (from_unit_id, to_unit_id, link_type, weight)
+        VALUES ($1, $2, 'semantic', 1.0)
+        ON CONFLICT DO NOTHING
+        """,
+        observation_id,
+        memory_id,
+    )
 
 
 async def _find_related_observations(
