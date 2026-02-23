@@ -46,8 +46,8 @@ class RetrievalResult:
     mentioned_at: datetime | None = None
     document_id: str | None = None
     chunk_id: str | None = None
-    embedding: list[float] | None = None
     tags: list[str] | None = None  # Visibility scope tags
+    embedding: list[float] | None = None  # Only populated for recall_exp diversity clustering
 
     # Retrieval-specific scores (only one will be set depending on retrieval method)
     similarity: float | None = None  # Semantic retrieval
@@ -70,8 +70,8 @@ class RetrievalResult:
             mentioned_at=row.get("mentioned_at"),
             document_id=row.get("document_id"),
             chunk_id=row.get("chunk_id"),
-            embedding=row.get("embedding"),
             tags=row.get("tags"),
+            embedding=row.get("embedding"),
             similarity=row.get("similarity"),
             bm25_score=row.get("bm25_score"),
             activation=row.get("activation"),
@@ -154,7 +154,6 @@ class ScoredResult:
             "mentioned_at": self.retrieval.mentioned_at,
             "document_id": self.retrieval.document_id,
             "chunk_id": self.retrieval.chunk_id,
-            "embedding": self.retrieval.embedding,
             "tags": self.retrieval.tags,
             "semantic_similarity": self.retrieval.similarity,
             "bm25_score": self.retrieval.bm25_score,
