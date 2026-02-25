@@ -290,6 +290,15 @@ ENV_CONSOLIDATION_MAX_TOKENS = "HINDSIGHT_API_CONSOLIDATION_MAX_TOKENS"
 ENV_SKIP_LLM_VERIFICATION = "HINDSIGHT_API_SKIP_LLM_VERIFICATION"
 ENV_LAZY_RERANKER = "HINDSIGHT_API_LAZY_RERANKER"
 
+# Primary LLM fallback configuration
+ENV_PRIMARY_LLM_ENABLED = "HINDSIGHT_API_PRIMARY_LLM_ENABLED"
+ENV_PRIMARY_LLM_PROVIDER = "HINDSIGHT_API_PRIMARY_LLM_PROVIDER"
+ENV_PRIMARY_LLM_MODEL = "HINDSIGHT_API_PRIMARY_LLM_MODEL"
+ENV_PRIMARY_LLM_API_KEY = "HINDSIGHT_API_PRIMARY_LLM_API_KEY"
+ENV_PRIMARY_LLM_BASE_URL = "HINDSIGHT_API_PRIMARY_LLM_BASE_URL"
+ENV_PRIMARY_LLM_FAILURE_THRESHOLD = "HINDSIGHT_API_PRIMARY_LLM_FAILURE_THRESHOLD"
+ENV_PRIMARY_LLM_COOLDOWN_SECONDS = "HINDSIGHT_API_PRIMARY_LLM_COOLDOWN_SECONDS"
+
 # Database migrations
 ENV_RUN_MIGRATIONS_ON_STARTUP = "HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP"
 
@@ -418,6 +427,11 @@ DEFAULT_FILE_DELETE_AFTER_RETAIN = True  # Delete file bytes after retain (saves
 DEFAULT_ENABLE_OBSERVATIONS = True  # Observations enabled by default
 DEFAULT_CONSOLIDATION_BATCH_SIZE = 500  # Memories to load per batch (internal memory optimization)
 DEFAULT_CONSOLIDATION_MAX_TOKENS = 1024  # Max tokens for recall when finding related observations
+
+# Primary LLM fallback defaults
+DEFAULT_PRIMARY_LLM_ENABLED = False
+DEFAULT_PRIMARY_LLM_FAILURE_THRESHOLD = 3
+DEFAULT_PRIMARY_LLM_COOLDOWN_SECONDS = 300
 
 # Database migrations
 DEFAULT_RUN_MIGRATIONS_ON_STARTUP = True
@@ -668,6 +682,15 @@ class HindsightConfig:
     # Optimization flags
     skip_llm_verification: bool
     lazy_reranker: bool
+
+    # Primary LLM with fallback
+    primary_llm_enabled: bool
+    primary_llm_provider: str | None
+    primary_llm_model: str | None
+    primary_llm_api_key: str | None
+    primary_llm_base_url: str | None
+    primary_llm_failure_threshold: int
+    primary_llm_cooldown_seconds: int
 
     # Database migrations
     run_migrations_on_startup: bool
@@ -1012,6 +1035,18 @@ class HindsightConfig:
             # Optimization flags
             skip_llm_verification=os.getenv(ENV_SKIP_LLM_VERIFICATION, "false").lower() == "true",
             lazy_reranker=os.getenv(ENV_LAZY_RERANKER, "false").lower() == "true",
+            # Primary LLM with fallback
+            primary_llm_enabled=os.getenv(ENV_PRIMARY_LLM_ENABLED, str(DEFAULT_PRIMARY_LLM_ENABLED)).lower() == "true",
+            primary_llm_provider=os.getenv(ENV_PRIMARY_LLM_PROVIDER) or None,
+            primary_llm_model=os.getenv(ENV_PRIMARY_LLM_MODEL) or None,
+            primary_llm_api_key=os.getenv(ENV_PRIMARY_LLM_API_KEY) or None,
+            primary_llm_base_url=os.getenv(ENV_PRIMARY_LLM_BASE_URL) or None,
+            primary_llm_failure_threshold=int(
+                os.getenv(ENV_PRIMARY_LLM_FAILURE_THRESHOLD, str(DEFAULT_PRIMARY_LLM_FAILURE_THRESHOLD))
+            ),
+            primary_llm_cooldown_seconds=int(
+                os.getenv(ENV_PRIMARY_LLM_COOLDOWN_SECONDS, str(DEFAULT_PRIMARY_LLM_COOLDOWN_SECONDS))
+            ),
             # Retain settings
             retain_max_completion_tokens=int(
                 os.getenv(ENV_RETAIN_MAX_COMPLETION_TOKENS, str(DEFAULT_RETAIN_MAX_COMPLETION_TOKENS))
@@ -1163,6 +1198,12 @@ class HindsightConfig:
             consolidation_provider = self.consolidation_llm_provider or self.llm_provider
             consolidation_model = self.consolidation_llm_model or self.llm_model
             logger.info(f"LLM (consolidation): provider={consolidation_provider}, model={consolidation_model}")
+        if self.primary_llm_enabled:
+            logger.info(
+                f"Primary LLM: provider={self.primary_llm_provider}, model={self.primary_llm_model} "
+                f"(fallback enabled, threshold={self.primary_llm_failure_threshold}, "
+                f"cooldown={self.primary_llm_cooldown_seconds}s)"
+            )
         logger.info(f"Embeddings: provider={self.embeddings_provider}")
         logger.info(f"Reranker: provider={self.reranker_provider}")
         logger.info(f"Graph retriever: {self.graph_retriever}")

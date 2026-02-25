@@ -451,6 +451,40 @@ class MemoryEngine(MemoryEngineInterface):
             model=consolidation_model,
         )
 
+        # Wrap LLM configs with primary+fallback if primary LLM is enabled
+        if config.primary_llm_enabled and config.primary_llm_provider:
+            from .providers.fallback_llm import CircuitBreaker, FallbackLLMProvider
+
+            shared_circuit = CircuitBreaker(
+                failure_threshold=config.primary_llm_failure_threshold,
+                cooldown_seconds=config.primary_llm_cooldown_seconds,
+            )
+            primary_model = config.primary_llm_model or config.primary_llm_provider
+            primary_api_key = config.primary_llm_api_key or ""
+            primary_base_url = config.primary_llm_base_url or ""
+
+            for attr in ("_llm_config", "_retain_llm_config", "_reflect_llm_config", "_consolidation_llm_config"):
+                fallback = getattr(self, attr)
+                primary = LLMConfig(
+                    provider=config.primary_llm_provider,
+                    api_key=primary_api_key,
+                    base_url=primary_base_url,
+                    model=primary_model,
+                )
+                setattr(
+                    self,
+                    attr,
+                    FallbackLLMProvider(
+                        primary=primary,
+                        fallback=fallback,
+                        circuit_breaker=shared_circuit,
+                    ),
+                )
+            logger.info(
+                f"Primary LLM fallback enabled: {config.primary_llm_provider}/{primary_model} "
+                f"→ fallback to existing config (threshold={config.primary_llm_failure_threshold})"
+            )
+
         # Initialize cross-encoder reranker (cached for performance)
         self._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=cross_encoder)
 

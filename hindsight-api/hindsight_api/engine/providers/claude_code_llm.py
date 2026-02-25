@@ -246,7 +246,9 @@ class ClaudeCodeLLM(LLMInterface):
                     model=self.model,
                     scope=scope,
                     messages=messages,
-                    response_content=result if isinstance(result, str) else json.dumps(result),
+                    response_content=result
+                    if isinstance(result, str)
+                    else (result.model_dump_json() if hasattr(result, "model_dump_json") else json.dumps(result)),
                     input_tokens=estimated_input,
                     output_tokens=estimated_output,
                     duration=duration,
