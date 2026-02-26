@@ -1,84 +1,66 @@
 """Prompts for the consolidation engine."""
 
-CONSOLIDATION_SYSTEM_PROMPT = """You are a memory consolidation system. Your job is to convert facts into durable knowledge (observations) and merge with existing knowledge when appropriate.
+# Default mission when no bank-specific mission is set
+_DEFAULT_MISSION = "Track every detail: names, numbers, dates, places, and relationships. Prefer specifics over abstractions, never generalise."
 
-You must output a JSON object with an "actions" array. The "text" field must be a concise plain-text statement (1-2 sentences). No markdown headers, no bullet lists, no formatting.
+# Processing rules — always present regardless of mission
+_PROCESSING_RULES = """Processing rules (always apply):
+- REDUNDANT: same info worded differently → UPDATE the existing observation.
+- CONTRADICTION/UPDATE: capture both states with temporal markers ("used to X, now Y").
+- RESOLVE REFERENCES: when a new fact provides a concrete value resolving a vague placeholder in an existing observation (e.g. "home country", "hometown", "birthplace", "native language", "her ex", "that city"), UPDATE the observation to embed the resolved value explicitly. Example: new fact says "grandma in Sweden" + existing observation says "moved from her home country" → update to "home country is Sweden".
+- NEVER merge observations about different people or unrelated topics."""
 
-## EXTRACT DURABLE KNOWLEDGE, NOT EPHEMERAL STATE
-Facts often describe events or actions. Extract the DURABLE KNOWLEDGE implied by the fact, not the transient state.
+# Data section — format placeholders {facts_text} and {observations_text} are substituted at call time
+_BATCH_DATA_SECTION = """
+NEW FACTS:
+{facts_text}
 
-Examples of extracting durable knowledge:
-- "User moved to Room 203" -> "Room 203 exists" (location exists, not where user is now)
-- "User visited Acme Corp at Room 105" -> "Acme Corp is located in Room 105"
-- "User took the elevator to floor 3" -> "Floor 3 is accessible by elevator"
-- "User met Sarah at the lobby" -> "Sarah can be found at the lobby"
-
-DO NOT track current user position/state as knowledge - that changes constantly.
-DO track permanent facts learned from the user's actions.
-
-## PRESERVE SPECIFIC DETAILS
-Keep names, locations, numbers, and other specifics. Do NOT:
-- Abstract into general principles
-- Generate business insights
-- Make knowledge generic
-
-GOOD examples:
-- Fact: "John likes pizza" -> "John likes pizza"
-- Fact: "Alice works at Google" -> "Alice works at Google"
-
-BAD examples:
-- "John likes pizza" -> "Understanding dietary preferences helps..." (TOO ABSTRACT)
-- "User is at Room 203" -> "User is currently at Room 203" (EPHEMERAL STATE)
-
-## MERGE RULES (when comparing to existing observations):
-1. REDUNDANT: Same information worded differently → update existing
-2. CONTRADICTION: Opposite information about same topic → update with temporal markers showing change
-   Example: "Alex used to love pizza but now hates it" OR "Alex's pizza preference changed from love to hate"
-3. UPDATE: New state replacing old state → update showing the transition with "used to", "now", "changed from X to Y"
-
-## CRITICAL RULES:
-- NEVER merge facts about DIFFERENT people
-- NEVER merge unrelated topics (food preferences vs work vs hobbies)
-- When merging contradictions, the "text" field MUST capture BOTH states with temporal markers:
-  * Use "used to X, now Y" OR "changed from X to Y" OR "X but now Y"
-  * DO NOT just state the new fact - you MUST show the change
-- Keep observations focused on ONE specific topic per person
-- The "text" field MUST contain durable knowledge, not ephemeral state
-- Do NOT include "tags" in output - tags are handled automatically"""
-
-CONSOLIDATION_USER_PROMPT = """Analyze this new fact and consolidate into knowledge.
-{mission_section}
-NEW FACT: {fact_text}
-
-EXISTING OBSERVATIONS (JSON array with source memories and dates):
+EXISTING OBSERVATIONS (JSON array, pooled from recalls across all facts above):
 {observations_text}
 
 Each observation includes:
 - id: unique identifier for updating
 - text: the observation content
 - proof_count: number of supporting memories
-- tags: visibility scope (handled automatically)
 - occurred_start/occurred_end: temporal range of source facts
 - source_memories: array of supporting facts with their text and dates
 
-Instructions:
-1. Extract DURABLE KNOWLEDGE from the new fact (not ephemeral state)
-2. Review source_memories in existing observations to understand evidence
-3. Check dates to detect contradictions or updates
-4. Compare with observations:
-   - Same topic → UPDATE with learning_id
-   - New topic → CREATE new observation
-   - Purely ephemeral → return empty actions list
+Compare the facts against existing observations:
+- Same topic as an existing observation → UPDATE it (observation_id + source_fact_ids)
+- New topic with durable knowledge → CREATE a new observation (source_fact_ids)
+- Cross-reference facts within the batch: a later fact may resolve a vague reference in an earlier one
+- Purely ephemeral facts → omit them (no create/update needed)"""
 
-Output a JSON object with an "actions" array (the "text" field must be concise plain text, 1-2 sentences, no markdown):
-{{"actions": [
-  {{"action": "update", "learning_id": "uuid-from-observations", "text": "Alice used to live in Rome but moved to San Francisco in January 2025.", "reason": "Updated location based on new evidence"}},
-  {{"action": "create", "text": "Bob works at Google as a senior software engineer.", "reason": "New durable fact about employment"}}
-]}}
+# Output format — JSON braces escaped as {{ }} so .format() leaves them literal
+_BATCH_OUTPUT_FORMAT = """
+Output a JSON object with three arrays.
 
-Return {{"actions": []}} if fact contains no durable knowledge.
+Example (showing the required UUID format for all IDs):
+{{"creates": [{{"text": "Alice lives in Berlin", "source_fact_ids": ["a1b2c3d4-e5f6-7890-abcd-ef1234567890", "b2c3d4e5-f6a7-8901-bcde-f12345678901"]}}],
+  "updates": [{{"text": "Alice works at Acme Corp as a senior engineer", "observation_id": "c3d4e5f6-a7b8-9012-cdef-123456789012", "source_fact_ids": ["d4e5f6a7-b8c9-0123-defa-234567890123"]}}],
+  "deletes": [{{"observation_id": "e5f6a7b8-c9d0-1234-efab-345678901234"}}]}}
 
-IMPORTANT: Keep the "text" field concise and plain:
-- Write 1-2 complete sentences, no markdown headers or formatting
-- Capture the essential durable knowledge, not a structured document
-- Be specific: include names, locations, and details"""
+Rules:
+- "source_fact_ids": copy the EXACT UUID strings shown in brackets [uuid] from NEW FACTS — never use integers or positions.
+- "observation_id": copy the EXACT "id" UUID string from EXISTING OBSERVATIONS.
+- One create/update may reference multiple facts when they jointly support the observation.
+- "deletes": only when an observation is directly superseded or contradicted by new facts.
+- Do NOT include "tags" — handled automatically.
+- Return {{"creates": [], "updates": [], "deletes": []}} if nothing durable is found."""
+
+
+def build_batch_consolidation_prompt(observations_mission: str | None = None) -> str:
+    """
+    Build the consolidation prompt for batch mode (multiple facts per LLM call).
+
+    The mission defines *what* to track (customisable per bank).
+    Processing rules and output format are always present regardless of mission.
+    """
+    mission = observations_mission or _DEFAULT_MISSION
+
+    return (
+        "You are a memory consolidation system. Synthesize facts into observations "
+        "and merge with existing observations when appropriate.\n\n"
+        f"## MISSION\n{mission}\n\n"
+        f"{_PROCESSING_RULES}" + _BATCH_DATA_SECTION + _BATCH_OUTPUT_FORMAT
+    )
