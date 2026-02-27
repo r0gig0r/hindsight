@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from ...config import get_config
 from ..memory_engine import fq_table
 from ..retain import embedding_utils
-from .prompts import build_batch_consolidation_prompt
+from .prompts import build_batch_consolidation_prompt, build_single_fact_prompt
 
 if TYPE_CHECKING:
     from asyncpg import Connection
@@ -49,6 +49,16 @@ class _UpdateAction(BaseModel):
 
 class _DeleteAction(BaseModel):
     observation_id: str  # UUID of the observation to remove
+
+
+class _SingleFactAction(BaseModel):
+    action: str  # "update" | "create"
+    text: str
+    learning_id: str | None = None
+
+
+class _SingleFactResponse(BaseModel):
+    actions: list[_SingleFactAction] = []
 
 
 class _ConsolidationBatchResponse(BaseModel):
@@ -861,6 +871,39 @@ async def _consolidate_batch_with_llm(
     config: Any = None,
 ) -> _BatchLLMResult:
     """Single LLM call for a batch of facts against a pooled set of observations."""
+    # Check if fallback is active — use simpler single-fact approach for weaker models
+    llm_config = memory_engine._consolidation_llm_config
+    use_single_fact = getattr(llm_config, "is_fallback_active", False)
+
+    if use_single_fact and len(memories) > 0:
+        logger.info(f"[CONSOLIDATION] Fallback active — using single-fact mode for {len(memories)} memories")
+        all_creates: list[_CreateAction] = []
+        all_updates: list[_UpdateAction] = []
+        all_deletes: list[_DeleteAction] = []
+        total_obs = 0
+        total_chars = 0
+        for memory in memories:
+            result = await _consolidate_single_fact_with_llm(
+                memory_engine=memory_engine,
+                memory=memory,
+                observations=union_observations,
+                source_facts=union_source_facts,
+                config=config,
+            )
+            all_creates.extend(result.creates)
+            all_updates.extend(result.updates)
+            all_deletes.extend(result.deletes)
+            total_obs += result.obs_count
+            total_chars += result.prompt_chars
+        return _BatchLLMResult(
+            creates=all_creates,
+            updates=all_updates,
+            deletes=all_deletes,
+            obs_count=total_obs,
+            prompt_chars=total_chars,
+        )
+
+    # Default: batch approach
     if union_observations:
         obs_list = _build_observations_for_llm(union_observations, union_source_facts)
         observations_text = json.dumps(obs_list, indent=2)
@@ -910,6 +953,54 @@ async def _consolidate_batch_with_llm(
         f"[CONSOLIDATION] LLM batch call failed after {max_attempts} attempts, skipping batch. Last error: {last_exc}"
     )
     return _BatchLLMResult(obs_count=len(union_observations), prompt_chars=len(prompt))
+
+
+async def _consolidate_single_fact_with_llm(
+    memory_engine: "MemoryEngine",
+    memory: dict[str, Any],
+    observations: "list[MemoryFact]",
+    source_facts: "dict[str, MemoryFact]",
+    config: Any = None,
+) -> _BatchLLMResult:
+    """Single-fact LLM call with simpler prompt for weaker models."""
+    obs_list = _build_observations_for_llm(observations, source_facts) if observations else []
+    observations_text = json.dumps(obs_list, indent=2) if obs_list else "[]"
+
+    observations_mission = config.observations_mission if config else None
+    prompt_template = build_single_fact_prompt(observations_mission)
+    prompt = prompt_template.format(
+        fact_text=memory["text"],
+        observations_text=observations_text,
+    )
+
+    mem_id = str(memory["id"])
+    try:
+        response: _SingleFactResponse = await memory_engine._consolidation_llm_config.call(
+            messages=[{"role": "user", "content": prompt}],
+            response_format=_SingleFactResponse,
+            scope="consolidation",
+        )
+    except Exception as exc:
+        logger.warning(f"[CONSOLIDATION] Single-fact LLM call failed: {exc}")
+        return _BatchLLMResult(obs_count=len(observations), prompt_chars=len(prompt))
+
+    creates: list[_CreateAction] = []
+    updates: list[_UpdateAction] = []
+    for action in response.actions:
+        text = (action.text or "").replace("\x00", "")
+        if not text:
+            continue
+        if action.action == "create":
+            creates.append(_CreateAction(text=text, source_fact_ids=[mem_id]))
+        elif action.action == "update" and action.learning_id:
+            updates.append(_UpdateAction(text=text, observation_id=action.learning_id, source_fact_ids=[mem_id]))
+
+    return _BatchLLMResult(
+        creates=creates,
+        updates=updates,
+        obs_count=len(observations),
+        prompt_chars=len(prompt),
+    )
 
 
 async def _create_observation_directly(

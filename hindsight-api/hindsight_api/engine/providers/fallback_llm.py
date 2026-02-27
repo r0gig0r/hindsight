@@ -181,6 +181,11 @@ class FallbackLLMProvider:
     def reasoning_effort(self) -> str:
         return self._fallback.reasoning_effort
 
+    @property
+    def is_fallback_active(self) -> bool:
+        """True when calls will definitely use the fallback provider (circuit open, not yet cooled down)."""
+        return self._circuit_breaker.state == "open"
+
     # --- Core LLM methods with failover ---
 
     async def call(

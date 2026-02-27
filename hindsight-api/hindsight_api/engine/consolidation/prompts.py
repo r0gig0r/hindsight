@@ -49,6 +49,43 @@ Rules:
 - Return {{"creates": [], "updates": [], "deletes": []}} if nothing durable is found."""
 
 
+# Single-fact response format — simpler for weaker models
+_SINGLE_FACT_OUTPUT_FORMAT = """
+Output a JSON object with an "actions" array.
+
+Example:
+{{"actions": [
+  {{"action": "update", "learning_id": "uuid-of-observation", "text": "Updated observation text"}},
+  {{"action": "create", "text": "New observation text"}}
+]}}
+
+Rules:
+- "learning_id": copy the EXACT "id" UUID from EXISTING OBSERVATIONS (required for "update").
+- "text": concise plain-text, 1-2 sentences. No markdown.
+- Return {{"actions": []}} if nothing durable is found."""
+
+_SINGLE_FACT_DATA_SECTION = """
+NEW FACT: {fact_text}
+
+EXISTING OBSERVATIONS:
+{observations_text}
+
+Compare the new fact against existing observations:
+- Same topic → UPDATE with learning_id
+- New topic with durable knowledge → CREATE
+- Purely ephemeral → return empty actions"""
+
+
+def build_single_fact_prompt(observations_mission: str | None = None) -> str:
+    """Build a simpler prompt for single-fact consolidation (weaker models)."""
+    mission = observations_mission or _DEFAULT_MISSION
+    return (
+        "You are a memory consolidation system.\n\n"
+        f"## MISSION\n{mission}\n\n"
+        f"{_PROCESSING_RULES}" + _SINGLE_FACT_DATA_SECTION + _SINGLE_FACT_OUTPUT_FORMAT
+    )
+
+
 def build_batch_consolidation_prompt(observations_mission: str | None = None) -> str:
     """
     Build the consolidation prompt for batch mode (multiple facts per LLM call).
