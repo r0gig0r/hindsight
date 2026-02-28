@@ -55,9 +55,10 @@ def _sanitize_env_for_claude_sdk() -> None:
 _AUTH_ERROR_MARKERS = frozenset({"auth", "login", "credential", "unauthorized", "forbidden", "401", "403"})
 
 # Max seconds to wait for a primary call before treating it as failed.
-# The Claude Agent SDK init can take 60s+ to timeout — we cap it much lower
-# so fallback kicks in quickly.
-_PRIMARY_CALL_TIMEOUT = 30.0
+# Successful calls average ~21s (retain) and ~17s (consolidation), but can
+# spike to 40s+ under load.  30s caused ~50% false-positive timeouts;
+# 60s gives headroom while still failing faster than the SDK's own timeout.
+_PRIMARY_CALL_TIMEOUT = 60.0
 
 
 @dataclass
