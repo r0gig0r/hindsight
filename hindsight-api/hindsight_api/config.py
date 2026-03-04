@@ -252,6 +252,9 @@ ENV_LLM_VERTEXAI_PROJECT_ID = "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID"
 ENV_LLM_VERTEXAI_REGION = "HINDSIGHT_API_LLM_VERTEXAI_REGION"
 ENV_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY = "HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY"
 
+# Gemini safety settings
+ENV_LLM_GEMINI_SAFETY_SETTINGS = "HINDSIGHT_API_LLM_GEMINI_SAFETY_SETTINGS"
+
 # Retain settings
 ENV_RETAIN_MAX_COMPLETION_TOKENS = "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS"
 ENV_RETAIN_CHUNK_SIZE = "HINDSIGHT_API_RETAIN_CHUNK_SIZE"
@@ -260,6 +263,7 @@ ENV_RETAIN_EXTRACTION_MODE = "HINDSIGHT_API_RETAIN_EXTRACTION_MODE"
 ENV_RETAIN_MISSION = "HINDSIGHT_API_RETAIN_MISSION"
 ENV_RETAIN_CUSTOM_INSTRUCTIONS = "HINDSIGHT_API_RETAIN_CUSTOM_INSTRUCTIONS"
 ENV_RETAIN_BATCH_TOKENS = "HINDSIGHT_API_RETAIN_BATCH_TOKENS"
+ENV_RETAIN_ENTITY_LOOKUP = "HINDSIGHT_API_RETAIN_ENTITY_LOOKUP"
 ENV_RETAIN_BATCH_ENABLED = "HINDSIGHT_API_RETAIN_BATCH_ENABLED"
 ENV_RETAIN_BATCH_POLL_INTERVAL_SECONDS = "HINDSIGHT_API_RETAIN_BATCH_POLL_INTERVAL_SECONDS"
 
@@ -323,6 +327,7 @@ ENV_WORKER_CONSOLIDATION_MAX_SLOTS = "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLO
 
 # Reflect agent settings
 ENV_REFLECT_MAX_ITERATIONS = "HINDSIGHT_API_REFLECT_MAX_ITERATIONS"
+ENV_REFLECT_MAX_CONTEXT_TOKENS = "HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS"
 ENV_REFLECT_MISSION = "HINDSIGHT_API_REFLECT_MISSION"
 
 # Disposition settings
@@ -359,6 +364,9 @@ DEFAULT_LLM_TIMEOUT = 120.0  # seconds
 DEFAULT_LLM_VERTEXAI_PROJECT_ID = None  # Required for Vertex AI
 DEFAULT_LLM_VERTEXAI_REGION = "us-central1"
 DEFAULT_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY = None  # Optional, uses ADC if not set
+
+# Gemini safety settings defaults
+DEFAULT_LLM_GEMINI_SAFETY_SETTINGS = None  # None = use Gemini default safety settings
 
 DEFAULT_EMBEDDINGS_PROVIDER = "local"
 DEFAULT_EMBEDDINGS_LOCAL_MODEL = "BAAI/bge-small-en-v1.5"
@@ -424,6 +432,7 @@ RETAIN_EXTRACTION_MODES = ("concise", "verbose", "custom")  # Allowed extraction
 DEFAULT_RETAIN_MISSION = None  # Declarative spec of what to retain (injected into any extraction mode)
 DEFAULT_RETAIN_CUSTOM_INSTRUCTIONS = None  # Custom extraction guidelines (only used when mode="custom")
 DEFAULT_RETAIN_BATCH_TOKENS = 10_000  # ~40KB of text  # Max chars per sub-batch for async retain auto-splitting
+DEFAULT_RETAIN_ENTITY_LOOKUP = "trigram"  # "full" or "trigram"
 DEFAULT_RETAIN_BATCH_ENABLED = False  # Use LLM Batch API for fact extraction (only when async=True)
 DEFAULT_RETAIN_BATCH_POLL_INTERVAL_SECONDS = 60  # Batch API polling interval in seconds
 
@@ -467,6 +476,7 @@ DEFAULT_WORKER_CONSOLIDATION_MAX_SLOTS = 2  # Max concurrent consolidation tasks
 
 # Reflect agent settings
 DEFAULT_REFLECT_MAX_ITERATIONS = 10  # Max tool call iterations before forcing response
+DEFAULT_REFLECT_MAX_CONTEXT_TOKENS = 100_000  # Max accumulated context tokens before forcing final prompt
 
 # Disposition defaults (None = not set, fall back to bank DB value or 3)
 DEFAULT_DISPOSITION_SKEPTICISM = None
@@ -577,6 +587,9 @@ class HindsightConfig:
     llm_vertexai_region: str
     llm_vertexai_service_account_key: str | None
 
+    # Gemini safety settings (None = use Gemini defaults; list of dicts with category/threshold)
+    llm_gemini_safety_settings: list | None
+
     # Per-operation LLM configuration (None = use default LLM config)
     retain_llm_provider: str | None
     retain_llm_api_key: str | None
@@ -674,6 +687,7 @@ class HindsightConfig:
     retain_batch_tokens: int
     retain_batch_enabled: bool
     retain_batch_poll_interval_seconds: int
+    retain_entity_lookup: str  # "full" or "trigram"
 
     # File storage (static - server-level only)
     file_storage_type: str  # "native" (PostgreSQL) or "s3" (S3-compatible)
@@ -701,6 +715,13 @@ class HindsightConfig:
     consolidation_llm_batch_size: int
     consolidation_max_tokens: int
     observations_mission: str | None
+
+    # Entity labels (controlled vocabulary of key:value classification labels extracted at retain time)
+    # List of label group dicts: [{key, description, type, optional, values: [{value, description}]}]
+    entity_labels: list | None
+    # Whether to extract regular named entities alongside entity labels (default: True)
+    # When False: only label entities are extracted (or no entities at all if no labels configured)
+    entities_allow_free_form: bool
 
     # Reflect agent settings
     reflect_mission: str | None
@@ -743,6 +764,7 @@ class HindsightConfig:
 
     # Reflect agent settings
     reflect_max_iterations: int
+    reflect_max_context_tokens: int
 
     # OpenTelemetry tracing configuration
     otel_traces_enabled: bool
@@ -790,6 +812,9 @@ class HindsightConfig:
         "retain_extraction_mode",
         "retain_mission",
         "retain_custom_instructions",
+        # Entity labels (controlled vocabulary for entity classification)
+        "entity_labels",
+        "entities_allow_free_form",
         # Consolidation settings
         "enable_observations",
         "observations_mission",
@@ -799,6 +824,8 @@ class HindsightConfig:
         "disposition_skepticism",
         "disposition_literalism",
         "disposition_empathy",
+        # Gemini safety settings (controls content filtering for Gemini/VertexAI providers)
+        "llm_gemini_safety_settings",
     }
 
     @property
@@ -919,6 +946,8 @@ class HindsightConfig:
             llm_vertexai_region=os.getenv(ENV_LLM_VERTEXAI_REGION, DEFAULT_LLM_VERTEXAI_REGION),
             llm_vertexai_service_account_key=os.getenv(ENV_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY)
             or DEFAULT_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY,
+            # Gemini safety settings (JSON-encoded list of {category, threshold} dicts)
+            llm_gemini_safety_settings=json.loads(os.getenv(ENV_LLM_GEMINI_SAFETY_SETTINGS, "null")),
             # Per-operation LLM config (None = use default)
             retain_llm_provider=os.getenv(ENV_RETAIN_LLM_PROVIDER) or None,
             retain_llm_api_key=os.getenv(ENV_RETAIN_LLM_API_KEY) or None,
@@ -1106,6 +1135,7 @@ class HindsightConfig:
             retain_mission=os.getenv(ENV_RETAIN_MISSION) or DEFAULT_RETAIN_MISSION,
             retain_custom_instructions=os.getenv(ENV_RETAIN_CUSTOM_INSTRUCTIONS) or DEFAULT_RETAIN_CUSTOM_INSTRUCTIONS,
             retain_batch_tokens=int(os.getenv(ENV_RETAIN_BATCH_TOKENS, str(DEFAULT_RETAIN_BATCH_TOKENS))),
+            retain_entity_lookup=os.getenv(ENV_RETAIN_ENTITY_LOOKUP, DEFAULT_RETAIN_ENTITY_LOOKUP),
             retain_batch_enabled=os.getenv(ENV_RETAIN_BATCH_ENABLED, str(DEFAULT_RETAIN_BATCH_ENABLED)).lower()
             == "true",
             retain_batch_poll_interval_seconds=int(
@@ -1150,6 +1180,8 @@ class HindsightConfig:
                 os.getenv(ENV_CONSOLIDATION_MAX_TOKENS, str(DEFAULT_CONSOLIDATION_MAX_TOKENS))
             ),
             observations_mission=os.getenv(ENV_OBSERVATIONS_MISSION) or DEFAULT_OBSERVATIONS_MISSION,
+            entity_labels=None,
+            entities_allow_free_form=True,
             # Database migrations
             run_migrations_on_startup=os.getenv(ENV_RUN_MIGRATIONS_ON_STARTUP, "true").lower() == "true",
             # Database connection pool
@@ -1169,6 +1201,9 @@ class HindsightConfig:
             ),
             # Reflect agent settings
             reflect_max_iterations=int(os.getenv(ENV_REFLECT_MAX_ITERATIONS, str(DEFAULT_REFLECT_MAX_ITERATIONS))),
+            reflect_max_context_tokens=int(
+                os.getenv(ENV_REFLECT_MAX_CONTEXT_TOKENS, str(DEFAULT_REFLECT_MAX_CONTEXT_TOKENS))
+            ),
             reflect_mission=os.getenv(ENV_REFLECT_MISSION) or None,
             # Disposition settings (None = fall back to DB value)
             disposition_skepticism=int(os.getenv(ENV_DISPOSITION_SKEPTICISM))

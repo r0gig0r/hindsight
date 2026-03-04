@@ -136,6 +136,11 @@ async def run_consolidation_job(
     """
     # Resolve bank-specific config with hierarchical overrides
     config = await memory_engine._config_resolver.resolve_full_config(bank_id, request_context)
+
+    # Build a configured LLM wrapper that applies per-bank settings (e.g. safety settings)
+    # to every call without leaking across operations.
+    llm_config = memory_engine._consolidation_llm_config.with_config(config)
+
     perf = ConsolidationPerfLog(bank_id)
     max_memories_per_batch = config.consolidation_batch_size
     llm_batch_size = max(1, config.consolidation_llm_batch_size)
@@ -285,6 +290,7 @@ async def run_consolidation_job(
                         pass_results = await _process_memory_batch(
                             conn=conn,
                             memory_engine=memory_engine,
+                            llm_config=llm_config,
                             bank_id=bank_id,
                             memories=llm_batch,
                             request_context=request_context,
@@ -322,6 +328,7 @@ async def run_consolidation_job(
                     results = await _process_memory_batch(
                         conn=conn,
                         memory_engine=memory_engine,
+                        llm_config=llm_config,
                         bank_id=bank_id,
                         memories=llm_batch,
                         request_context=request_context,
@@ -517,6 +524,7 @@ async def _trigger_mental_model_refreshes(
 async def _process_memory_batch(
     conn: "Connection",
     memory_engine: "MemoryEngine",
+    llm_config: Any,
     bank_id: str,
     memories: list[dict[str, Any]],
     request_context: "RequestContext",
@@ -585,7 +593,7 @@ async def _process_memory_batch(
     # 3. Single LLM call
     t0 = time.time()
     llm_result = await _consolidate_batch_with_llm(
-        memory_engine=memory_engine,
+        llm_config=llm_config,
         memories=memories,
         union_observations=union_observations,
         union_source_facts=union_source_facts,
@@ -949,7 +957,7 @@ def _build_observations_for_llm(
 
 
 async def _consolidate_batch_with_llm(
-    memory_engine: "MemoryEngine",
+    llm_config: Any,
     memories: list[dict[str, Any]],
     union_observations: "list[MemoryFact]",
     union_source_facts: "dict[str, MemoryFact]",
@@ -957,7 +965,6 @@ async def _consolidate_batch_with_llm(
 ) -> _BatchLLMResult:
     """Single LLM call for a batch of facts against a pooled set of observations."""
     # Check if fallback is active — use simpler single-fact approach for weaker models
-    llm_config = memory_engine._consolidation_llm_config
     use_single_fact = getattr(llm_config, "is_fallback_active", False)
 
     if use_single_fact and len(memories) > 0:
@@ -969,7 +976,7 @@ async def _consolidate_batch_with_llm(
         total_chars = 0
         for memory in memories:
             result = await _consolidate_single_fact_with_llm(
-                memory_engine=memory_engine,
+                llm_config=llm_config,
                 memory=memory,
                 observations=union_observations,
                 source_facts=union_source_facts,
@@ -1018,7 +1025,7 @@ async def _consolidate_batch_with_llm(
     last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            response: _ConsolidationBatchResponse = await memory_engine._consolidation_llm_config.call(
+            response: _ConsolidationBatchResponse = await llm_config.call(
                 messages=[{"role": "user", "content": prompt}],
                 response_format=_ConsolidationBatchResponse,
                 scope="consolidation",
@@ -1041,7 +1048,7 @@ async def _consolidate_batch_with_llm(
 
 
 async def _consolidate_single_fact_with_llm(
-    memory_engine: "MemoryEngine",
+    llm_config: Any,
     memory: dict[str, Any],
     observations: "list[MemoryFact]",
     source_facts: "dict[str, MemoryFact]",
@@ -1060,7 +1067,7 @@ async def _consolidate_single_fact_with_llm(
 
     mem_id = str(memory["id"])
     try:
-        response: _SingleFactResponse = await memory_engine._consolidation_llm_config.call(
+        response: _SingleFactResponse = await llm_config.call(
             messages=[{"role": "user", "content": prompt}],
             response_format=_SingleFactResponse,
             scope="consolidation",

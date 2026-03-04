@@ -7,7 +7,7 @@ info:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0.html
   title: Hindsight HTTP API
-  version: 0.4.14
+  version: 0.4.15
 servers:
 - url: /
 paths:
@@ -1173,12 +1173,36 @@ paths:
           title: Bank Id
           type: string
         style: simple
-      - explode: true
+      - description: Case-insensitive substring filter on document ID (e.g. 'report'
+          matches 'report-2024')
+        explode: true
         in: query
         name: q
         required: false
         schema:
           nullable: true
+          type: string
+        style: form
+      - description: Filter documents by tags
+        explode: true
+        in: query
+        name: tags
+        required: false
+        schema:
+          items:
+            type: string
+          nullable: true
+          type: array
+        style: form
+      - description: "How to match tags: 'any', 'all', 'any_strict', 'all_strict'"
+        explode: true
+        in: query
+        name: tags_match
+        required: false
+        schema:
+          default: any_strict
+          description: "How to match tags: 'any', 'all', 'any_strict', 'all_strict'"
+          title: Tags Match
           type: string
         style: form
       - explode: true
@@ -3477,9 +3501,7 @@ components:
           title: Content
           type: string
         timestamp:
-          format: date-time
-          nullable: true
-          type: string
+          $ref: '#/components/schemas/Timestamp'
         context:
           nullable: true
           type: string
@@ -4459,6 +4481,17 @@ components:
       - api_version
       - features
       title: VersionResponse
+    Timestamp:
+      anyOf:
+      - format: date-time
+        type: string
+      - type: string
+      description: "When the content occurred. Accepts an ISO 8601 datetime string\
+        \ (e.g. '2024-01-15T10:30:00Z'), null/omitted (defaults to now), or the special\
+        \ string 'unset' to explicitly store without any timestamp (use this for timeless\
+        \ content such as fictional documents or static reference material)."
+      nullable: true
+      title: Timestamp
     ObservationScopes:
       anyOf:
       - enum:

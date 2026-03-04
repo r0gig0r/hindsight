@@ -1165,6 +1165,8 @@ export type MemoryItem = {
   content: string;
   /**
    * Timestamp
+   *
+   * When the content occurred. Accepts an ISO 8601 datetime string (e.g. '2024-01-15T10:30:00Z'), null/omitted (defaults to now), or the special string 'unset' to explicitly store without any timestamp (use this for timeless content such as fictional documents or static reference material).
    */
   timestamp?: string | null;
   /**
@@ -3080,8 +3082,22 @@ export type ListDocumentsData = {
   query?: {
     /**
      * Q
+     *
+     * Case-insensitive substring filter on document ID (e.g. 'report' matches 'report-2024')
      */
     q?: string | null;
+    /**
+     * Tags
+     *
+     * Filter documents by tags
+     */
+    tags?: Array<string> | null;
+    /**
+     * Tags Match
+     *
+     * How to match tags: 'any', 'all', 'any_strict', 'all_strict'
+     */
+    tags_match?: string;
     /**
      * Limit
      */
