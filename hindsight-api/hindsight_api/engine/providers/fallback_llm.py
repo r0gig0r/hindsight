@@ -187,6 +187,13 @@ class FallbackLLMProvider:
         """True when calls will definitely use the fallback provider (circuit open, not yet cooled down)."""
         return self._circuit_breaker.state == "open"
 
+    def with_config(self, config: Any) -> Any:
+        """Return a ConfiguredLLMProvider wrapping this fallback provider."""
+        from ..llm_wrapper import ConfiguredLLMProvider
+
+        gemini_settings = getattr(config, "llm_gemini_safety_settings", None)
+        return ConfiguredLLMProvider(self, gemini_settings)
+
     # --- Core LLM methods with failover ---
 
     async def call(
