@@ -268,19 +268,22 @@ class CodexLLM(LLMInterface):
                 # Estimate tokens for tracing
                 estimated_input = sum(len(m.get("content", "")) for m in messages) // 4
                 estimated_output = len(content) // 4
-                span_recorder = get_span_recorder()
-                span_recorder.record_llm_call(
-                    provider=self.provider,
-                    model=self.model,
-                    scope=scope,
-                    messages=messages,
-                    response_content=result if isinstance(result, str) else json.dumps(result),
-                    input_tokens=estimated_input,
-                    output_tokens=estimated_output,
-                    duration=duration,
-                    finish_reason=None,
-                    error=None,
-                )
+                try:
+                    span_recorder = get_span_recorder()
+                    span_recorder.record_llm_call(
+                        provider=self.provider,
+                        model=self.model,
+                        scope=scope,
+                        messages=messages,
+                        response_content=result if isinstance(result, str) else result.model_dump_json(),
+                        input_tokens=estimated_input,
+                        output_tokens=estimated_output,
+                        duration=duration,
+                        finish_reason=None,
+                        error=None,
+                    )
+                except Exception:
+                    pass  # logging failure must never affect the operation
 
                 if return_usage:
                     # Codex doesn't provide token counts, estimate based on content
