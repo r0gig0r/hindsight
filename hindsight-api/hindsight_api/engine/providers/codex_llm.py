@@ -196,7 +196,7 @@ class CodexLLM(LLMInterface):
             "tools": [],
             "tool_choice": "auto",
             "parallel_tool_calls": True,
-            "reasoning": {"summary": reasoning_summary},
+            "reasoning": {"effort": self.reasoning_effort, "summary": reasoning_summary},
             "store": False,  # Codex uses stateless mode
             "stream": True,  # SSE streaming
             "include": ["reasoning.encrypted_content"],
@@ -484,7 +484,7 @@ class CodexLLM(LLMInterface):
             "tools": codex_tools,
             "tool_choice": tool_choice,
             "parallel_tool_calls": True,
-            "reasoning": {"summary": reasoning_summary},
+            "reasoning": {"effort": self.reasoning_effort, "summary": reasoning_summary},
             "store": False,
             "stream": True,
             "include": ["reasoning.encrypted_content"],
