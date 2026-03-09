@@ -24,6 +24,14 @@ from hindsight_api.metrics import get_metrics_collector
 logger = logging.getLogger(__name__)
 
 
+class CodexRateLimitError(Exception):
+    """Raised when Codex returns a 429 with usage_limit_reached."""
+
+    def __init__(self, message: str, resets_in_seconds: float):
+        super().__init__(message)
+        self.resets_in_seconds = resets_in_seconds
+
+
 class CodexLLM(LLMInterface):
     """
     LLM provider using OpenAI Codex OAuth authentication.
@@ -312,6 +320,19 @@ class CodexLLM(LLMInterface):
 
                 # Log the actual error message from the API
                 error_detail = e.response.text[:500] if hasattr(e.response, "text") else str(e)
+
+                # Detect rate limit with reset info — raise specific error
+                if status_code == 429 and "usage_limit_reached" in error_detail:
+                    import re
+
+                    match = re.search(r'"resets_in_seconds"\s*:\s*(\d+)', error_detail)
+                    resets_in = float(match.group(1)) if match else 3600.0
+                    logger.error(
+                        f"Codex HTTP error after {attempt + 1} attempts: Status {status_code}, Detail: {error_detail}"
+                    )
+                    raise CodexRateLimitError(
+                        f"Codex usage limit reached (resets in {resets_in:.0f}s)", resets_in_seconds=resets_in
+                    ) from e
 
                 if attempt < max_retries:
                     backoff = min(initial_backoff * (2**attempt), max_backoff)

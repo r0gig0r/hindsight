@@ -97,13 +97,29 @@ class CircuitBreaker:
             logger.info(f"Circuit breaker CLOSED (was {self.state}) — primary recovered")
         self.state = "closed"
         self.failure_count = 0
+        # Restore default cooldown if it was overridden by a rate limit
+        if hasattr(self, "_original_cooldown"):
+            self.cooldown_seconds = self._original_cooldown
+            del self._original_cooldown
 
-    def force_open(self, reason: str = "") -> None:
-        """Immediately open the circuit (e.g., on auth errors)."""
+    def force_open(self, reason: str = "", cooldown_override: float | None = None) -> None:
+        """Immediately open the circuit (e.g., on auth or rate limit errors).
+
+        Args:
+            reason: Human-readable reason for opening.
+            cooldown_override: If set, temporarily override cooldown_seconds
+                (e.g., to match a rate limit reset window). Resets to default
+                on next record_success().
+        """
         self.state = "open"
         self.failure_count = self.failure_threshold
         self.last_failure_time = time.monotonic()
-        logger.warning(f"Circuit breaker FORCE-OPENED: {reason}")
+        if cooldown_override is not None and cooldown_override > self.cooldown_seconds:
+            self._original_cooldown = self.cooldown_seconds
+            self.cooldown_seconds = cooldown_override
+            logger.warning(f"Circuit breaker FORCE-OPENED: {reason} (cooldown={cooldown_override:.0f}s)")
+        else:
+            logger.warning(f"Circuit breaker FORCE-OPENED: {reason}")
 
     def should_try_primary(self) -> bool:
         """Return True if we should attempt the primary provider."""
@@ -124,6 +140,18 @@ def _is_auth_error(exc: BaseException) -> bool:
     """Check if an exception looks like an authentication/authorization error."""
     error_str = str(exc).lower()
     return any(marker in error_str for marker in _AUTH_ERROR_MARKERS)
+
+
+def _is_rate_limit_error(exc: BaseException) -> float | None:
+    """Check if an exception is a rate limit error with a known reset time.
+
+    Returns the reset duration in seconds, or None if not a rate limit error.
+    """
+    from .codex_llm import CodexRateLimitError
+
+    if isinstance(exc, CodexRateLimitError):
+        return exc.resets_in_seconds
+    return None
 
 
 class FallbackLLMProvider:
@@ -240,7 +268,14 @@ class FallbackLLMProvider:
                 if _is_auth_error(e):
                     self._circuit_breaker.force_open(f"Auth error: {e}")
                 else:
-                    self._circuit_breaker.record_failure()
+                    reset_seconds = _is_rate_limit_error(e)
+                    if reset_seconds is not None:
+                        self._circuit_breaker.force_open(
+                            f"Rate limit: resets in {reset_seconds:.0f}s",
+                            cooldown_override=reset_seconds,
+                        )
+                    else:
+                        self._circuit_breaker.record_failure()
                 logger.warning(
                     f"Primary LLM failed (scope={scope}): {e!r} — falling back to "
                     f"{self._fallback.provider}/{self._fallback.model}"
@@ -301,7 +336,14 @@ class FallbackLLMProvider:
                 if _is_auth_error(e):
                     self._circuit_breaker.force_open(f"Auth error: {e}")
                 else:
-                    self._circuit_breaker.record_failure()
+                    reset_seconds = _is_rate_limit_error(e)
+                    if reset_seconds is not None:
+                        self._circuit_breaker.force_open(
+                            f"Rate limit: resets in {reset_seconds:.0f}s",
+                            cooldown_override=reset_seconds,
+                        )
+                    else:
+                        self._circuit_breaker.record_failure()
                 logger.warning(
                     f"Primary LLM tool call failed (scope={scope}): {e!r} — falling back to "
                     f"{self._fallback.provider}/{self._fallback.model}"

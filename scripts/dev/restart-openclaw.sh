@@ -197,11 +197,17 @@ else
     if ! $DRY_RUN; then
         ACTUAL_PY=$("$REPO_DIR/.venv/bin/python" --version 2>&1)
         ok "Venv ready: $ACTUAL_PY"
-        # Quick sanity: onnxruntime must import
+        # Quick sanity: critical packages must import
         if "$REPO_DIR/.venv/bin/python" -c "import onnxruntime" 2>/dev/null; then
             ok "onnxruntime imports OK"
         else
             fail "onnxruntime import failed — check Python version compatibility"
+            exit 1
+        fi
+        if "$REPO_DIR/.venv/bin/python" -c "from openai.resources import chat" 2>/dev/null; then
+            ok "openai SDK imports OK"
+        else
+            fail "openai SDK import failed — fallback LLM will not work"
             exit 1
         fi
     fi
