@@ -186,8 +186,10 @@ class CodexLLM(LLMInterface):
             schema_msg = f"\n\nYou must respond with valid JSON matching this schema:\n{json.dumps(schema, indent=2)}"
             system_instruction += schema_msg
 
-        # gpt-5.2-codex only supports "detailed" reasoning summary
-        reasoning_summary = "detailed" if "5.2" in self.model else self.reasoning_summary
+        # Older/mini codex models only support "detailed" reasoning summary
+        # (gpt-5.2-codex, gpt-5.1-codex-mini, etc. — only gpt-5.3-codex supports concise/auto)
+        _supports_concise = "5.3-codex" in self.model and "mini" not in self.model
+        reasoning_summary = self.reasoning_summary if _supports_concise else "detailed"
 
         # Build Codex request payload
         payload = {
@@ -495,8 +497,10 @@ class CodexLLM(LLMInterface):
                 }
             )
 
-        # gpt-5.2-codex only supports "detailed" reasoning summary
-        reasoning_summary = "detailed" if "5.2" in self.model else self.reasoning_summary
+        # Older/mini codex models only support "detailed" reasoning summary
+        # (gpt-5.2-codex, gpt-5.1-codex-mini, etc. — only gpt-5.3-codex supports concise/auto)
+        _supports_concise = "5.3-codex" in self.model and "mini" not in self.model
+        reasoning_summary = self.reasoning_summary if _supports_concise else "detailed"
 
         payload = {
             "model": self.model,
