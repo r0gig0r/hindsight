@@ -7,7 +7,7 @@ info:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0.html
   title: Hindsight HTTP API
-  version: 0.4.15
+  version: 0.4.17
 servers:
 - url: /
 paths:
@@ -210,8 +210,9 @@ paths:
       - Memory
   /v1/default/banks/{bank_id}/memories/{memory_id}:
     get:
-      description: Get a single memory unit by ID with all its metadata including
-        entities and tags.
+      description: "Get a single memory unit by ID with all its metadata including\
+        \ entities and tags. Note: the 'history' field is deprecated and always returns\
+        \ an empty list - use GET /memories/{memory_id}/history instead."
       operationId: get_memory
       parameters:
       - explode: false
@@ -251,6 +252,51 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       summary: Get memory unit
+      tags:
+      - Memory
+  /v1/default/banks/{bank_id}/memories/{memory_id}/history:
+    get:
+      description: "Get the full history of an observation, with each change's source\
+        \ facts resolved to their text."
+      operationId: get_observation_history
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: memory_id
+        required: true
+        schema:
+          title: Memory Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Get observation history
       tags:
       - Memory
   /v1/default/banks/{bank_id}/memories/recall:
@@ -838,6 +884,51 @@ paths:
       summary: Update mental model
       tags:
       - Mental Models
+  /v1/default/banks/{bank_id}/mental-models/{mental_model_id}/history:
+    get:
+      description: "Get the refresh history of a mental model, showing content changes\
+        \ over time."
+      operationId: get_mental_model_history
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: mental_model_id
+        required: true
+        schema:
+          title: Mental Model Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Get mental model history
+      tags:
+      - Mental Models
   /v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh:
     post:
       description: Submit an async task to re-run the source query through reflect
@@ -1344,6 +1435,61 @@ paths:
       summary: Get document details
       tags:
       - Documents
+    patch:
+      description: |-
+        Update mutable fields on a document without re-processing its content.
+
+        **Tags** (`tags`): Propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset.
+
+        At least one field must be provided.
+      operationId: update_document
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: document_id
+        required: true
+        schema:
+          title: Document Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDocumentRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateDocumentResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Update document
+      tags:
+      - Documents
   /v1/default/banks/{bank_id}/tags:
     get:
       description: "List all unique tags in a memory bank with usage counts. Supports\
@@ -1454,7 +1600,8 @@ paths:
   /v1/default/banks/{bank_id}/operations:
     get:
       description: "Get a list of async operations for a specific agent, with optional\
-        \ filtering by status. Results are sorted by most recent first."
+        \ filtering by status and operation type. Results are sorted by most recent\
+        \ first."
       operationId: list_operations
       parameters:
       - explode: false
@@ -1469,6 +1616,16 @@ paths:
         explode: true
         in: query
         name: status
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      - description: "Filter by operation type: retain, consolidation, refresh_mental_model,\
+          \ file_convert_retain, webhook_delivery"
+        explode: true
+        in: query
+        name: type
         required: false
         schema:
           nullable: true
@@ -1612,6 +1769,51 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       summary: Get operation status
+      tags:
+      - Operations
+  /v1/default/banks/{bank_id}/operations/{operation_id}/retry:
+    post:
+      description: Re-queue a failed async operation so the worker picks it up again
+      operationId: retry_operation
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: operation_id
+        required: true
+        schema:
+          title: Operation Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetryOperationResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Retry a failed async operation
       tags:
       - Operations
   /v1/default/banks/{bank_id}/profile:
@@ -2492,9 +2694,14 @@ paths:
 
         **Request format:** multipart/form-data with:
         - `files`: One or more files to upload
-        - `request`: JSON string with FileRetainRequest model (files_metadata)
+        - `request`: JSON string with FileRetainRequest model
 
-        **Note:** File parser is configured server-side via `HINDSIGHT_API_FILE_PARSER` (default: markitdown).
+        **Parser selection:**
+        - Set `parser` in the request body to override the server default for all files.
+        - Set `parser` inside a `files_metadata` entry for per-file control.
+        - Pass a list (e.g. `['iris', 'markitdown']`) to define an ordered fallback chain — each parser is tried in sequence until one succeeds.
+        - Falls back to the server default (`HINDSIGHT_API_FILE_PARSER`) if not specified.
+        - Only parsers enabled on the server may be requested; others return HTTP 400.
       operationId: file_retain
       parameters:
       - explode: false
@@ -4586,13 +4793,40 @@ components:
       - items_count
       - success
       title: RetainResponse
+    RetryOperationResponse:
+      description: Response model for retry operation endpoint.
+      example:
+        message: Operation 550e8400-e29b-41d4-a716-446655440000 queued for retry
+        operation_id: 550e8400-e29b-41d4-a716-446655440000
+        success: true
+      properties:
+        success:
+          title: Success
+          type: boolean
+        message:
+          title: Message
+          type: string
+        operation_id:
+          title: Operation Id
+          type: string
+      required:
+      - message
+      - operation_id
+      - success
+      title: RetryOperationResponse
     SourceFactsIncludeOptions:
       description: Options for including source facts for observation-type results.
       properties:
         max_tokens:
           default: 4096
-          description: Maximum tokens for source facts
+          description: Maximum total tokens for source facts across all observations
+            (-1 = unlimited)
           title: Max Tokens
+          type: integer
+        max_tokens_per_observation:
+          default: -1
+          description: Maximum tokens of source facts per observation (-1 = unlimited)
+          title: Max Tokens Per Observation
           type: integer
       title: SourceFactsIncludeOptions
     TagItem:
@@ -4689,6 +4923,29 @@ components:
       required:
       - disposition
       title: UpdateDispositionRequest
+    UpdateDocumentRequest:
+      description: Request model for updating a document's mutable fields.
+      example:
+        tags:
+        - team-a
+        - team-b
+      properties:
+        tags:
+          items:
+            type: string
+          nullable: true
+          type: array
+      title: UpdateDocumentRequest
+    UpdateDocumentResponse:
+      description: Response model for update document endpoint.
+      example:
+        success: true
+      properties:
+        success:
+          default: true
+          title: Success
+          type: boolean
+      title: UpdateDocumentResponse
     UpdateMentalModelRequest:
       description: Request model for updating a mental model.
       example:

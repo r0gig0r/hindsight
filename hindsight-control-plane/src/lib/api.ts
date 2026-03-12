@@ -248,10 +248,11 @@ export class ControlPlaneClient {
    */
   async listOperations(
     bankId: string,
-    options?: { status?: string; limit?: number; offset?: number }
+    options?: { status?: string; type?: string; limit?: number; offset?: number }
   ) {
     const params = new URLSearchParams();
     if (options?.status) params.append("status", options.status);
+    if (options?.type) params.append("type", options.type);
     if (options?.limit) params.append("limit", options.limit.toString());
     if (options?.offset) params.append("offset", options.offset.toString());
     const query = params.toString();
@@ -282,6 +283,19 @@ export class ControlPlaneClient {
       operation_id: string;
     }>(`/api/operations/${bankId}?operation_id=${operationId}`, {
       method: "DELETE",
+    });
+  }
+
+  /**
+   * Retry a failed operation
+   */
+  async retryOperation(bankId: string, operationId: string) {
+    return this.fetchApi<{
+      success: boolean;
+      message: string;
+      operation_id: string;
+    }>(`/api/banks/${bankId}/operations/${operationId}`, {
+      method: "POST",
     });
   }
 
@@ -334,6 +348,20 @@ export class ControlPlaneClient {
    */
   async getDocument(documentId: string, bankId: string) {
     return this.fetchApi(`/api/documents/${documentId}?bank_id=${bankId}`);
+  }
+
+  /**
+   * Update tags on a document and its associated memory units
+   */
+  async updateDocument(documentId: string, bankId: string, tags: string[]) {
+    return this.fetchApi<{ success: boolean }>(
+      `/api/documents/${encodeURIComponent(documentId)}?bank_id=${bankId}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tags }),
+      }
+    );
   }
 
   /**
@@ -413,7 +441,40 @@ export class ControlPlaneClient {
       chunk_id: string | null;
       tags: string[];
       observation_scopes: string | string[][] | null;
+      history?: {
+        previous_text: string;
+        previous_tags: string[];
+        previous_occurred_start: string | null;
+        previous_occurred_end: string | null;
+        previous_mentioned_at: string | null;
+        changed_at: string;
+        new_source_memory_ids: string[];
+      }[];
     }>(`/api/memories/${memoryId}?bank_id=${bankId}`);
+  }
+
+  /**
+   * Get the history of an observation with resolved source facts
+   */
+  async getObservationHistory(memoryId: string, bankId: string) {
+    return this.fetchApi<
+      {
+        previous_text: string;
+        previous_tags: string[];
+        previous_occurred_start: string | null;
+        previous_occurred_end: string | null;
+        previous_mentioned_at: string | null;
+        changed_at: string;
+        new_source_memory_ids: string[];
+        source_facts: {
+          id: string;
+          text: string | null;
+          type: string | null;
+          context: string | null;
+          is_new: boolean;
+        }[];
+      }[]
+    >(`/api/memories/${memoryId}/history?bank_id=${bankId}`);
   }
 
   /**
@@ -778,6 +839,18 @@ export class ControlPlaneClient {
     }>(`/api/banks/${bankId}/mental-models/${mentalModelId}/refresh`, {
       method: "POST",
     });
+  }
+
+  /**
+   * Get the refresh history of a mental model
+   */
+  async getMentalModelHistory(bankId: string, mentalModelId: string) {
+    return this.fetchApi<
+      {
+        previous_content: string | null;
+        changed_at: string;
+      }[]
+    >(`/api/banks/${bankId}/mental-models/${mentalModelId}/history`);
   }
 
   /**

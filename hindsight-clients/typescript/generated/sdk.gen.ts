@@ -82,7 +82,13 @@ import type {
   GetMemoryResponses,
   GetMentalModelData,
   GetMentalModelErrors,
+  GetMentalModelHistoryData,
+  GetMentalModelHistoryErrors,
+  GetMentalModelHistoryResponses,
   GetMentalModelResponses,
+  GetObservationHistoryData,
+  GetObservationHistoryErrors,
+  GetObservationHistoryResponses,
   GetOperationStatusData,
   GetOperationStatusErrors,
   GetOperationStatusResponses,
@@ -140,6 +146,9 @@ import type {
   RetainMemoriesData,
   RetainMemoriesErrors,
   RetainMemoriesResponses,
+  RetryOperationData,
+  RetryOperationErrors,
+  RetryOperationResponses,
   TriggerConsolidationData,
   TriggerConsolidationErrors,
   TriggerConsolidationResponses,
@@ -155,6 +164,9 @@ import type {
   UpdateDirectiveData,
   UpdateDirectiveErrors,
   UpdateDirectiveResponses,
+  UpdateDocumentData,
+  UpdateDocumentErrors,
+  UpdateDocumentResponses,
   UpdateMentalModelData,
   UpdateMentalModelErrors,
   UpdateMentalModelResponses,
@@ -252,7 +264,7 @@ export const listMemories = <ThrowOnError extends boolean = false>(
 /**
  * Get memory unit
  *
- * Get a single memory unit by ID with all its metadata including entities and tags.
+ * Get a single memory unit by ID with all its metadata including entities and tags. Note: the 'history' field is deprecated and always returns an empty list - use GET /memories/{memory_id}/history instead.
  */
 export const getMemory = <ThrowOnError extends boolean = false>(
   options: Options<GetMemoryData, ThrowOnError>,
@@ -262,6 +274,23 @@ export const getMemory = <ThrowOnError extends boolean = false>(
     GetMemoryErrors,
     ThrowOnError
   >({ url: "/v1/default/banks/{bank_id}/memories/{memory_id}", ...options });
+
+/**
+ * Get observation history
+ *
+ * Get the full history of an observation, with each change's source facts resolved to their text.
+ */
+export const getObservationHistory = <ThrowOnError extends boolean = false>(
+  options: Options<GetObservationHistoryData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    GetObservationHistoryResponses,
+    GetObservationHistoryErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/memories/{memory_id}/history",
+    ...options,
+  });
 
 /**
  * Recall memory
@@ -484,6 +513,23 @@ export const updateMentalModel = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Get mental model history
+ *
+ * Get the refresh history of a mental model, showing content changes over time.
+ */
+export const getMentalModelHistory = <ThrowOnError extends boolean = false>(
+  options: Options<GetMentalModelHistoryData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    GetMentalModelHistoryResponses,
+    GetMentalModelHistoryErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/history",
+    ...options,
+  });
+
+/**
  * Refresh mental model
  *
  * Submit an async task to re-run the source query through reflect and update the content.
@@ -640,6 +686,31 @@ export const getDocument = <ThrowOnError extends boolean = false>(
   >({ url: "/v1/default/banks/{bank_id}/documents/{document_id}", ...options });
 
 /**
+ * Update document
+ *
+ * Update mutable fields on a document without re-processing its content.
+ *
+ * **Tags** (`tags`): Propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset.
+ *
+ * At least one field must be provided.
+ */
+export const updateDocument = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateDocumentData, ThrowOnError>,
+) =>
+  (options.client ?? client).patch<
+    UpdateDocumentResponses,
+    UpdateDocumentErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/documents/{document_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * List tags
  *
  * List all unique tags in a memory bank with usage counts. Supports wildcard search using '*' (e.g., 'user:*', '*-fred', 'tag*-2'). Case-insensitive.
@@ -670,7 +741,7 @@ export const getChunk = <ThrowOnError extends boolean = false>(
 /**
  * List async operations
  *
- * Get a list of async operations for a specific agent, with optional filtering by status. Results are sorted by most recent first.
+ * Get a list of async operations for a specific agent, with optional filtering by status and operation type. Results are sorted by most recent first.
  */
 export const listOperations = <ThrowOnError extends boolean = false>(
   options: Options<ListOperationsData, ThrowOnError>,
@@ -712,6 +783,23 @@ export const getOperationStatus = <ThrowOnError extends boolean = false>(
     ThrowOnError
   >({
     url: "/v1/default/banks/{bank_id}/operations/{operation_id}",
+    ...options,
+  });
+
+/**
+ * Retry a failed async operation
+ *
+ * Re-queue a failed async operation so the worker picks it up again
+ */
+export const retryOperation = <ThrowOnError extends boolean = false>(
+  options: Options<RetryOperationData, ThrowOnError>,
+) =>
+  (options.client ?? client).post<
+    RetryOperationResponses,
+    RetryOperationErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/operations/{operation_id}/retry",
     ...options,
   });
 
@@ -1096,9 +1184,14 @@ export const retainMemories = <ThrowOnError extends boolean = false>(
  *
  * **Request format:** multipart/form-data with:
  * - `files`: One or more files to upload
- * - `request`: JSON string with FileRetainRequest model (files_metadata)
+ * - `request`: JSON string with FileRetainRequest model
  *
- * **Note:** File parser is configured server-side via `HINDSIGHT_API_FILE_PARSER` (default: markitdown).
+ * **Parser selection:**
+ * - Set `parser` in the request body to override the server default for all files.
+ * - Set `parser` inside a `files_metadata` entry for per-file control.
+ * - Pass a list (e.g. `['iris', 'markitdown']`) to define an ordered fallback chain — each parser is tried in sequence until one succeeds.
+ * - Falls back to the server default (`HINDSIGHT_API_FILE_PARSER`) if not specified.
+ * - Only parsers enabled on the server may be requested; others return HTTP 400.
  */
 export const fileRetain = <ThrowOnError extends boolean = false>(
   options: Options<FileRetainData, ThrowOnError>,

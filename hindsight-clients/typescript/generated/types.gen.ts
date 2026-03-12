@@ -1952,6 +1952,26 @@ export type RetainResponse = {
 };
 
 /**
+ * RetryOperationResponse
+ *
+ * Response model for retry operation endpoint.
+ */
+export type RetryOperationResponse = {
+  /**
+   * Success
+   */
+  success: boolean;
+  /**
+   * Message
+   */
+  message: string;
+  /**
+   * Operation Id
+   */
+  operation_id: string;
+};
+
+/**
  * SourceFactsIncludeOptions
  *
  * Options for including source facts for observation-type results.
@@ -1960,9 +1980,15 @@ export type SourceFactsIncludeOptions = {
   /**
    * Max Tokens
    *
-   * Maximum tokens for source facts
+   * Maximum total tokens for source facts across all observations (-1 = unlimited)
    */
   max_tokens?: number;
+  /**
+   * Max Tokens Per Observation
+   *
+   * Maximum tokens of source facts per observation (-1 = unlimited)
+   */
+  max_tokens_per_observation?: number;
 };
 
 /**
@@ -2073,6 +2099,32 @@ export type UpdateDirectiveRequest = {
  */
 export type UpdateDispositionRequest = {
   disposition: DispositionTraits;
+};
+
+/**
+ * UpdateDocumentRequest
+ *
+ * Request model for updating a document's mutable fields.
+ */
+export type UpdateDocumentRequest = {
+  /**
+   * Tags
+   *
+   * New tags for the document and its memory units. Triggers observation invalidation and re-consolidation.
+   */
+  tags?: Array<string> | null;
+};
+
+/**
+ * UpdateDocumentResponse
+ *
+ * Response model for update document endpoint.
+ */
+export type UpdateDocumentResponse = {
+  /**
+   * Success
+   */
+  success?: boolean;
 };
 
 /**
@@ -2537,6 +2589,45 @@ export type GetMemoryErrors = {
 export type GetMemoryError = GetMemoryErrors[keyof GetMemoryErrors];
 
 export type GetMemoryResponses = {
+  /**
+   * Successful Response
+   */
+  200: unknown;
+};
+
+export type GetObservationHistoryData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Memory Id
+     */
+    memory_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/memories/{memory_id}/history";
+};
+
+export type GetObservationHistoryErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type GetObservationHistoryError =
+  GetObservationHistoryErrors[keyof GetObservationHistoryErrors];
+
+export type GetObservationHistoryResponses = {
   /**
    * Successful Response
    */
@@ -3037,6 +3128,45 @@ export type UpdateMentalModelResponses = {
 export type UpdateMentalModelResponse =
   UpdateMentalModelResponses[keyof UpdateMentalModelResponses];
 
+export type GetMentalModelHistoryData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Mental Model Id
+     */
+    mental_model_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/history";
+};
+
+export type GetMentalModelHistoryErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type GetMentalModelHistoryError =
+  GetMentalModelHistoryErrors[keyof GetMentalModelHistoryErrors];
+
+export type GetMentalModelHistoryResponses = {
+  /**
+   * Successful Response
+   */
+  200: unknown;
+};
+
 export type RefreshMentalModelData = {
   body?: never;
   headers?: {
@@ -3451,6 +3581,48 @@ export type GetDocumentResponses = {
 export type GetDocumentResponse =
   GetDocumentResponses[keyof GetDocumentResponses];
 
+export type UpdateDocumentData = {
+  body: UpdateDocumentRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Document Id
+     */
+    document_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/documents/{document_id}";
+};
+
+export type UpdateDocumentErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type UpdateDocumentError =
+  UpdateDocumentErrors[keyof UpdateDocumentErrors];
+
+export type UpdateDocumentResponses = {
+  /**
+   * Successful Response
+   */
+  200: UpdateDocumentResponse;
+};
+
+export type UpdateDocumentResponse2 =
+  UpdateDocumentResponses[keyof UpdateDocumentResponses];
+
 export type ListTagsData = {
   body?: never;
   headers?: {
@@ -3563,6 +3735,12 @@ export type ListOperationsData = {
      * Filter by status: pending, completed, or failed
      */
     status?: string | null;
+    /**
+     * Type
+     *
+     * Filter by operation type: retain, consolidation, refresh_mental_model, file_convert_retain, webhook_delivery
+     */
+    type?: string | null;
     /**
      * Limit
      *
@@ -3682,6 +3860,48 @@ export type GetOperationStatusResponses = {
 
 export type GetOperationStatusResponse =
   GetOperationStatusResponses[keyof GetOperationStatusResponses];
+
+export type RetryOperationData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Operation Id
+     */
+    operation_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/operations/{operation_id}/retry";
+};
+
+export type RetryOperationErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type RetryOperationError =
+  RetryOperationErrors[keyof RetryOperationErrors];
+
+export type RetryOperationResponses = {
+  /**
+   * Successful Response
+   */
+  200: RetryOperationResponse;
+};
+
+export type RetryOperationResponse2 =
+  RetryOperationResponses[keyof RetryOperationResponses];
 
 export type GetBankProfileData = {
   body?: never;

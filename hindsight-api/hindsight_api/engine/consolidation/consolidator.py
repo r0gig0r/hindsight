@@ -9,6 +9,10 @@ Observations are stored in memory_units with fact_type='observation' and include
 - proof_count: Number of supporting memories
 - source_memory_ids: Array of memory UUIDs that contribute to this observation
 - history: JSONB tracking changes over time
+
+NOTE: Observations are distinct from mental models (pinned reflections).
+- Observations: auto-generated bottom-up by this engine from raw facts (memory_units table, fact_type='observation')
+- Mental models: user-defined queries stored in the mental_models table, refreshed on demand via reflect
 """
 
 import json
@@ -20,9 +24,10 @@ from datetime import datetime, timezone
 from itertools import combinations
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from ...config import get_config
+from ..llm_wrapper import sanitize_llm_output
 from ..memory_engine import fq_table
 from ..retain import embedding_utils
 from .prompts import build_batch_consolidation_prompt, build_single_fact_prompt
@@ -41,11 +46,21 @@ class _CreateAction(BaseModel):
     text: str
     source_fact_ids: list[str]  # memory UUIDs from the NEW FACTS list
 
+    @field_validator("text", mode="before")
+    @classmethod
+    def sanitize_text(cls, v: str) -> str:
+        return sanitize_llm_output(v) or ""
+
 
 class _UpdateAction(BaseModel):
     text: str
     observation_id: str  # UUID of the existing observation to update
     source_fact_ids: list[str]  # memory UUIDs from the NEW FACTS list
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def sanitize_text(cls, v: str) -> str:
+        return sanitize_llm_output(v) or ""
 
 
 class _DeleteAction(BaseModel):
@@ -75,6 +90,42 @@ class _BatchLLMResult:
     deletes: list[_DeleteAction] = field(default_factory=list)
     obs_count: int = 0
     prompt_chars: int = 0
+
+
+@dataclass
+class _SourceAggregation:
+    """Fields inherited by an observation from its source memories."""
+
+    event_date: datetime | None
+    occurred_start: datetime | None
+    occurred_end: datetime | None
+    mentioned_at: datetime | None
+    tags: list[str]
+
+
+def _aggregate_source_fields(source_mems: list[dict[str, Any]], tags: list[str] | None = None) -> _SourceAggregation:
+    """Compute the observation fields inherited from a set of source memories.
+
+    Temporal aggregation rules:
+    - ``event_date``    — earliest across sources (min)
+    - ``occurred_start`` — earliest across sources (min)
+    - ``occurred_end``   — latest across sources (max)
+    - ``mentioned_at``   — latest across sources (max)
+
+    Fields remain ``None`` when no source memory carries that information, so
+    observations are never stamped with an artificial timestamp.
+
+    ``tags`` defaults to those of the first source memory when not explicitly
+    provided (all memories in a consolidation batch share the same tag set).
+    """
+    effective_tags = tags if tags is not None else (source_mems[0].get("tags") or [] if source_mems else [])
+    return _SourceAggregation(
+        event_date=_min_date(m.get("event_date") for m in source_mems),
+        occurred_start=_min_date(m.get("occurred_start") for m in source_mems),
+        occurred_end=_max_date(m.get("occurred_end") for m in source_mems),
+        mentioned_at=_max_date(m.get("mentioned_at") for m in source_mems),
+        tags=effective_tags,
+    )
 
 
 class ConsolidationPerfLog:
@@ -120,6 +171,7 @@ async def run_consolidation_job(
     memory_engine: "MemoryEngine",
     bank_id: str,
     request_context: "RequestContext",
+    operation_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Run consolidation job for a bank.
@@ -344,6 +396,13 @@ async def run_consolidation_job(
                     f"UPDATE {fq_table('memory_units')} SET consolidated_at = NOW() WHERE id = $1",
                     [(m["id"],) for m in llm_batch],
                 )
+
+            # Checkpoint: abort if the operation (and thus the bank) was deleted mid-run.
+            if operation_id and not await memory_engine._check_op_alive(operation_id):
+                logger.info(
+                    f"[CONSOLIDATION] bank={bank_id} operation {operation_id} cancelled (bank deleted), stopping early"
+                )
+                return {"status": "cancelled", "bank_id": bank_id, **stats}
 
             for result in results:
                 stats["memories_processed"] += 1
@@ -626,17 +685,18 @@ async def _process_memory_batch(
         source_mems = [mem_by_id[fid] for fid in create.source_fact_ids if fid in mem_by_id]
         if not source_mems:
             continue
+        agg = _aggregate_source_fields(source_mems, tags=fact_tags)
         await _execute_create_action(
             conn=conn,
             memory_engine=memory_engine,
             bank_id=bank_id,
             source_memory_ids=[m["id"] for m in source_mems],
             text=create.text,
-            source_fact_tags=fact_tags,
-            event_date=_min_date(m.get("event_date") for m in source_mems),
-            occurred_start=_min_date(m.get("occurred_start") for m in source_mems),
-            occurred_end=_max_date(m.get("occurred_end") for m in source_mems),
-            mentioned_at=_max_date(m.get("mentioned_at") for m in source_mems),
+            source_fact_tags=agg.tags,
+            event_date=agg.event_date,
+            occurred_start=agg.occurred_start,
+            occurred_end=agg.occurred_end,
+            mentioned_at=agg.mentioned_at,
             perf=perf,
         )
         for m in source_mems:
@@ -653,6 +713,7 @@ async def _process_memory_batch(
                 f"not in any source fact's recall"
             )
             continue
+        agg = _aggregate_source_fields(source_mems, tags=fact_tags)
         await _execute_update_action(
             conn=conn,
             memory_engine=memory_engine,
@@ -661,10 +722,10 @@ async def _process_memory_batch(
             observation_id=update.observation_id,
             new_text=update.text,
             observations=union_observations,
-            source_fact_tags=fact_tags,
-            source_occurred_start=_min_date(m.get("occurred_start") for m in source_mems),
-            source_occurred_end=_max_date(m.get("occurred_end") for m in source_mems),
-            source_mentioned_at=_max_date(m.get("mentioned_at") for m in source_mems),
+            source_fact_tags=agg.tags,
+            source_occurred_start=agg.occurred_start,
+            source_occurred_end=agg.occurred_end,
+            source_mentioned_at=agg.mentioned_at,
             perf=perf,
         )
         for m in source_mems:
@@ -734,13 +795,17 @@ async def _execute_update_action(
         logger.debug(f"Update skipped: observation {observation_id} not found in recall results")
         return
 
-    history = [
-        {
-            "previous_text": model.text,
-            "changed_at": datetime.now(timezone.utc).isoformat(),
-            "source_memory_ids": [str(mid) for mid in source_memory_ids],
-        }
-    ]
+    from ...config import get_config
+
+    history_entry = {
+        "previous_text": model.text,
+        "previous_tags": list(model.tags or []),
+        "previous_occurred_start": model.occurred_start,
+        "previous_occurred_end": model.occurred_end,
+        "previous_mentioned_at": model.mentioned_at,
+        "changed_at": datetime.now(timezone.utc).isoformat(),
+        "new_source_memory_ids": [str(mid) for mid in source_memory_ids],
+    }
 
     source_ids = list(model.source_fact_ids or []) + source_memory_ids
 
@@ -755,13 +820,18 @@ async def _execute_update_action(
     if perf:
         perf.record_timing("embedding", time.time() - t0)
 
+    config = get_config()
+    history_clause = (
+        "history = COALESCE(history, '[]'::jsonb) || $3::jsonb," if config.enable_observation_history else ""
+    )
+
     t0 = time.time()
     await conn.execute(
         f"""
         UPDATE {fq_table("memory_units")}
         SET text = $1,
             embedding = $2::vector,
-            history = $3,
+            {history_clause}
             source_memory_ids = $4,
             proof_count = $5,
             tags = $10,
@@ -773,7 +843,7 @@ async def _execute_update_action(
         """,
         new_text,
         embedding_str,
-        json.dumps(history),
+        json.dumps([history_entry]),
         source_ids,
         len(source_ids),
         uuid.UUID(observation_id),
@@ -885,10 +955,9 @@ async def _find_related_observations(
     """
     # Use recall to find related observations with token budget
     # max_tokens naturally limits how many observations are returned
-    from ...config import get_config
     from ...tracing import get_tracer, is_tracing_enabled
 
-    config = get_config()
+    config = await memory_engine._config_resolver.resolve_full_config(bank_id, request_context)
 
     # SECURITY: Use all_strict matching if tags provided to prevent cross-scope consolidation
     tags_match = "all_strict" if tags else "any"
@@ -913,7 +982,8 @@ async def _find_related_observations(
             tags=tags,  # Filter by source memory's tags
             tags_match=tags_match,  # Use strict matching for security
             include_source_facts=True,  # Embed source facts so we avoid a separate DB fetch
-            max_source_facts_tokens=-1,  # No token limit — we need all source facts for consolidation
+            max_source_facts_tokens=config.consolidation_source_facts_max_tokens,
+            max_source_facts_tokens_per_observation=config.consolidation_source_facts_max_tokens_per_observation,
             _quiet=True,  # Suppress logging
         )
     finally:
@@ -1046,14 +1116,17 @@ async def _consolidate_batch_with_llm(
         observations_text = "[]"
 
     def _fact_line(m: dict[str, Any]) -> str:
-        parts = [f"[{m['id']}] {m['text']}"]
+        text = f"[{m['id']}] {m['text']}"
+        temporal_parts = []
         if m.get("occurred_start"):
-            parts.append(f"occurred_start={m['occurred_start']}")
+            temporal_parts.append(f"occurred_start={m['occurred_start']}")
         if m.get("occurred_end"):
-            parts.append(f"occurred_end={m['occurred_end']}")
+            temporal_parts.append(f"occurred_end={m['occurred_end']}")
         if m.get("mentioned_at"):
-            parts.append(f"mentioned_at={m['mentioned_at']}")
-        return " | ".join(parts)
+            temporal_parts.append(f"mentioned_at={m['mentioned_at']}")
+        if temporal_parts:
+            text += f" ({', '.join(temporal_parts)})"
+        return text
 
     facts_lines = "\n".join(_fact_line(m) for m in memories)
 
@@ -1173,8 +1246,8 @@ async def _create_observation_directly(
     # Create the observation as a memory_unit
     now = datetime.now(timezone.utc)
     obs_event_date = event_date or now
-    obs_occurred_start = occurred_start or now
-    obs_occurred_end = occurred_end or now
+    obs_occurred_start = occurred_start
+    obs_occurred_end = occurred_end
     obs_mentioned_at = mentioned_at or now
     obs_tags = tags or []
 

@@ -16,7 +16,7 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 import asyncpg
@@ -168,7 +168,7 @@ from enum import Enum
 from ..metrics import get_metrics_collector
 from ..pg0 import EmbeddedPostgres, parse_pg0_url
 from .entity_resolver import EntityResolver
-from .llm_wrapper import LLMConfig, requires_api_key
+from .llm_wrapper import LLMConfig, requires_api_key, sanitize_llm_output
 from .query_analyzer import QueryAnalyzer
 from .reflect import run_reflect_agent
 from .reflect.tools import tool_expand, tool_recall, tool_search_mental_models, tool_search_observations
@@ -187,7 +187,7 @@ from .response_models import RecallResult as RecallResultModel
 from .retain import bank_utils, embedding_utils
 from .retain.types import RetainContentDict
 from .search import think_utils
-from .search.reranking import CrossEncoderReranker
+from .search.reranking import CrossEncoderReranker, apply_combined_scoring
 from .search.tags import TagsMatch, build_tags_where_clause
 from .task_backend import BrokerTaskBackend, SyncTaskBackend, TaskBackend
 
@@ -628,7 +628,7 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id,
                 contents=contents,
                 operation_id=operation_id,
-                schema=context.tenant_id,
+                schema=_current_schema.get(),
             ),
         )
 
@@ -687,13 +687,19 @@ class MemoryEngine(MemoryEngineInterface):
             # Retrieve file from storage
             file_data = await self._file_storage.retrieve(storage_key)
 
-            # Convert to markdown
-            parser = self._parser_registry.get_parser(
-                name=task_dict.get("parser"),
+            # Convert to markdown using the ordered fallback chain stored in the task payload.
+            # task_dict["parser"] is always a list[str] set at submission time.
+            parser_chain: list[str] = task_dict.get("parser") or []
+            if not parser_chain:
+                raise ValueError("No parser chain defined for file_convert_retain task")
+            convert_result = await self._parser_registry.convert_with_fallback(
+                parsers=parser_chain,
+                file_data=file_data,
                 filename=filename,
                 content_type=task_dict.get("content_type"),
             )
-            markdown_content = await parser.convert(file_data, filename)
+            markdown_content = sanitize_llm_output(convert_result.content) or ""
+            winning_parser = convert_result.parser_name
         except Exception as e:
             # Re-raise with filename context for better error reporting
             error_msg = f"Failed to parse file '{filename}': {str(e)}"
@@ -704,6 +710,31 @@ class MemoryEngine(MemoryEngineInterface):
             f"[FILE_CONVERT_RETAIN] Converted file for bank_id={bank_id}, "
             f"document_id={document_id}, {len(markdown_content)} chars. Submitting retain task."
         )
+
+        # Fire file conversion hook (e.g., for Iris billing)
+        if self._operation_validator:
+            try:
+                from hindsight_api.extensions.operation_validator import FileConvertResult
+                from hindsight_api.models import RequestContext
+
+                convert_context = RequestContext(
+                    internal=True,
+                    user_initiated=True,
+                    tenant_id=task_dict.get("_tenant_id"),
+                    api_key_id=task_dict.get("_api_key_id"),
+                )
+                await self._operation_validator.on_file_convert_complete(
+                    FileConvertResult(
+                        bank_id=bank_id,
+                        parser_name=winning_parser,
+                        filename=filename,
+                        output_chars=len(markdown_content),
+                        output_text=markdown_content,
+                        request_context=convert_context,
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"[FILE_CONVERT_RETAIN] on_file_convert_complete hook failed: {e}")
 
         # Build retain task payload
         retain_contents = [
@@ -823,6 +854,7 @@ class MemoryEngine(MemoryEngineInterface):
             memory_engine=self,
             bank_id=bank_id,
             request_context=internal_context,
+            operation_id=task_dict.get("operation_id"),
         )
 
         logger.info(f"[CONSOLIDATION] bank={bank_id} completed: {result.get('memories_processed', 0)} processed")
@@ -1142,8 +1174,13 @@ class MemoryEngine(MemoryEngineInterface):
             )
 
         async def _callback(conn: asyncpg.Connection) -> None:
+            # Resolve schema at call time (not at callback creation time) because
+            # _current_schema contextvar may not yet be set when the callback is built
+            # from the HTTP path (http.py calls _build_retain_outbox_callback before
+            # retain_batch_async which is where _authenticate_tenant sets the schema).
+            resolved_schema = schema or _current_schema.get()
             for event in events:
-                await webhook_manager.fire_event_with_conn(event, conn, schema=schema)
+                await webhook_manager.fire_event_with_conn(event, conn, schema=resolved_schema)
 
         return _callback
 
@@ -1247,6 +1284,24 @@ class MemoryEngine(MemoryEngineInterface):
         except Exception as e:
             logger.error(f"Failed to delete async operation record {operation_id}: {e}")
 
+    async def _check_op_alive(self, operation_id: str) -> bool:
+        """Return False if the operation row no longer exists (e.g. bank was deleted via CASCADE).
+
+        Long-running operations should call this at natural checkpoints (e.g. after each
+        committed batch) to detect bank deletion early and abort cleanly.
+        """
+        try:
+            pool = await self._get_pool()
+            async with acquire_with_retry(pool) as conn:
+                row = await conn.fetchrow(
+                    f"SELECT operation_id FROM {fq_table('async_operations')} WHERE operation_id = $1",
+                    uuid.UUID(operation_id),
+                )
+                return row is not None
+        except Exception as e:
+            logger.error(f"Failed to check operation liveness {operation_id}: {e}")
+            return True  # Assume alive on DB error to avoid false-positive aborts
+
     async def _mark_operation_failed(self, operation_id: str, error_message: str, error_traceback: str):
         """Helper to mark an operation as failed in the database.
 
@@ -1262,15 +1317,19 @@ class MemoryEngine(MemoryEngineInterface):
             async with acquire_with_retry(pool) as conn:
                 async with conn.transaction():
                     # Mark this operation as failed
-                    await conn.execute(
+                    row = await conn.fetchrow(
                         f"""
                         UPDATE {fq_table("async_operations")}
                         SET status = 'failed', error_message = $2, updated_at = NOW()
                         WHERE operation_id = $1
+                        RETURNING operation_id
                         """,
                         uuid.UUID(operation_id),
                         truncated_error,
                     )
+                    if row is None:
+                        logger.info(f"Operation {operation_id} no longer exists (bank deleted), skipping mark-failed")
+                        return
                     logger.info(f"Marked async operation as failed: {operation_id}")
 
                     # Check if this is a child operation and update parent if all siblings are done
@@ -1290,14 +1349,20 @@ class MemoryEngine(MemoryEngineInterface):
             async with acquire_with_retry(pool) as conn:
                 async with conn.transaction():
                     # Mark this operation as completed
-                    await conn.execute(
+                    row = await conn.fetchrow(
                         f"""
                         UPDATE {fq_table("async_operations")}
                         SET status = 'completed', updated_at = NOW(), completed_at = NOW()
                         WHERE operation_id = $1
+                        RETURNING operation_id
                         """,
                         uuid.UUID(operation_id),
                     )
+                    if row is None:
+                        logger.info(
+                            f"Operation {operation_id} no longer exists (bank deleted), skipping mark-completed"
+                        )
+                        return
                     logger.info(f"Marked async operation as completed: {operation_id}")
 
                     # Check if this is a child operation and update parent if all siblings are done
@@ -1327,14 +1392,20 @@ class MemoryEngine(MemoryEngineInterface):
             pool = await self._get_pool()
             async with acquire_with_retry(pool) as conn:
                 async with conn.transaction():
-                    await conn.execute(
+                    row = await conn.fetchrow(
                         f"""
                         UPDATE {fq_table("async_operations")}
                         SET status = 'completed', updated_at = NOW(), completed_at = NOW()
                         WHERE operation_id = $1
+                        RETURNING operation_id
                         """,
                         uuid.UUID(operation_id),
                     )
+                    if row is None:
+                        logger.info(
+                            f"Operation {operation_id} no longer exists (bank deleted), skipping mark-completed"
+                        )
+                        return
                     logger.info(f"Marked async operation as completed: {operation_id}")
                     await self._maybe_update_parent_operation(operation_id, conn)
 
@@ -1632,6 +1703,15 @@ class MemoryEngine(MemoryEngineInterface):
         # Create connection pool
         # For read-heavy workloads with many parallel think/search operations,
         # we need a larger pool. Read operations don't need strong isolation.
+        async def _init_connection(conn: asyncpg.Connection) -> None:
+            # SET (not SET LOCAL) so it persists for the connection lifetime.
+            # ef_search=200 improves HNSW recall quality for the per-fact_type
+            # semantic queries in retrieve_semantic_bm25_combined().
+            try:
+                await conn.execute("SET hnsw.ef_search = 200")
+            except Exception:
+                logger.debug("Could not set hnsw.ef_search — extension may not support it")
+
         self._pool = await asyncpg.create_pool(
             self.db_url,
             min_size=self._pool_min_size,
@@ -1639,6 +1719,7 @@ class MemoryEngine(MemoryEngineInterface):
             command_timeout=self._db_command_timeout,
             statement_cache_size=0,  # Disable prepared statement cache
             timeout=self._db_acquire_timeout,  # Connection acquisition timeout (seconds)
+            init=_init_connection,
         )
 
         # Initialize entity resolver with pool and configured lookup strategy
@@ -2186,6 +2267,15 @@ class MemoryEngine(MemoryEngineInterface):
             # Process each sub-batch
             all_results = []
             for i, sub_batch in enumerate(sub_batches, 1):
+                # Checkpoint: abort if the operation was deleted (bank was deleted) between sub-batches.
+                if operation_id and not await self._check_op_alive(operation_id):
+                    logger.info(
+                        f"[BATCH_RETAIN] bank={bank_id} operation {operation_id} cancelled (bank deleted), stopping after {i - 1}/{len(sub_batches)} sub-batches"
+                    )
+                    if return_usage:
+                        return all_results, total_usage
+                    return all_results
+
                 sub_batch_tokens = sum(count_tokens(item.get("content", "")) for item in sub_batch)
                 logger.info(
                     f"Processing sub-batch {i}/{len(sub_batches)}: {len(sub_batch)} items, {sub_batch_tokens:,} tokens"
@@ -2326,7 +2416,7 @@ class MemoryEngine(MemoryEngineInterface):
                     document_tags=document_tags,
                     config=resolved_config,
                     operation_id=operation_id,
-                    schema=request_context.tenant_id if request_context else None,
+                    schema=_current_schema.get(),
                     outbox_callback=outbox_callback,
                 )
 
@@ -2387,6 +2477,7 @@ class MemoryEngine(MemoryEngineInterface):
         max_chunk_tokens: int = 8192,
         include_source_facts: bool = False,
         max_source_facts_tokens: int = 4096,
+        max_source_facts_tokens_per_observation: int = -1,
         request_context: "RequestContext",
         tags: list[str] | None = None,
         tags_match: TagsMatch = "any",
@@ -2528,6 +2619,7 @@ class MemoryEngine(MemoryEngineInterface):
                             quiet=_quiet,
                             include_source_facts=include_source_facts,
                             max_source_facts_tokens=max_source_facts_tokens,
+                            max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,
                         )
                         break  # Success - exit retry loop
                     except Exception as e:
@@ -2654,6 +2746,7 @@ class MemoryEngine(MemoryEngineInterface):
         quiet: bool = False,
         include_source_facts: bool = False,
         max_source_facts_tokens: int = 4096,
+        max_source_facts_tokens_per_observation: int = -1,
     ) -> RecallResultModel:
         """
         Search implementation with modular retrieval and reranking.
@@ -3033,57 +3126,12 @@ class MemoryEngine(MemoryEngineInterface):
                     rerank_span.set_attribute("hindsight.pre_filtered_count", pre_filtered_count)
                 rerank_span.end()
 
-            # Step 4.5: Combine cross-encoder score with retrieval signals
-            # This preserves retrieval work (RRF, temporal, recency) instead of pure cross-encoder ranking
+            # Step 4.5: Combine cross-encoder score with retrieval signals via multiplicative boosts.
+            # See apply_combined_scoring for the full rationale and formula.
             if scored_results:
-                # Normalize RRF scores to [0, 1] range using min-max normalization
-                rrf_scores = [sr.candidate.rrf_score for sr in scored_results]
-                max_rrf = max(rrf_scores) if rrf_scores else 0.0
-                min_rrf = min(rrf_scores) if rrf_scores else 0.0
-                rrf_range = max_rrf - min_rrf  # Don't force to 1.0, let fallback handle it
-
-                # Calculate recency based on occurred_start (more recent = higher score)
-                now = utcnow()
-                for sr in scored_results:
-                    # Normalize RRF score (0-1 range, 0.5 if all same)
-                    if rrf_range > 0:
-                        sr.rrf_normalized = (sr.candidate.rrf_score - min_rrf) / rrf_range
-                    else:
-                        # All RRF scores are the same, use neutral value
-                        sr.rrf_normalized = 0.5
-
-                    # Calculate recency (decay over 365 days, minimum 0.1)
-                    sr.recency = 0.5  # default for missing dates
-                    if sr.retrieval.occurred_start:
-                        occurred = sr.retrieval.occurred_start
-                        if hasattr(occurred, "tzinfo") and occurred.tzinfo is None:
-                            occurred = occurred.replace(tzinfo=UTC)
-                        days_ago = (now - occurred).total_seconds() / 86400
-                        sr.recency = max(0.1, 1.0 - (days_ago / 365))  # Linear decay over 1 year
-
-                    # Get temporal proximity if available (already 0-1)
-                    sr.temporal = (
-                        sr.retrieval.temporal_proximity if sr.retrieval.temporal_proximity is not None else 0.5
-                    )
-
-                    # Weighted combination
-                    # Cross-encoder: 60% (semantic relevance)
-                    # RRF: 20% (retrieval consensus)
-                    # Temporal proximity: 10% (time relevance for temporal queries)
-                    # Recency: 10% (prefer recent facts)
-                    sr.combined_score = (
-                        0.6 * sr.cross_encoder_score_normalized
-                        + 0.2 * sr.rrf_normalized
-                        + 0.1 * sr.temporal
-                        + 0.1 * sr.recency
-                    )
-                    sr.weight = sr.combined_score  # Update weight for final ranking
-
-                # Re-sort by combined score
+                apply_combined_scoring(scored_results, now=utcnow())
                 scored_results.sort(key=lambda x: x.weight, reverse=True)
-                log_buffer.append(
-                    "  [4.6] Combined scoring: cross_encoder(0.6) + rrf(0.2) + temporal(0.1) + recency(0.1)"
-                )
+                log_buffer.append("  [4.6] Combined scoring: ce * recency_boost(0.2) * temporal_boost(0.2)")
 
             # Add reranked results to tracer AFTER combined scoring (so normalized values are included)
             if tracer:
@@ -3111,15 +3159,53 @@ class MemoryEngine(MemoryEngineInterface):
             if include_chunks and top_scored:
                 from .response_models import ChunkInfo
 
-                # Collect chunk_ids in order of fact relevance (preserving order from top_scored)
-                # Use a list to maintain order, but track seen chunks to avoid duplicates
-                chunk_ids_ordered = []
-                seen_chunk_ids = set()
+                # Collect chunk_ids in order of fact relevance (preserving order from top_scored).
+                # Observations have no direct chunk_id — use a placeholder so their source
+                # chunks end up at the observation's rank position, not appended at the end.
+                # ordered_items: list of ('chunk', chunk_id) | ('obs', sr.id)
+                ordered_items: list[tuple[str, str]] = []
+                seen_chunk_ids: set[str] = set()
+                observation_ids_ordered: list[uuid.UUID] = []
                 for sr in top_scored:
                     chunk_id = sr.retrieval.chunk_id
                     if chunk_id and chunk_id not in seen_chunk_ids:
-                        chunk_ids_ordered.append(chunk_id)
+                        ordered_items.append(("chunk", chunk_id))
                         seen_chunk_ids.add(chunk_id)
+                    elif not chunk_id and sr.retrieval.fact_type == "observation":
+                        ordered_items.append(("obs", sr.id))
+                        observation_ids_ordered.append(uuid.UUID(sr.id))
+
+                # Resolve source chunk_ids for all observations in a single query,
+                # ordered by observation rank so per-observation results stay grouped correctly.
+                obs_chunk_ids: dict[str, list[str]] = {}
+                if observation_ids_ordered:
+                    async with acquire_with_retry(pool) as obs_conn:
+                        obs_source_rows = await obs_conn.fetch(
+                            f"""
+                            SELECT obs.id AS obs_id, mu.chunk_id
+                            FROM {fq_table("memory_units")} obs
+                            JOIN {fq_table("memory_units")} mu
+                              ON mu.id = ANY(obs.source_memory_ids)
+                            WHERE obs.id = ANY($1::uuid[])
+                              AND mu.chunk_id IS NOT NULL
+                            ORDER BY array_position($1::uuid[], obs.id)
+                            """,
+                            observation_ids_ordered,
+                        )
+                    for row in obs_source_rows:
+                        obs_id = str(row["obs_id"])
+                        cid = row["chunk_id"]
+                        if cid not in seen_chunk_ids:
+                            obs_chunk_ids.setdefault(obs_id, []).append(cid)
+                            seen_chunk_ids.add(cid)
+
+                # Flatten ordered_items into chunk_ids_ordered, expanding obs placeholders
+                chunk_ids_ordered = []
+                for item_type, item_id in ordered_items:
+                    if item_type == "chunk":
+                        chunk_ids_ordered.append(item_id)
+                    else:
+                        chunk_ids_ordered.extend(obs_chunk_ids.get(item_id, []))
 
                 if chunk_ids_ordered:
                     chunks_dict = {}
@@ -3282,18 +3368,9 @@ class MemoryEngine(MemoryEngineInterface):
 
                             encoding = _get_tiktoken_encoding()
                             source_facts_dict = {}
-                            total_source_tokens = 0
-                            for sid in source_ids_ordered:
-                                if sid not in source_row_by_id:
-                                    continue
-                                r = source_row_by_id[sid]
-                                fact_tokens = len(encoding.encode(r["text"]))
-                                if (
-                                    max_source_facts_tokens >= 0
-                                    and total_source_tokens + fact_tokens > max_source_facts_tokens
-                                ):
-                                    break
-                                source_facts_dict[sid] = MemoryFact(
+
+                            def _make_source_fact(sid: str, r: Any) -> MemoryFact:
+                                return MemoryFact(
                                     id=sid,
                                     text=r["text"],
                                     fact_type=r["fact_type"],
@@ -3305,7 +3382,37 @@ class MemoryEngine(MemoryEngineInterface):
                                     chunk_id=str(r["chunk_id"]) if r["chunk_id"] else None,
                                     tags=r["tags"] or None,
                                 )
-                                total_source_tokens += fact_tokens
+
+                            if max_source_facts_tokens_per_observation >= 0:
+                                # Per-observation capping: each observation independently selects
+                                # source facts up to its token budget.
+                                for obs_id, sids in source_fact_ids_by_obs.items():
+                                    obs_tokens = 0
+                                    for sid in sids:
+                                        if sid not in source_row_by_id:
+                                            continue
+                                        r = source_row_by_id[sid]
+                                        fact_tokens = len(encoding.encode(r["text"]))
+                                        if obs_tokens + fact_tokens > max_source_facts_tokens_per_observation:
+                                            break
+                                        obs_tokens += fact_tokens
+                                        if sid not in source_facts_dict:
+                                            source_facts_dict[sid] = _make_source_fact(sid, r)
+                            else:
+                                # Global budget: fill in order of first appearance until exhausted.
+                                total_source_tokens = 0
+                                for sid in source_ids_ordered:
+                                    if sid not in source_row_by_id:
+                                        continue
+                                    r = source_row_by_id[sid]
+                                    fact_tokens = len(encoding.encode(r["text"]))
+                                    if (
+                                        max_source_facts_tokens >= 0
+                                        and total_source_tokens + fact_tokens > max_source_facts_tokens
+                                    ):
+                                        break
+                                    source_facts_dict[sid] = _make_source_fact(sid, r)
+                                    total_source_tokens += fact_tokens
 
             # Get entities for each fact if include_entities is requested
             fact_entity_map = {}  # unit_id -> list of (entity_id, entity_name)
@@ -3826,6 +3933,140 @@ class MemoryEngine(MemoryEngineInterface):
 
         return result
 
+    async def update_document(
+        self,
+        document_id: str,
+        bank_id: str,
+        *,
+        tags: list[str] | None = None,
+        request_context: "RequestContext",
+    ) -> bool:
+        """
+        Update mutable fields on a document without re-processing its content.
+
+        Tag changes propagate to all associated memory units and trigger observation
+        invalidation + re-consolidation (same semantics as delete_document):
+        - Observations referencing the document's memory units are deleted.
+        - The document's own units and any co-source memories from other documents
+          have consolidated_at reset so they are re-consolidated under the new tags.
+
+        Args:
+            document_id: Document ID to update
+            bank_id: Bank ID that owns the document
+            tags: New tags to apply to the document and all its memory units (optional)
+            request_context: Request context for authentication.
+
+        Returns:
+            True if the document was found and updated, False if not found
+        """
+        await self._authenticate_tenant(request_context)
+        if self._operation_validator:
+            from hindsight_api.extensions import BankWriteContext
+
+            ctx = BankWriteContext(bank_id=bank_id, operation="update_document", request_context=request_context)
+            await self._validate_operation(self._operation_validator.validate_bank_write(ctx))
+        pool = await self._get_pool()
+        invalidated_obs = 0
+        async with acquire_with_retry(pool) as conn:
+            async with conn.transaction():
+                set_parts: list[str] = ["updated_at = now()"]
+                params: list[Any] = []
+                p = 1
+
+                if tags is not None:
+                    set_parts.append(f"tags = ${p}")
+                    params.append(tags)
+                    p += 1
+
+                params.extend([document_id, bank_id])
+                doc_id_found = await conn.fetchval(
+                    f"""
+                    UPDATE {fq_table("documents")}
+                    SET {", ".join(set_parts)}
+                    WHERE id = ${p} AND bank_id = ${p + 1}
+                    RETURNING id
+                    """,
+                    *params,
+                )
+                if not doc_id_found:
+                    return False
+
+                if tags is not None:
+                    unit_rows = await conn.fetch(
+                        f"SELECT id FROM {fq_table('memory_units')} WHERE document_id = $1 AND fact_type IN ('experience', 'world')",
+                        document_id,
+                    )
+                    unit_ids = [str(row["id"]) for row in unit_rows]
+
+                    await conn.execute(
+                        f"UPDATE {fq_table('memory_units')} SET tags = $1 WHERE document_id = $2",
+                        tags,
+                        document_id,
+                    )
+
+                    if unit_ids:
+                        import uuid as uuid_module
+
+                        unit_uuids = [uuid_module.UUID(uid) for uid in unit_ids]
+                        unit_uuid_set = {str(u) for u in unit_uuids}
+                        affected_obs = await conn.fetch(
+                            f"""
+                            SELECT id, source_memory_ids FROM {fq_table("memory_units")}
+                            WHERE bank_id = $1
+                              AND fact_type = 'observation'
+                              AND source_memory_ids && $2::uuid[]
+                            """,
+                            bank_id,
+                            unit_uuids,
+                        )
+                        if affected_obs:
+                            obs_ids = [obs["id"] for obs in affected_obs]
+
+                            seen: set[str] = set()
+                            other_source_uuids: list[uuid_module.UUID] = []
+                            for obs in affected_obs:
+                                for src_id in obs["source_memory_ids"] or []:
+                                    src_str = str(src_id)
+                                    if src_str not in unit_uuid_set and src_str not in seen:
+                                        other_source_uuids.append(src_id)
+                                        seen.add(src_str)
+
+                            await conn.execute(
+                                f"DELETE FROM {fq_table('memory_units')} WHERE id = ANY($1::uuid[])",
+                                obs_ids,
+                            )
+                            await conn.execute(
+                                f"""
+                                UPDATE {fq_table("memory_units")}
+                                SET consolidated_at = NULL
+                                WHERE id = ANY($1::uuid[])
+                                  AND fact_type IN ('experience', 'world')
+                                """,
+                                unit_uuids,
+                            )
+                            if other_source_uuids:
+                                await conn.execute(
+                                    f"""
+                                    UPDATE {fq_table("memory_units")}
+                                    SET consolidated_at = NULL
+                                    WHERE id = ANY($1::uuid[])
+                                      AND fact_type IN ('experience', 'world')
+                                    """,
+                                    other_source_uuids,
+                                )
+                            invalidated_obs = len(obs_ids)
+                            logger.info(
+                                f"[OBSERVATIONS] Deleted {invalidated_obs} observations, reset "
+                                f"{len(unit_ids)} document source memories and "
+                                f"{len(other_source_uuids)} co-source memories for re-consolidation "
+                                f"after document update on '{document_id}' in bank {bank_id}"
+                            )
+
+        if invalidated_obs > 0:
+            await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
+
+        return True
+
     async def delete_memory_unit(
         self,
         unit_id: str,
@@ -3923,6 +4164,7 @@ class MemoryEngine(MemoryEngineInterface):
         pool = await self._get_pool()
         invalidated_obs = 0
         result: dict[str, int] = {}
+        bank_internal_id: str | None = None
         async with acquire_with_retry(pool) as conn:
             # Ensure connection is not in read-only mode (can happen with connection poolers)
             await conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE")
@@ -3978,8 +4220,12 @@ class MemoryEngine(MemoryEngineInterface):
                         # Delete entities (cascades to unit_entities, entity_cooccurrences, memory_links with entity_id)
                         await conn.execute(f"DELETE FROM {fq_table('entities')} WHERE bank_id = $1", bank_id)
 
-                        # Delete the bank profile itself
-                        await conn.execute(f"DELETE FROM {fq_table('banks')} WHERE bank_id = $1", bank_id)
+                        # Delete the bank profile and retrieve internal_id for HNSW index cleanup
+                        internal_id = await conn.fetchval(
+                            f"DELETE FROM {fq_table('banks')} WHERE bank_id = $1 RETURNING internal_id", bank_id
+                        )
+                        if internal_id:
+                            bank_internal_id = str(internal_id)
 
                         result = {
                             "memory_units_deleted": units_count,
@@ -3990,6 +4236,12 @@ class MemoryEngine(MemoryEngineInterface):
 
                 except Exception as e:
                     raise Exception(f"Failed to delete agent data: {str(e)}")
+
+            # Drop per-bank HNSW indexes AFTER the transaction commits to avoid
+            # AccessExclusiveLock deadlocks with concurrent bank deletions.
+            # (DROP INDEX on memory_units conflicts with RowExclusiveLock from DELETE inside tx)
+            if bank_internal_id:
+                await bank_utils.drop_bank_hnsw_indexes(conn, bank_internal_id)
 
         if invalidated_obs > 0:
             await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
@@ -4739,7 +4991,11 @@ class MemoryEngine(MemoryEngineInterface):
                 "observation_scopes": row["observation_scopes"] if row["observation_scopes"] else None,
             }
 
-            # For observations, include source_memory_ids and fetch source_memories
+            # For observations, include source_memory_ids
+            # history is deprecated here - use GET /memories/{id}/history instead
+            if row["fact_type"] == "observation":
+                result["history"] = []
+
             if row["fact_type"] == "observation" and row["source_memory_ids"]:
                 source_ids = row["source_memory_ids"]
                 result["source_memory_ids"] = [str(sid) for sid in source_ids]
@@ -4767,6 +5023,95 @@ class MemoryEngine(MemoryEngineInterface):
                 ]
 
             return result
+
+    async def get_observation_history(
+        self,
+        bank_id: str,
+        memory_id: str,
+        request_context: "RequestContext",
+    ) -> list[dict] | None:
+        """
+        Get the history of an observation, with source facts resolved to their text.
+
+        Returns None if the memory is not found or is not an observation.
+        Returns a list of history entries (most recent first), each with source_facts resolved.
+        """
+        await self._authenticate_tenant(request_context)
+        if self._operation_validator:
+            from hindsight_api.extensions import BankReadContext
+
+            ctx = BankReadContext(bank_id=bank_id, operation="get_observation_history", request_context=request_context)
+            await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        pool = await self._get_pool()
+        async with acquire_with_retry(pool) as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT fact_type, history, source_memory_ids
+                FROM {fq_table("memory_units")}
+                WHERE id = $1 AND bank_id = $2
+                """,
+                uuid.UUID(memory_id),
+                bank_id,
+            )
+            if not row:
+                return None
+            if row["fact_type"] != "observation":
+                return []
+
+            raw_history = row["history"]
+            if isinstance(raw_history, str):
+                raw_history = json.loads(raw_history)
+            if not raw_history:
+                return []
+
+            # Collect all source memory IDs (current full set + all historical new ones)
+            current_source_ids: list[str] = [str(sid) for sid in (row["source_memory_ids"] or [])]
+            all_source_ids: set[uuid.UUID] = set(uuid.UUID(sid) for sid in current_source_ids)
+            for entry in raw_history:
+                for sid in entry.get("new_source_memory_ids", []):
+                    try:
+                        all_source_ids.add(uuid.UUID(sid))
+                    except (ValueError, AttributeError):
+                        pass
+
+            # Resolve all source memories in one query
+            source_map: dict[str, dict] = {}
+            if all_source_ids:
+                source_rows = await conn.fetch(
+                    f"""
+                    SELECT id, text, fact_type, context
+                    FROM {fq_table("memory_units")}
+                    WHERE id = ANY($1::uuid[])
+                    """,
+                    list(all_source_ids),
+                )
+                for r in source_rows:
+                    source_map[str(r["id"])] = {
+                        "id": str(r["id"]),
+                        "text": r["text"],
+                        "type": r["fact_type"],
+                        "context": r["context"] or None,
+                    }
+
+            # Reconstruct cumulative source IDs per change by working backwards from current state.
+            # Source IDs are only ever accumulated (never removed), so:
+            #   after_change_N = before_change_N + new_source_memory_ids_N
+            cumulative_ids: list[str] = list(current_source_ids)
+            enriched: list[dict] = []
+            for entry in reversed(raw_history):
+                new_ids_in_entry: set[str] = set(entry.get("new_source_memory_ids", []))
+                source_facts = []
+                for sid in cumulative_ids:
+                    fact = source_map.get(sid, {"id": sid, "text": None, "type": None, "context": None})
+                    source_facts.append({**fact, "is_new": sid in new_ids_in_entry})
+                enriched_entry = dict(entry)
+                enriched_entry["source_facts"] = source_facts
+                enriched.append(enriched_entry)
+                # Step back: remove the new IDs added by this change to get the prior state
+                cumulative_ids = [sid for sid in cumulative_ids if sid not in new_ids_in_entry]
+
+            enriched.reverse()
+            return enriched
 
     async def list_documents(
         self,
@@ -6300,6 +6645,39 @@ class MemoryEngine(MemoryEngineInterface):
 
         return result
 
+    async def get_mental_model_history(
+        self,
+        bank_id: str,
+        mental_model_id: str,
+        *,
+        request_context: "RequestContext",
+    ) -> list[dict] | None:
+        """Get the refresh history of a mental model.
+
+        Returns None if the mental model is not found.
+        Returns a list of history entries (most recent first), each with previous_content and changed_at.
+        """
+        await self._authenticate_tenant(request_context)
+        pool = await self._get_pool()
+        async with acquire_with_retry(pool) as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT history
+                FROM {fq_table("mental_models")}
+                WHERE bank_id = $1 AND id = $2
+                """,
+                bank_id,
+                mental_model_id,
+            )
+            if row is None:
+                return None
+            raw_history = row["history"]
+            if isinstance(raw_history, str):
+                raw_history = json.loads(raw_history)
+            if not raw_history:
+                return []
+            return list(reversed(raw_history))
+
     async def create_mental_model(
         self,
         bank_id: str,
@@ -6520,6 +6898,17 @@ class MemoryEngine(MemoryEngineInterface):
         pool = await self._get_pool()
 
         async with acquire_with_retry(pool) as conn:
+            # If content is changing, fetch current content first to record history
+            previous_content: str | None = None
+            if content is not None:
+                current_row = await conn.fetchrow(
+                    f"SELECT content FROM {fq_table('mental_models')} WHERE bank_id = $1 AND id = $2",
+                    bank_id,
+                    mental_model_id,
+                )
+                if current_row:
+                    previous_content = current_row["content"]
+
             # Build dynamic update
             updates = []
             params: list[Any] = [bank_id, mental_model_id]
@@ -6535,6 +6924,14 @@ class MemoryEngine(MemoryEngineInterface):
                 params.append(content)
                 param_idx += 1
                 updates.append("last_refreshed_at = NOW()")
+                # Record history entry with the previous content
+                if get_config().enable_mental_model_history:
+                    history_entry = json.dumps(
+                        [{"previous_content": previous_content, "changed_at": datetime.now(timezone.utc).isoformat()}]
+                    )
+                    updates.append(f"history = COALESCE(history, '[]'::jsonb) || ${param_idx}::jsonb")
+                    params.append(history_entry)
+                    param_idx += 1
                 # Also update embedding (convert to string for asyncpg vector type)
                 embedding_text = f"{name or ''} {content}"
                 embedding = await embedding_utils.generate_embeddings_batch(self.embeddings, [embedding_text])
@@ -6955,6 +7352,7 @@ class MemoryEngine(MemoryEngineInterface):
         bank_id: str,
         *,
         status: str | None = None,
+        task_type: str | None = None,
         limit: int = 20,
         offset: int = 0,
         request_context: "RequestContext",
@@ -6964,6 +7362,7 @@ class MemoryEngine(MemoryEngineInterface):
         Args:
             bank_id: Bank identifier
             status: Optional status filter (pending, completed, failed)
+            task_type: Optional operation type filter (retain, consolidation, etc.)
             limit: Maximum number of operations to return (default 20)
             offset: Number of operations to skip (default 0)
             request_context: Request context for authentication
@@ -6991,6 +7390,10 @@ class MemoryEngine(MemoryEngineInterface):
                 else:
                     where_conditions.append(f"status = ${len(params) + 1}")
                     params.append(status)
+
+            if task_type:
+                where_conditions.append(f"operation_type = ${len(params) + 1}")
+                params.append(task_type)
 
             where_clause = " AND ".join(where_conditions)
 
@@ -7222,6 +7625,64 @@ class MemoryEngine(MemoryEngineInterface):
                 "bank_id": bank_id,
             }
 
+    async def retry_operation(
+        self,
+        bank_id: str,
+        operation_id: str,
+        *,
+        request_context: "RequestContext",
+    ) -> dict[str, Any]:
+        """Re-queue a failed async operation."""
+        await self._authenticate_tenant(request_context)
+        from hindsight_api.extensions import OperationValidationError
+
+        if self._operation_validator:
+            from hindsight_api.extensions import BankWriteContext
+
+            ctx = BankWriteContext(bank_id=bank_id, operation="retry_operation", request_context=request_context)
+            await self._validate_operation(self._operation_validator.validate_bank_write(ctx))
+        pool = await self._get_pool()
+
+        op_uuid = uuid.UUID(operation_id)
+
+        async with acquire_with_retry(pool) as conn:
+            row = await conn.fetchrow(
+                f"SELECT bank_id, status FROM {fq_table('async_operations')} WHERE operation_id = $1 AND bank_id = $2",
+                op_uuid,
+                bank_id,
+            )
+
+            if not row:
+                raise ValueError(f"Operation {operation_id} not found for bank {bank_id}")
+
+            if row["status"] != "failed":
+                raise OperationValidationError(
+                    f"Operation {operation_id} cannot be retried: status is '{row['status']}', expected 'failed'",
+                    409,
+                )
+
+            await conn.execute(
+                f"""
+                UPDATE {fq_table("async_operations")}
+                SET status = 'pending',
+                    error_message = NULL,
+                    completed_at = NULL,
+                    next_retry_at = NULL,
+                    worker_id = NULL,
+                    claimed_at = NULL,
+                    retry_count = 0,
+                    updated_at = NOW()
+                WHERE operation_id = $1
+                """,
+                op_uuid,
+            )
+
+            return {
+                "success": True,
+                "message": f"Operation {operation_id} queued for retry",
+                "operation_id": operation_id,
+            }
+
     async def update_bank(
         self,
         bank_id: str,
@@ -7427,6 +7888,10 @@ class MemoryEngine(MemoryEngineInterface):
         parent_operation_id = uuid.uuid4()
         pool = await self._get_pool()
 
+        # Ensure the bank row exists before inserting async_operations (which now has a FK).
+        # Banks are created lazily on first retain, but the FK requires the row to exist first.
+        await bank_utils.get_bank_profile(pool, bank_id)
+
         # Create typed metadata for parent operation
         parent_metadata = BatchRetainParentMetadata(
             items_count=len(contents),
@@ -7493,7 +7958,6 @@ class MemoryEngine(MemoryEngineInterface):
         self,
         bank_id: str,
         file_items: list[dict[str, Any]],
-        parser: str,
         document_tags: list[str] | None,
         request_context: "RequestContext",
     ) -> dict[str, Any]:
@@ -7512,7 +7976,7 @@ class MemoryEngine(MemoryEngineInterface):
                 - metadata: Optional metadata dict
                 - tags: Optional tags list
                 - timestamp: Optional timestamp
-            parser: Parser name (e.g., "markitdown")
+                - parser: Ordered list of parser names to try (fallback chain)
             document_tags: Tags applied to all documents
             request_context: Request context for authentication
 
@@ -7568,7 +8032,7 @@ class MemoryEngine(MemoryEngineInterface):
                 "storage_key": storage_key,
                 "original_filename": file.filename,
                 "content_type": file.content_type or "application/octet-stream",
-                "parser": parser,
+                "parser": item["parser"],
                 "context": item.get("context"),
                 "metadata": item.get("metadata", {}),
                 "tags": item.get("tags", []),

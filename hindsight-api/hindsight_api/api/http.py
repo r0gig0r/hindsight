@@ -71,9 +71,7 @@ def FieldWithDefault(default_factory: Callable, **kwargs) -> Any:
 
 
 from hindsight_api.config import get_config
-from hindsight_api.engine.db_utils import acquire_with_retry
-from hindsight_api.engine.memory_engine import Budget, _get_tiktoken_encoding, fq_table
-from hindsight_api.engine.reflect.observations import Observation
+from hindsight_api.engine.memory_engine import Budget, _current_schema, _get_tiktoken_encoding, fq_table
 from hindsight_api.engine.response_models import VALID_RECALL_FACT_TYPES, MemoryFact, TokenUsage
 from hindsight_api.engine.search.tags import TagsMatch
 from hindsight_api.extensions import HttpExtension, OperationValidationError, load_extension
@@ -81,8 +79,6 @@ from hindsight_api.metrics import create_metrics_collector, get_metrics_collecto
 from hindsight_api.models import RequestContext
 
 logger = logging.getLogger(__name__)
-
-MAX_QUERY_TOKENS = 500  # Maximum tokens allowed in recall query
 
 
 class EntityIncludeOptions(BaseModel):
@@ -100,7 +96,12 @@ class ChunkIncludeOptions(BaseModel):
 class SourceFactsIncludeOptions(BaseModel):
     """Options for including source facts for observation-type results."""
 
-    max_tokens: int = Field(default=4096, description="Maximum tokens for source facts")
+    max_tokens: int = Field(
+        default=4096, description="Maximum total tokens for source facts across all observations (-1 = unlimited)"
+    )
+    max_tokens_per_observation: int = Field(
+        default=-1, description="Maximum tokens of source facts per observation (-1 = unlimited)"
+    )
 
 
 class IncludeOptions(BaseModel):
@@ -474,6 +475,11 @@ class FileRetainMetadata(BaseModel):
     metadata: dict[str, Any] | None = Field(default=None, description="Additional metadata")
     tags: list[str] | None = Field(default=None, description="Tags for this file")
     timestamp: str | None = Field(default=None, description="ISO timestamp")
+    parser: str | list[str] | None = Field(
+        default=None,
+        description="Parser or ordered fallback chain for this file (overrides request-level parser). "
+        "E.g. 'iris' or ['iris', 'markitdown'].",
+    )
 
 
 class FileRetainRequest(BaseModel):
@@ -482,14 +488,21 @@ class FileRetainRequest(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
+                "parser": "iris",
                 "files_metadata": [
                     {"document_id": "report_2024", "tags": ["quarterly"]},
-                    {"context": "meeting notes"},
+                    {"context": "meeting notes", "parser": ["iris", "markitdown"]},
                 ],
             }
         }
     )
 
+    parser: str | list[str] | None = Field(
+        default=None,
+        description="Default parser or ordered fallback chain for all files in this request. "
+        "E.g. 'markitdown' or ['iris', 'markitdown']. Falls back to server default if not set. "
+        "Per-file 'parser' in files_metadata takes precedence over this value.",
+    )
     files_metadata: list[FileRetainMetadata] | None = Field(
         default=None,
         description="Metadata for each file (optional, must match number of files if provided)",
@@ -757,14 +770,6 @@ class ReflectResponse(BaseModel):
         default=None,
         description="Execution trace of tool and LLM calls. Only present when include.tool_calls is set.",
     )
-
-
-class BanksResponse(BaseModel):
-    """Response model for banks list endpoint."""
-
-    model_config = ConfigDict(json_schema_extra={"example": {"banks": ["user123", "bank_alice", "bank_bob"]}})
-
-    banks: list[str]
 
 
 class DispositionTraits(BaseModel):
@@ -1199,6 +1204,30 @@ class DocumentResponse(BaseModel):
     tags: list[str] = FieldWithDefault(list, description="Tags associated with this document")
 
 
+class UpdateDocumentRequest(BaseModel):
+    """Request model for updating a document's mutable fields."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "tags": ["team-a", "team-b"],
+            }
+        }
+    )
+
+    tags: list[str] | None = Field(
+        default=None,
+        description="New tags for the document and its memory units. "
+        "Triggers observation invalidation and re-consolidation.",
+    )
+
+
+class UpdateDocumentResponse(BaseModel):
+    """Response model for update document endpoint."""
+
+    success: bool = True
+
+
 class DeleteDocumentResponse(BaseModel):
     """Response model for delete document endpoint."""
 
@@ -1303,15 +1332,6 @@ class BankStatsResponse(BaseModel):
 
 
 # Mental Model models
-
-
-class ObservationEvidenceResponse(BaseModel):
-    """A single piece of evidence supporting an observation."""
-
-    memory_id: str = Field(description="ID of the memory unit this evidence comes from")
-    quote: str = Field(description="Exact quote from the memory supporting the observation")
-    relevance: str = Field(description="Brief explanation of how this quote supports the observation")
-    timestamp: str = Field(description="When the source memory was created (ISO format)")
 
 
 # =========================================================================
@@ -1526,6 +1546,24 @@ class CancelOperationResponse(BaseModel):
             "example": {
                 "success": True,
                 "message": "Operation 550e8400-e29b-41d4-a716-446655440000 cancelled",
+                "operation_id": "550e8400-e29b-41d4-a716-446655440000",
+            }
+        }
+    )
+
+    success: bool
+    message: str
+    operation_id: str
+
+
+class RetryOperationResponse(BaseModel):
+    """Response model for retry operation endpoint."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "success": True,
+                "message": "Operation 550e8400-e29b-41d4-a716-446655440000 queued for retry",
                 "operation_id": "550e8400-e29b-41d4-a716-446655440000",
             }
         }
@@ -2139,7 +2177,7 @@ def _register_routes(app: FastAPI):
     @app.get(
         "/v1/default/banks/{bank_id}/memories/{memory_id}",
         summary="Get memory unit",
-        description="Get a single memory unit by ID with all its metadata including entities and tags.",
+        description="Get a single memory unit by ID with all its metadata including entities and tags. Note: the 'history' field is deprecated and always returns an empty list - use GET /memories/{memory_id}/history instead.",
         operation_id="get_memory",
         tags=["Memory"],
     )
@@ -2169,6 +2207,39 @@ def _register_routes(app: FastAPI):
             logger.error(f"Error in /v1/default/banks/{bank_id}/memories/{memory_id}: {error_detail}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    @app.get(
+        "/v1/default/banks/{bank_id}/memories/{memory_id}/history",
+        summary="Get observation history",
+        description="Get the full history of an observation, with each change's source facts resolved to their text.",
+        operation_id="get_observation_history",
+        tags=["Memory"],
+    )
+    async def api_get_observation_history(
+        bank_id: str,
+        memory_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Get the history of a single observation by ID."""
+        try:
+            data = await app.state.memory.get_observation_history(
+                bank_id=bank_id,
+                memory_id=memory_id,
+                request_context=request_context,
+            )
+            if data is None:
+                raise HTTPException(status_code=404, detail=f"Memory unit '{memory_id}' not found")
+            return data
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in /v1/default/banks/{bank_id}/memories/{memory_id}/history: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
     @app.post(
         "/v1/default/banks/{bank_id}/memories/recall",
         response_model=RecallResponse,
@@ -2190,12 +2261,13 @@ def _register_routes(app: FastAPI):
         metrics = get_metrics_collector()
 
         # Validate query length to prevent expensive operations on oversized queries
+        max_query_tokens = get_config().recall_max_query_tokens
         encoding = _get_tiktoken_encoding()
         query_tokens = len(encoding.encode(request.query))
-        if query_tokens > MAX_QUERY_TOKENS:
+        if query_tokens > max_query_tokens:
             raise HTTPException(
                 status_code=400,
-                detail=f"Query too long: {query_tokens} tokens exceeds maximum of {MAX_QUERY_TOKENS}. Please shorten your query.",
+                detail=f"Query too long: {query_tokens} tokens exceeds maximum of {max_query_tokens}. Please shorten your query.",
             )
 
         try:
@@ -2224,6 +2296,9 @@ def _register_routes(app: FastAPI):
             # Determine source facts inclusion settings
             include_source_facts = request.include.source_facts is not None
             max_source_facts_tokens = request.include.source_facts.max_tokens if include_source_facts else 4096
+            max_source_facts_tokens_per_observation = (
+                request.include.source_facts.max_tokens_per_observation if include_source_facts else -1
+            )
 
             pre_recall = time.time() - handler_start
             # Run recall with tracing (record metrics)
@@ -2245,6 +2320,7 @@ def _register_routes(app: FastAPI):
                     max_chunk_tokens=max_chunk_tokens,
                     include_source_facts=include_source_facts,
                     max_source_facts_tokens=max_source_facts_tokens,
+                    max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,
                     request_context=request_context,
                     tags=request.tags,
                     tags_match=request.tags_match,
@@ -2804,6 +2880,41 @@ def _register_routes(app: FastAPI):
             logger.error(f"Error in GET /v1/default/banks/{bank_id}/mental-models/{mental_model_id}: {error_detail}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    @app.get(
+        "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/history",
+        summary="Get mental model history",
+        description="Get the refresh history of a mental model, showing content changes over time.",
+        operation_id="get_mental_model_history",
+        tags=["Mental Models"],
+    )
+    async def api_get_mental_model_history(
+        bank_id: str,
+        mental_model_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Get the refresh history of a mental model."""
+        try:
+            data = await app.state.memory.get_mental_model_history(
+                bank_id=bank_id,
+                mental_model_id=mental_model_id,
+                request_context=request_context,
+            )
+            if data is None:
+                raise HTTPException(status_code=404, detail=f"Mental model '{mental_model_id}' not found")
+            return data
+        except (AuthenticationError, HTTPException):
+            raise
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(
+                f"Error in GET /v1/default/banks/{bank_id}/mental-models/{mental_model_id}/history: {error_detail}"
+            )
+            raise HTTPException(status_code=500, detail=str(e))
+
     @app.post(
         "/v1/default/banks/{bank_id}/mental-models",
         response_model=CreateMentalModelResponse,
@@ -3325,6 +3436,55 @@ def _register_routes(app: FastAPI):
             logger.error(f"Error in /v1/default/chunks/{chunk_id}: {error_detail}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    @app.patch(
+        "/v1/default/banks/{bank_id}/documents/{document_id:path}",
+        response_model=UpdateDocumentResponse,
+        summary="Update document",
+        description="Update mutable fields on a document without re-processing its content.\n\n"
+        "**Tags** (`tags`): Propagated to all associated memory units. Observations derived from "
+        "those units are invalidated and queued for re-consolidation under the new tags. "
+        "Co-source memories from other documents that shared those observations are also reset.\n\n"
+        "At least one field must be provided.",
+        operation_id="update_document",
+        tags=["Documents"],
+    )
+    async def api_update_document(
+        bank_id: str,
+        document_id: str,
+        body: UpdateDocumentRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """
+        Update mutable fields on a document without re-processing its content.
+
+        Args:
+            bank_id: Memory Bank ID (from path)
+            document_id: Document ID (from path)
+            body: Fields to update (tags, metadata, context)
+        """
+        if body.tags is None:
+            raise HTTPException(status_code=422, detail="At least one field (tags) must be provided")
+        try:
+            result = await app.state.memory.update_document(
+                document_id,
+                bank_id,
+                tags=body.tags,
+                request_context=request_context,
+            )
+            if not result:
+                raise HTTPException(status_code=404, detail="Document not found")
+            return UpdateDocumentResponse(success=True)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in PATCH /v1/default/banks/{bank_id}/documents/{document_id}: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
     @app.delete(
         "/v1/default/banks/{bank_id}/documents/{document_id:path}",
         response_model=DeleteDocumentResponse,
@@ -3375,13 +3535,17 @@ def _register_routes(app: FastAPI):
         "/v1/default/banks/{bank_id}/operations",
         response_model=OperationsListResponse,
         summary="List async operations",
-        description="Get a list of async operations for a specific agent, with optional filtering by status. Results are sorted by most recent first.",
+        description="Get a list of async operations for a specific agent, with optional filtering by status and operation type. Results are sorted by most recent first.",
         operation_id="list_operations",
         tags=["Operations"],
     )
     async def api_list_operations(
         bank_id: str,
         status: str | None = Query(default=None, description="Filter by status: pending, completed, or failed"),
+        type: str | None = Query(
+            default=None,
+            description="Filter by operation type: retain, consolidation, refresh_mental_model, file_convert_retain, webhook_delivery",
+        ),
         limit: int = Query(default=20, ge=1, le=100, description="Maximum number of operations to return"),
         offset: int = Query(default=0, ge=0, description="Number of operations to skip"),
         request_context: RequestContext = Depends(get_request_context),
@@ -3389,7 +3553,7 @@ def _register_routes(app: FastAPI):
         """List async operations for a memory bank with optional filtering and pagination."""
         try:
             result = await app.state.memory.list_operations(
-                bank_id, status=status, limit=limit, offset=offset, request_context=request_context
+                bank_id, status=status, task_type=type, limit=limit, offset=offset, request_context=request_context
             )
             return OperationsListResponse(
                 bank_id=bank_id,
@@ -3474,6 +3638,39 @@ def _register_routes(app: FastAPI):
 
             error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.error(f"Error in /v1/default/banks/{bank_id}/operations/{operation_id}: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/operations/{operation_id}/retry",
+        response_model=RetryOperationResponse,
+        summary="Retry a failed async operation",
+        description="Re-queue a failed async operation so the worker picks it up again",
+        operation_id="retry_operation",
+        tags=["Operations"],
+    )
+    async def api_retry_operation(
+        bank_id: str, operation_id: str, request_context: RequestContext = Depends(get_request_context)
+    ):
+        """Retry a failed async operation."""
+        try:
+            try:
+                uuid.UUID(operation_id)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid operation_id format: {operation_id}")
+
+            result = await app.state.memory.retry_operation(bank_id, operation_id, request_context=request_context)
+            return RetryOperationResponse(**result)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in POST /v1/default/banks/{bank_id}/operations/{operation_id}/retry: {error_detail}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get(
@@ -3985,6 +4182,10 @@ def _register_routes(app: FastAPI):
         try:
             pool = await app.state.memory._get_pool()
             from hindsight_api.engine.memory_engine import fq_table
+            from hindsight_api.engine.retain import bank_utils
+
+            # Ensure the bank row exists before inserting into webhooks (FK constraint).
+            await bank_utils.get_bank_profile(pool, bank_id)
 
             webhook_id = uuid.uuid4()
             now = datetime.utcnow().isoformat() + "Z"
@@ -4371,7 +4572,7 @@ def _register_routes(app: FastAPI):
                             bank_id=bank_id,
                             contents=contents,
                             operation_id=None,
-                            schema=request_context.tenant_id,
+                            schema=_current_schema.get(),
                         ),
                     )
 
@@ -4422,8 +4623,14 @@ def _register_routes(app: FastAPI):
         "Use the operations endpoint to monitor progress.\n\n"
         "**Request format:** multipart/form-data with:\n"
         "- `files`: One or more files to upload\n"
-        "- `request`: JSON string with FileRetainRequest model (files_metadata)\n\n"
-        "**Note:** File parser is configured server-side via `HINDSIGHT_API_FILE_PARSER` (default: markitdown).",
+        "- `request`: JSON string with FileRetainRequest model\n\n"
+        "**Parser selection:**\n"
+        "- Set `parser` in the request body to override the server default for all files.\n"
+        "- Set `parser` inside a `files_metadata` entry for per-file control.\n"
+        "- Pass a list (e.g. `['iris', 'markitdown']`) to define an ordered fallback chain — "
+        "each parser is tried in sequence until one succeeds.\n"
+        "- Falls back to the server default (`HINDSIGHT_API_FILE_PARSER`) if not specified.\n"
+        "- Only parsers enabled on the server may be requested; others return HTTP 400.",
         operation_id="file_retain",
         tags=["Files"],
     )
@@ -4469,20 +4676,39 @@ def _register_routes(app: FastAPI):
                     detail=f"files_metadata count ({len(request_data.files_metadata)}) must match files count ({len(files)})",
                 )
 
+            # Resolve the registered parser names for allowlist validation
+            registered_parsers = app.state.memory._parser_registry.list_parsers()
+            allowlist = config.file_parser_allowlist if config.file_parser_allowlist is not None else registered_parsers
+
+            def _resolve_parser(raw: str | list[str] | None) -> list[str]:
+                """Normalize parser value to a non-empty list of names."""
+                if raw is None:
+                    return config.file_parser
+                return [raw] if isinstance(raw, str) else list(raw)
+
+            def _validate_parsers(parsers: list[str], context: str) -> None:
+                """Raise HTTP 400 if any parser name is not in the allowlist."""
+                disallowed = [p for p in parsers if p not in allowlist]
+                if disallowed:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Parser(s) not available ({context}): {disallowed}. Available: {allowlist}",
+                    )
+
+            # Validate request-level parser early (before reading files)
+            if request_data.parser is not None:
+                _validate_parsers(_resolve_parser(request_data.parser), "request-level parser")
+
             # Prepare file items and calculate total batch size
+            import io
+
             file_items = []
             total_batch_size = 0
 
             for i, file in enumerate(files):
                 # Read file content to check size
                 file_content = await file.read()
-                size = len(file_content)
-                total_batch_size += size
-
-                # Create a temporary file-like object from the bytes
-                import io
-
-                file_obj = io.BytesIO(file_content)
+                total_batch_size += len(file_content)
 
                 # Create a mock UploadFile with the necessary attributes
                 class FileWrapper:
@@ -4490,7 +4716,6 @@ def _register_routes(app: FastAPI):
                         self._content = content
                         self.filename = filename
                         self.content_type = content_type
-                        self._buffer = io.BytesIO(content)
 
                     async def read(self):
                         return self._content
@@ -4501,6 +4726,12 @@ def _register_routes(app: FastAPI):
                 file_meta = request_data.files_metadata[i] if request_data.files_metadata else FileRetainMetadata()
                 doc_id = file_meta.document_id or f"file_{uuid.uuid4()}"
 
+                # Resolve and validate per-file parser chain
+                # Priority: per-file > request-level > server default
+                raw_parser = file_meta.parser if file_meta.parser is not None else request_data.parser
+                parser_chain = _resolve_parser(raw_parser)
+                _validate_parsers(parser_chain, f"file '{file.filename}'")
+
                 item = {
                     "file": wrapped_file,
                     "document_id": doc_id,
@@ -4508,6 +4739,7 @@ def _register_routes(app: FastAPI):
                     "metadata": file_meta.metadata or {},
                     "tags": file_meta.tags or [],
                     "timestamp": file_meta.timestamp,
+                    "parser": parser_chain,
                 }
                 file_items.append(item)
 
@@ -4522,7 +4754,6 @@ def _register_routes(app: FastAPI):
             result = await app.state.memory.submit_async_file_retain(
                 bank_id=bank_id,
                 file_items=file_items,
-                parser=config.file_parser,
                 document_tags=None,
                 request_context=request_context,
             )

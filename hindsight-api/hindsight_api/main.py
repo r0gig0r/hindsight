@@ -246,6 +246,7 @@ def main():
             mpfp_top_k_neighbors=config.mpfp_top_k_neighbors,
             recall_max_concurrent=config.recall_max_concurrent,
             recall_connection_budget=config.recall_connection_budget,
+            recall_max_query_tokens=config.recall_max_query_tokens,
             retain_max_completion_tokens=config.retain_max_completion_tokens,
             retain_chunk_size=config.retain_chunk_size,
             retain_extract_causal_links=config.retain_extract_causal_links,
@@ -268,6 +269,7 @@ def main():
             file_storage_azure_account_name=config.file_storage_azure_account_name,
             file_storage_azure_account_key=config.file_storage_azure_account_key,
             file_parser=config.file_parser,
+            file_parser_allowlist=config.file_parser_allowlist,
             file_parser_iris_token=config.file_parser_iris_token,
             file_parser_iris_org_id=config.file_parser_iris_org_id,
             file_conversion_max_batch_size_mb=config.file_conversion_max_batch_size_mb,
@@ -275,9 +277,13 @@ def main():
             enable_file_upload_api=config.enable_file_upload_api,
             file_delete_after_retain=config.file_delete_after_retain,
             enable_observations=config.enable_observations,
+            enable_observation_history=config.enable_observation_history,
+            enable_mental_model_history=config.enable_mental_model_history,
             consolidation_batch_size=config.consolidation_batch_size,
             consolidation_llm_batch_size=config.consolidation_llm_batch_size,
             consolidation_max_tokens=config.consolidation_max_tokens,
+            consolidation_source_facts_max_tokens=config.consolidation_source_facts_max_tokens,
+            consolidation_source_facts_max_tokens_per_observation=config.consolidation_source_facts_max_tokens_per_observation,
             observations_mission=config.observations_mission,
             entity_labels=config.entity_labels,
             entities_allow_free_form=config.entities_allow_free_form,
@@ -396,6 +402,7 @@ def main():
         "ws": "wsproto",  # Use wsproto instead of websockets to avoid deprecation warnings
         "loop": loop_impl,  # Explicitly set event loop implementation
         "timeout_keep_alive": 30,  # Exceed aiohttp's 15s client timeout so the client always closes first
+        "timeout_graceful_shutdown": 5,  # Cap graceful shutdown at 5s; also enables force-kill on second Ctrl+C
     }
 
     # Add optional parameters if provided
