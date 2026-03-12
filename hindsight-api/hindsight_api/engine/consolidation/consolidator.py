@@ -962,6 +962,30 @@ def _build_observations_for_llm(
     return obs_list
 
 
+def _is_duplicate_create(text: str, prior_creates: list[dict[str, str]], threshold: float = 0.65) -> bool:
+    """Check if a create action duplicates an already-accumulated observation.
+
+    Uses Jaccard word overlap — lightweight and effective for the kind of
+    near-duplicates that single-fact mode produces (same topic, slightly
+    different wording).  Threshold 0.65 catches "Igor prefers X" vs
+    "Igor likes X" while allowing genuinely different observations.
+    """
+    if not prior_creates:
+        return False
+    words_new = set(text.lower().split())
+    if not words_new:
+        return False
+    for pc in prior_creates:
+        words_existing = set(pc["text"].lower().split())
+        if not words_existing:
+            continue
+        intersection = words_new & words_existing
+        union = words_new | words_existing
+        if len(intersection) / len(union) > threshold:
+            return True
+    return False
+
+
 async def _consolidate_batch_with_llm(
     llm_config: Any,
     memories: list[dict[str, Any]],
@@ -980,6 +1004,10 @@ async def _consolidate_batch_with_llm(
         all_deletes: list[_DeleteAction] = []
         total_obs = 0
         total_chars = 0
+        # Track observations created within this batch so subsequent facts
+        # see them in context and can UPDATE instead of creating duplicates.
+        prior_creates: list[dict[str, str]] = []
+        skipped_dup_creates = 0
         for memory in memories:
             result = await _consolidate_single_fact_with_llm(
                 llm_config=llm_config,
@@ -987,12 +1015,21 @@ async def _consolidate_batch_with_llm(
                 observations=union_observations,
                 source_facts=union_source_facts,
                 config=config,
+                prior_creates=prior_creates,
             )
-            all_creates.extend(result.creates)
+            # Dedup creates against already-accumulated creates (word-overlap safety net).
+            for create in result.creates:
+                if _is_duplicate_create(create.text, prior_creates):
+                    skipped_dup_creates += 1
+                    continue
+                all_creates.append(create)
+                prior_creates.append({"id": f"pending-{len(prior_creates)}", "text": create.text})
             all_updates.extend(result.updates)
             all_deletes.extend(result.deletes)
             total_obs += result.obs_count
             total_chars += result.prompt_chars
+        if skipped_dup_creates:
+            logger.info(f"[CONSOLIDATION] Single-fact dedup skipped {skipped_dup_creates} duplicate creates")
         return _BatchLLMResult(
             creates=all_creates,
             updates=all_updates,
@@ -1059,9 +1096,20 @@ async def _consolidate_single_fact_with_llm(
     observations: "list[MemoryFact]",
     source_facts: "dict[str, MemoryFact]",
     config: Any = None,
+    prior_creates: list[dict[str, str]] | None = None,
 ) -> _BatchLLMResult:
-    """Single-fact LLM call with simpler prompt for weaker models."""
+    """Single-fact LLM call with simpler prompt for weaker models.
+
+    Args:
+        prior_creates: Observations created by earlier facts in the same batch,
+            injected as pseudo-observations so the LLM can update them instead
+            of creating duplicates. Each dict has ``id`` and ``text`` keys.
+    """
     obs_list = _build_observations_for_llm(observations, source_facts) if observations else []
+    # Inject observations created by earlier facts in this batch so the LLM
+    # sees them and can UPDATE instead of creating near-duplicates.
+    if prior_creates:
+        obs_list.extend(prior_creates)
     observations_text = json.dumps(obs_list, indent=2) if obs_list else "[]"
 
     observations_mission = config.observations_mission if config else None
