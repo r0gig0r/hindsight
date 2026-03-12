@@ -2444,11 +2444,12 @@ def _register_routes(app: FastAPI):
         metrics = get_metrics_collector()
 
         encoding = _get_tiktoken_encoding()
+        max_query_tokens = get_config().recall_max_query_tokens
         query_tokens = len(encoding.encode(request.query))
-        if query_tokens > MAX_QUERY_TOKENS:
+        if query_tokens > max_query_tokens:
             raise HTTPException(
                 status_code=400,
-                detail=f"Query too long: {query_tokens} tokens exceeds maximum of {MAX_QUERY_TOKENS}.",
+                detail=f"Query too long: {query_tokens} tokens exceeds maximum of {max_query_tokens}. Please shorten your query.",
             )
 
         try:
