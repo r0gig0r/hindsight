@@ -9,6 +9,31 @@ Hindsight is an agent memory system that provides long-term memory for AI agents
 - **Experience facts**: Personal experiences ("I visited Paris in 2023")
 - **Mental models**: Consolidated knowledge synthesized from facts ("User prefers functional programming patterns")
 
+## Fork Customizations (PROTECT DURING UPSTREAM MERGES)
+
+This is a fork of `vectorize-io/hindsight`. The following files contain critical fork customizations
+that upstream may remove or break during merges. **Always verify these survive after any merge:**
+
+| File | Customization | Why |
+|------|--------------|-----|
+| `hindsight-api/.../retain/orchestrator.py` | `duplicate_checker_fn` parameter + `[4] Deduplication` step | Upstream removed inline dedup (commit `5eb484fb`). Without it, ~10K duplicates/day are created. The nightly cron catches them but wastes storage, LLM tokens, and degrades recall during the day. |
+| `hindsight-api/.../retain/deduplication.py` | Within-batch dedup + time-bucketed DB dedup | Must be imported by orchestrator. If orchestrator is refactored, re-wire the import. |
+| `hindsight-api/.../engine/memory_engine.py` | `_find_duplicate_facts_batch` + global dedup fallback, passed as `duplicate_checker_fn` to orchestrator | Upstream removed the call site. Ensure the function still exists and is passed to `retain_batch()`. |
+| `hindsight-api/.../engine/memory_engine.py` | FallbackLLMProvider wiring (primary LLM) | Primary Codex LLM with circuit breaker fallback to OpenRouter. |
+| `hindsight-api/.../engine/providers/fallback_llm.py` | FallbackLLMProvider + CircuitBreaker | Fork-only file. |
+| `hindsight-api/.../engine/providers/codex_llm.py` | Codex OAuth LLM provider | Fork-only file. |
+| `hindsight-integrations/openclaw/src/index.ts` | HTTP daemon mode, recall_exp with fallback, Jaccard dedup + compact formatting | Multiple fork customizations in the plugin entry point. |
+
+**Post-merge verification:**
+```bash
+# 1. Dedup is wired in
+grep "duplicate_checker_fn" hindsight-api/hindsight_api/engine/retain/orchestrator.py
+# 2. Dedup module is imported
+grep "from .deduplication import" hindsight-api/hindsight_api/engine/retain/orchestrator.py
+# 3. Memory engine passes the checker
+grep "duplicate_checker_fn=self._find_duplicate_facts_batch" hindsight-api/hindsight_api/engine/memory_engine.py
+```
+
 ## Development Commands
 
 ### API Server (Python/FastAPI)

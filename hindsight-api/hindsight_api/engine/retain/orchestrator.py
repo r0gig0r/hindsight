@@ -64,6 +64,7 @@ from . import (
     fact_storage,
     link_creation,
 )
+from .deduplication import check_duplicates_batch, filter_duplicates
 from .types import EntityLink, ExtractedFact, ProcessedFact, RetainContent, RetainContentDict
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,7 @@ async def retain_batch(
     operation_id: str | None = None,
     schema: str | None = None,
     outbox_callback: Callable[["asyncpg.Connection"], Awaitable[None]] | None = None,
+    duplicate_checker_fn: Callable | None = None,
 ) -> tuple[list[list[str]], TokenUsage]:
     """
     Process a batch of content through the retain pipeline.
@@ -104,6 +106,9 @@ async def retain_batch(
         fact_type_override: Override fact type for all facts
         confidence_score: Confidence score for opinions
         document_tags: Tags applied to all items in this batch
+        duplicate_checker_fn: Async function for checking duplicates against DB
+            (FORK CUSTOMIZATION — upstream removed inline dedup, but without it
+            we generate ~10K duplicates/day that the nightly cron must clean up)
 
     Returns:
         Tuple of (unit ID lists, token usage for fact extraction)
@@ -445,7 +450,21 @@ async def retain_batch(
                             actual_doc_id = document_id
                         processed_fact.document_id = actual_doc_id
 
+                # [FORK] Step 4: Deduplication — check for duplicates against DB + within-batch
+                # Upstream removed this in 5eb484fb but without it we generate ~10K duplicates/day.
+                # The nightly dedup cron catches them but it wastes storage, LLM tokens on
+                # consolidation, and degrades recall quality during the day.
                 non_duplicate_facts = processed_facts
+                if duplicate_checker_fn and processed_facts:
+                    step_start = time.time()
+                    is_duplicate = await check_duplicates_batch(
+                        conn, bank_id, processed_facts, duplicate_checker_fn
+                    )
+                    non_duplicate_facts = filter_duplicates(processed_facts, is_duplicate)
+                    dup_count = len(processed_facts) - len(non_duplicate_facts)
+                    log_buffer.append(
+                        f"[4] Deduplication: {dup_count} duplicates in {time.time() - step_start:.3f}s"
+                    )
 
                 # Insert facts (document_id is now stored per-fact)
                 step_start = time.time()

@@ -2418,6 +2418,7 @@ class MemoryEngine(MemoryEngineInterface):
                     operation_id=operation_id,
                     schema=_current_schema.get(),
                     outbox_callback=outbox_callback,
+                    duplicate_checker_fn=self._find_duplicate_facts_batch,
                 )
 
     def recall(
