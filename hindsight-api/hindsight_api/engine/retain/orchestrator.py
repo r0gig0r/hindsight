@@ -455,16 +455,13 @@ async def retain_batch(
                 # The nightly dedup cron catches them but it wastes storage, LLM tokens on
                 # consolidation, and degrades recall quality during the day.
                 non_duplicate_facts = processed_facts
+                is_duplicate_flags: list[bool] | None = None
                 if duplicate_checker_fn and processed_facts:
                     step_start = time.time()
-                    is_duplicate = await check_duplicates_batch(
-                        conn, bank_id, processed_facts, duplicate_checker_fn
-                    )
-                    non_duplicate_facts = filter_duplicates(processed_facts, is_duplicate)
+                    is_duplicate_flags = await check_duplicates_batch(conn, bank_id, processed_facts, duplicate_checker_fn)
+                    non_duplicate_facts = filter_duplicates(processed_facts, is_duplicate_flags)
                     dup_count = len(processed_facts) - len(non_duplicate_facts)
-                    log_buffer.append(
-                        f"[4] Deduplication: {dup_count} duplicates in {time.time() - step_start:.3f}s"
-                    )
+                    log_buffer.append(f"[4] Deduplication: {dup_count} duplicates in {time.time() - step_start:.3f}s")
 
                 # Insert facts (document_id is now stored per-fact)
                 step_start = time.time()
@@ -516,7 +513,7 @@ async def retain_batch(
                 log_buffer.append(f"[10] Causal links: {causal_link_count} links in {time.time() - step_start:.3f}s")
 
                 # Map results back to original content items
-                result_unit_ids = _map_results_to_contents(contents, extracted_facts, unit_ids)
+                result_unit_ids = _map_results_to_contents(contents, extracted_facts, unit_ids, is_duplicate_flags)
 
                 # Transactional outbox: queue any side-effect tasks (e.g. webhook deliveries)
                 # inside the same transaction so they are atomically committed with the retain data.
@@ -545,8 +542,13 @@ def _map_results_to_contents(
     contents: list[RetainContent],
     extracted_facts: list[ExtractedFact],
     unit_ids: list[str],
+    is_duplicate_flags: list[bool] | None = None,
 ) -> list[list[str]]:
-    """Map created unit IDs back to original content items."""
+    """Map created unit IDs back to original content items.
+
+    When is_duplicate_flags is provided (from dedup step), skips facts
+    that were marked as duplicates since they have no corresponding unit_id.
+    """
     facts_by_content: dict[int, list[int]] = {i: [] for i in range(len(contents))}
     for i, fact in enumerate(extracted_facts):
         facts_by_content[fact.content_index].append(i)
@@ -555,7 +557,10 @@ def _map_results_to_contents(
     unit_idx = 0
     for content_index in range(len(contents)):
         content_unit_ids = []
-        for _ in facts_by_content[content_index]:
+        for fact_idx in facts_by_content[content_index]:
+            # Skip facts that were filtered as duplicates — they have no unit_id
+            if is_duplicate_flags and is_duplicate_flags[fact_idx]:
+                continue
             content_unit_ids.append(unit_ids[unit_idx])
             unit_idx += 1
         result_unit_ids.append(content_unit_ids)
