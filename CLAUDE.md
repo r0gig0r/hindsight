@@ -16,22 +16,29 @@ that upstream may remove or break during merges. **Always verify these survive a
 
 | File | Customization | Why |
 |------|--------------|-----|
-| `hindsight-api/.../retain/orchestrator.py` | `duplicate_checker_fn` parameter + `[4] Deduplication` step | Upstream removed inline dedup (commit `5eb484fb`). Without it, ~10K duplicates/day are created. The nightly cron catches them but wastes storage, LLM tokens, and degrades recall during the day. |
-| `hindsight-api/.../retain/deduplication.py` | Within-batch dedup + time-bucketed DB dedup | Must be imported by orchestrator. If orchestrator is refactored, re-wire the import. |
-| `hindsight-api/.../engine/memory_engine.py` | `_find_duplicate_facts_batch` + global dedup fallback, passed as `duplicate_checker_fn` to orchestrator | Upstream removed the call site. Ensure the function still exists and is passed to `retain_batch()`. |
-| `hindsight-api/.../engine/memory_engine.py` | FallbackLLMProvider wiring (primary LLM) | Primary Codex LLM with circuit breaker fallback to OpenRouter. |
-| `hindsight-api/.../engine/providers/fallback_llm.py` | FallbackLLMProvider + CircuitBreaker | Fork-only file. |
-| `hindsight-api/.../engine/providers/codex_llm.py` | Codex OAuth LLM provider | Fork-only file. |
-| `hindsight-integrations/openclaw/src/index.ts` | HTTP daemon mode, recall_exp with fallback, Jaccard dedup + compact formatting | Multiple fork customizations in the plugin entry point. |
+| `hindsight-api-slim/.../retain/orchestrator.py` | `duplicate_checker_fn` parameter + `[FORK] Deduplication` step in streaming Phase 1.5 | Upstream removed inline dedup (commit `5eb484fb`). Without it, ~10K duplicates/day are created. Dedup runs between Phase 1 (entity resolution) and Phase 2 (write txn) in the streaming pipeline. |
+| `hindsight-api-slim/.../retain/deduplication.py` | Within-batch dedup + time-bucketed DB dedup | Must be imported by orchestrator. If orchestrator is refactored, re-wire the import. |
+| `hindsight-api-slim/.../engine/memory_engine.py` | `_find_duplicate_facts_batch` + global dedup fallback, passed as `duplicate_checker_fn` to orchestrator | Upstream removed the call site. Ensure the function still exists and is passed to `retain_batch()`. |
+| `hindsight-api-slim/.../engine/memory_engine.py` | FallbackLLMProvider wiring (primary LLM) | Primary Codex LLM with circuit breaker fallback to OpenRouter. |
+| `hindsight-api-slim/.../engine/providers/fallback_llm.py` | FallbackLLMProvider + CircuitBreaker + string-based rate limit detection | Fork-only file. `CodexRateLimitError` was removed upstream; uses string matching instead. |
+| `hindsight-api-slim/.../engine/providers/codex_llm.py` | Codex OAuth LLM provider (shared with upstream since v0.5.0) | Upstream now ships this file too. Our fork's additions are merged. |
+| `hindsight-api-slim/.../consolidation/prompts.py` | `build_single_fact_prompt` + single-fact prompt templates | Fork-only addition for weaker fallback models. |
+| `hindsight-api-slim/.../consolidation/consolidator.py` | `_SingleFactAction/Response` models, `_is_duplicate_create`, single-fact mode routing | Activates when circuit breaker fallback is active (`is_fallback_active`). |
+| `hindsight-integrations/openclaw/src/index.ts` | `recallExp` on `BankScopedClient` (direct HTTP), Jaccard dedup + compact formatting | `recall_exp` not in generated SDK; uses direct HTTP call with fallback to `client.recall()`. |
+| `hindsight-integrations/openclaw/src/memory-formatter.ts` | `stripMarkdown`, `deduplicateByJaccard`, `formatMemoriesCompact` | Fork-only file. 64% character reduction on injected memories. |
 
 **Post-merge verification:**
 ```bash
 # 1. Dedup is wired in
-grep "duplicate_checker_fn" hindsight-api/hindsight_api/engine/retain/orchestrator.py
+grep "duplicate_checker_fn" hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py
 # 2. Dedup module is imported
-grep "from .deduplication import" hindsight-api/hindsight_api/engine/retain/orchestrator.py
+grep "from .deduplication import" hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py
 # 3. Memory engine passes the checker
-grep "duplicate_checker_fn=self._find_duplicate_facts_batch" hindsight-api/hindsight_api/engine/memory_engine.py
+grep "duplicate_checker_fn=self._find_duplicate_facts_batch" hindsight-api-slim/hindsight_api/engine/memory_engine.py
+# 4. Single-fact prompt exists
+grep "build_single_fact_prompt" hindsight-api-slim/hindsight_api/engine/consolidation/prompts.py
+# 5. Fallback LLM exists
+test -f hindsight-api-slim/hindsight_api/engine/providers/fallback_llm.py && echo OK
 ```
 
 ## Development Commands
