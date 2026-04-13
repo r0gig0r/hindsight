@@ -99,7 +99,7 @@ else
     RESTART_ARGS=()
     $SKIP_VENV && RESTART_ARGS+=(--skip-venv)
     $FORCE && RESTART_ARGS+=(--force)
-    "$RESTART_SCRIPT" "${RESTART_ARGS[@]}"
+    "$RESTART_SCRIPT" ${RESTART_ARGS[@]+"${RESTART_ARGS[@]}"}
 fi
 
 echo ""

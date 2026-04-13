@@ -428,9 +428,19 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
             info = response.json()
             self._model_id = info.get("model_id", "unknown")
             logger.info(f"Reranker: TEI provider initialized (model: {self._model_id})")
-        except httpx.HTTPError as e:
-            self._async_client = None
-            raise RuntimeError(f"Failed to connect to TEI server at {self.base_url}: {e}")
+        except httpx.HTTPError:
+            # [FORK] Infinity sidecar uses /models instead of /info
+            try:
+                response = await self._async_request_with_retry(
+                    self._async_client, init_semaphore, "GET", f"{self.base_url}/models"
+                )
+                models = response.json()
+                model_list = models.get("data", [])
+                self._model_id = model_list[0]["id"] if model_list else "unknown"
+                logger.info(f"Reranker: TEI/Infinity provider initialized (model: {self._model_id})")
+            except httpx.HTTPError as e2:
+                self._async_client = None
+                raise RuntimeError(f"Failed to connect to TEI server at {self.base_url}: {e2}")
 
     async def _rerank_query_group(
         self,
@@ -441,20 +451,25 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
     ) -> list[tuple[int, float]]:
         """Rerank a single query group and return list of (original_index, score) tuples."""
         try:
+            # [FORK] Support both TEI format (texts) and Infinity/OpenAI format (documents + model)
+            payload: dict = {"query": query, "texts": texts, "return_text": False}
+            if self._model_id and self._model_id != "unknown":
+                # Infinity requires model + documents instead of texts
+                payload = {"query": query, "documents": texts, "model": self._model_id, "return_documents": False}
             response = await self._async_request_with_retry(
                 client,
                 semaphore,
                 "POST",
                 f"{self.base_url}/rerank",
-                json={
-                    "query": query,
-                    "texts": texts,
-                    "return_text": False,
-                },
+                json=payload,
             )
-            results = response.json()
-            # TEI returns results sorted by score descending, with original index
-            return [(result["index"], result["score"]) for result in results]
+            raw = response.json()
+            # Handle both TEI format [{index, score}] and Infinity format {results: [{index, relevance_score}]}
+            results = raw.get("results", raw) if isinstance(raw, dict) else raw
+            return [
+                (r["index"], r.get("score", r.get("relevance_score", 0.0)))
+                for r in results
+            ]
         except httpx.HTTPError as e:
             raise RuntimeError(f"TEI rerank request failed: {e}")
 
