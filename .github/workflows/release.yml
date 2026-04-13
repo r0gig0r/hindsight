@@ -13,15 +13,15 @@ jobs:
       id-token: write
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v5
+      uses: astral-sh/setup-uv@v7
       with:
         enable-cache: true
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version-file: ".python-version"
 
@@ -30,35 +30,37 @@ jobs:
       working-directory: ./hindsight-clients/python
       run: uv build --out-dir dist
 
+    - name: Build hindsight-api-slim
+      working-directory: ./hindsight-api-slim
+      run: uv build --out-dir dist
+
     - name: Build hindsight-api
       working-directory: ./hindsight-api
       run: uv build --out-dir dist
 
     - name: Build hindsight-all
-      working-directory: ./hindsight
+      working-directory: ./hindsight-all
       run: uv build --out-dir dist
 
-    - name: Build hindsight-litellm
-      working-directory: ./hindsight-integrations/litellm
+    - name: Build hindsight-all-slim
+      working-directory: ./hindsight-all-slim
       run: uv build --out-dir dist
 
     - name: Build hindsight-embed
       working-directory: ./hindsight-embed
       run: uv build --out-dir dist
 
-    - name: Build hindsight-crewai
-      working-directory: ./hindsight-integrations/crewai
-      run: uv build --out-dir dist
-
-    - name: Build hindsight-pydantic-ai
-      working-directory: ./hindsight-integrations/pydantic-ai
-      run: uv build --out-dir dist
-
-    # Publish in order (client and api first, then hindsight-all which depends on them)
+    # Publish in order (client and api-slim first, then api/all wrappers which depend on them)
     - name: Publish hindsight-client to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
         packages-dir: ./hindsight-clients/python/dist
+        skip-existing: true
+
+    - name: Publish hindsight-api-slim to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        packages-dir: ./hindsight-api-slim/dist
         skip-existing: true
 
     - name: Publish hindsight-api to PyPI
@@ -70,13 +72,13 @@ jobs:
     - name: Publish hindsight-all to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
-        packages-dir: ./hindsight/dist
+        packages-dir: ./hindsight-all/dist
         skip-existing: true
 
-    - name: Publish hindsight-litellm to PyPI
+    - name: Publish hindsight-all-slim to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
-        packages-dir: ./hindsight-integrations/litellm/dist
+        packages-dir: ./hindsight-all-slim/dist
         skip-existing: true
 
     - name: Publish hindsight-embed to PyPI
@@ -85,31 +87,18 @@ jobs:
         packages-dir: ./hindsight-embed/dist
         skip-existing: true
 
-    - name: Publish hindsight-crewai to PyPI
-      uses: pypa/gh-action-pypi-publish@release/v1
-      with:
-        packages-dir: ./hindsight-integrations/crewai/dist
-        skip-existing: true
-
-    - name: Publish hindsight-pydantic-ai to PyPI
-      uses: pypa/gh-action-pypi-publish@release/v1
-      with:
-        packages-dir: ./hindsight-integrations/pydantic-ai/dist
-        skip-existing: true
-
     # Upload artifacts for GitHub release
     - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: python-packages
         path: |
           hindsight-clients/python/dist/*
+          hindsight-api-slim/dist/*
           hindsight-api/dist/*
-          hindsight/dist/*
-          hindsight-integrations/litellm/dist/*
+          hindsight-all/dist/*
+          hindsight-all-slim/dist/*
           hindsight-embed/dist/*
-          hindsight-integrations/crewai/dist/*
-          hindsight-integrations/pydantic-ai/dist/*
         retention-days: 1
 
   release-typescript-client:
@@ -117,10 +106,10 @@ jobs:
     environment: npm
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Set up Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v6
       with:
         node-version: '20'
         registry-url: 'https://registry.npmjs.org'
@@ -155,35 +144,35 @@ jobs:
       run: npm pack
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: typescript-client
         path: hindsight-clients/typescript/*.tgz
         retention-days: 1
 
-  release-openclaw-integration:
+  release-hindsight-all-npm:
     runs-on: ubuntu-latest
     environment: npm
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Set up Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v6
       with:
         node-version: '22'
         registry-url: 'https://registry.npmjs.org'
+        cache: 'npm'
+        cache-dependency-path: package-lock.json
 
     - name: Install dependencies
-      working-directory: ./hindsight-integrations/openclaw
-      run: npm ci
+      run: npm ci --workspace=hindsight-all-npm
 
     - name: Build
-      working-directory: ./hindsight-integrations/openclaw
-      run: npm run build
+      run: npm run build --workspace=hindsight-all-npm
 
     - name: Publish to npm
-      working-directory: ./hindsight-integrations/openclaw
+      working-directory: ./hindsight-all-npm
       run: |
         set +e
         OUTPUT=$(npm publish --access public 2>&1)
@@ -200,112 +189,14 @@ jobs:
         NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
     - name: Pack for GitHub release
-      working-directory: ./hindsight-integrations/openclaw
+      working-directory: ./hindsight-all-npm
       run: npm pack
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
-        name: openclaw-integration
-        path: hindsight-integrations/openclaw/*.tgz
-        retention-days: 1
-
-  release-ai-sdk-integration:
-    runs-on: ubuntu-latest
-    environment: npm
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Set up Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '22'
-        registry-url: 'https://registry.npmjs.org'
-
-    - name: Install dependencies
-      working-directory: ./hindsight-integrations/ai-sdk
-      run: npm ci
-
-    - name: Build
-      working-directory: ./hindsight-integrations/ai-sdk
-      run: npm run build
-
-    - name: Publish to npm
-      working-directory: ./hindsight-integrations/ai-sdk
-      run: |
-        set +e
-        OUTPUT=$(npm publish --access public 2>&1)
-        EXIT_CODE=$?
-        echo "$OUTPUT"
-        if [ $EXIT_CODE -ne 0 ]; then
-          if echo "$OUTPUT" | grep -q "cannot publish over"; then
-            echo "Package version already published, skipping..."
-            exit 0
-          fi
-          exit $EXIT_CODE
-        fi
-      env:
-        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-    - name: Pack for GitHub release
-      working-directory: ./hindsight-integrations/ai-sdk
-      run: npm pack
-
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: ai-sdk-integration
-        path: hindsight-integrations/ai-sdk/*.tgz
-        retention-days: 1
-
-  release-chat-integration:
-    runs-on: ubuntu-latest
-    environment: npm
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Set up Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '22'
-        registry-url: 'https://registry.npmjs.org'
-
-    - name: Install dependencies
-      working-directory: ./hindsight-integrations/chat
-      run: npm ci
-
-    - name: Build
-      working-directory: ./hindsight-integrations/chat
-      run: npm run build
-
-    - name: Publish to npm
-      working-directory: ./hindsight-integrations/chat
-      run: |
-        set +e
-        OUTPUT=$(npm publish --access public 2>&1)
-        EXIT_CODE=$?
-        echo "$OUTPUT"
-        if [ $EXIT_CODE -ne 0 ]; then
-          if echo "$OUTPUT" | grep -q "cannot publish over"; then
-            echo "Package version already published, skipping..."
-            exit 0
-          fi
-          exit $EXIT_CODE
-        fi
-      env:
-        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-    - name: Pack for GitHub release
-      working-directory: ./hindsight-integrations/chat
-      run: npm pack
-
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: chat-integration
-        path: hindsight-integrations/chat/*.tgz
+        name: hindsight-all-npm
+        path: hindsight-all-npm/*.tgz
         retention-days: 1
 
   release-control-plane:
@@ -313,10 +204,10 @@ jobs:
     environment: npm
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Set up Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v6
       with:
         node-version: '20'
         registry-url: 'https://registry.npmjs.org'
@@ -364,7 +255,7 @@ jobs:
       run: npm pack
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: control-plane
         path: hindsight-control-plane/*.tgz
@@ -393,7 +284,7 @@ jobs:
             asset_name: hindsight-linux-arm64
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -411,7 +302,7 @@ jobs:
         chmod +x artifacts/${{ matrix.asset_name }}
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: rust-cli-${{ matrix.asset_name }}
         path: artifacts/${{ matrix.asset_name }}
@@ -452,7 +343,7 @@ jobs:
               PRELOAD_ML_MODELS=false
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Free Disk Space
       uses: jlumbroso/free-disk-space@main
@@ -466,13 +357,13 @@ jobs:
         swap-storage: true
 
     - name: Set up QEMU
-      uses: docker/setup-qemu-action@v3
+      uses: docker/setup-qemu-action@v4
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@v4
 
     - name: Log in to GitHub Container Registry
-      uses: docker/login-action@v3
+      uses: docker/login-action@v4
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
@@ -484,7 +375,7 @@ jobs:
 
     - name: Extract metadata for release tags
       id: meta
-      uses: docker/metadata-action@v5
+      uses: docker/metadata-action@v6
       with:
         images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image_name }}
         flavor: |
@@ -500,7 +391,7 @@ jobs:
     # # Step 1: Build for local testing (single platform, no push)
     # # This creates an identical image to what will be released, just for one platform
     # - name: Build image for testing
-    #   uses: docker/build-push-action@v6
+    #   uses: docker/build-push-action@v7
     #   with:
     #     context: .
     #     file: docker/standalone/Dockerfile
@@ -519,7 +410,7 @@ jobs:
 
     # Build multi-platform and push to release tags
     - name: Build and push release images
-      uses: docker/build-push-action@v6
+      uses: docker/build-push-action@v7
       with:
         context: .
         file: docker/standalone/Dockerfile
@@ -537,10 +428,10 @@ jobs:
       packages: write
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Install Helm
-      uses: azure/setup-helm@v4
+      uses: azure/setup-helm@v5
       with:
         version: 'latest'
 
@@ -557,7 +448,7 @@ jobs:
       run: helm push helm-packages/*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: helm-chart
         path: helm-packages/*.tgz
@@ -565,73 +456,61 @@ jobs:
 
   create-github-release:
     runs-on: ubuntu-latest
-    needs: [release-python-packages, release-typescript-client, release-openclaw-integration, release-ai-sdk-integration, release-chat-integration, release-control-plane, release-rust-cli, release-docker-images, release-helm-chart]
+    needs: [release-python-packages, release-typescript-client, release-hindsight-all-npm, release-control-plane, release-rust-cli, release-docker-images, release-helm-chart]
     permissions:
       contents: write
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Extract version from tag
       id: get_version
       run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
     - name: Download Python packages
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         name: python-packages
         path: ./artifacts/python-packages
 
     - name: Download TypeScript client
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         name: typescript-client
         path: ./artifacts/typescript-client
 
-    - name: Download OpenClaw Integration
-      uses: actions/download-artifact@v4
-      with:
-        name: openclaw-integration
-        path: ./artifacts/openclaw-integration
-
-    - name: Download AI SDK Integration
-      uses: actions/download-artifact@v4
-      with:
-        name: ai-sdk-integration
-        path: ./artifacts/ai-sdk-integration
-
-    - name: Download Chat Integration
-      uses: actions/download-artifact@v4
-      with:
-        name: chat-integration
-        path: ./artifacts/chat-integration
-
     - name: Download Control Plane
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         name: control-plane
         path: ./artifacts/control-plane
 
+    - name: Download hindsight-embed npm wrapper
+      uses: actions/download-artifact@v8
+      with:
+        name: hindsight-all-npm
+        path: ./artifacts/hindsight-all-npm
+
     - name: Download Rust CLI (Linux)
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         name: rust-cli-hindsight-linux-amd64
         path: ./artifacts/rust-cli-linux
 
     - name: Download Rust CLI (macOS Intel)
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         name: rust-cli-hindsight-darwin-amd64
         path: ./artifacts/rust-cli-darwin-amd64
 
     - name: Download Rust CLI (macOS ARM)
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         name: rust-cli-hindsight-darwin-arm64
         path: ./artifacts/rust-cli-darwin-arm64
 
     - name: Download Helm chart
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         name: helm-chart
         path: ./artifacts/helm-chart
@@ -641,19 +520,15 @@ jobs:
         mkdir -p release-assets
         # Python packages
         cp artifacts/python-packages/hindsight-clients/python/dist/* release-assets/ || true
+        cp artifacts/python-packages/hindsight-api-slim/dist/* release-assets/ || true
         cp artifacts/python-packages/hindsight-api/dist/* release-assets/ || true
-        cp artifacts/python-packages/hindsight/dist/* release-assets/ || true
-        cp artifacts/python-packages/hindsight-integrations/litellm/dist/* release-assets/ || true
-        cp artifacts/python-packages/hindsight-integrations/pydantic-ai/dist/* release-assets/ || true
+        cp artifacts/python-packages/hindsight-all/dist/* release-assets/ || true
+        cp artifacts/python-packages/hindsight-all-slim/dist/* release-assets/ || true
         cp artifacts/python-packages/hindsight-embed/dist/* release-assets/ || true
         # TypeScript client
         cp artifacts/typescript-client/*.tgz release-assets/ || true
-        # OpenClaw Integration
-        cp artifacts/openclaw-integration/*.tgz release-assets/ || true
-        # AI SDK Integration
-        cp artifacts/ai-sdk-integration/*.tgz release-assets/ || true
-        # Chat Integration
-        cp artifacts/chat-integration/*.tgz release-assets/ || true
+        # hindsight-embed npm wrapper
+        cp artifacts/hindsight-all-npm/*.tgz release-assets/ || true
         # Control Plane
         cp artifacts/control-plane/*.tgz release-assets/ || true
         # Rust CLI binaries

@@ -11,6 +11,9 @@ import type {
   AddBankBackgroundData,
   AddBankBackgroundErrors,
   AddBankBackgroundResponses,
+  AuditLogStatsData,
+  AuditLogStatsErrors,
+  AuditLogStatsResponses,
   CancelOperationData,
   CancelOperationErrors,
   CancelOperationResponses,
@@ -50,6 +53,9 @@ import type {
   DeleteWebhookData,
   DeleteWebhookErrors,
   DeleteWebhookResponses,
+  ExportBankTemplateData,
+  ExportBankTemplateErrors,
+  ExportBankTemplateResponses,
   FileRetainData,
   FileRetainErrors,
   FileRetainResponses,
@@ -62,6 +68,8 @@ import type {
   GetBankProfileData,
   GetBankProfileErrors,
   GetBankProfileResponses,
+  GetBankTemplateSchemaData,
+  GetBankTemplateSchemaResponses,
   GetChunkData,
   GetChunkErrors,
   GetChunkResponses,
@@ -96,6 +104,12 @@ import type {
   GetVersionResponses,
   HealthEndpointHealthGetData,
   HealthEndpointHealthGetResponses,
+  ImportBankTemplateData,
+  ImportBankTemplateErrors,
+  ImportBankTemplateResponses,
+  ListAuditLogsData,
+  ListAuditLogsErrors,
+  ListAuditLogsResponses,
   ListBanksData,
   ListBanksErrors,
   ListBanksResponses,
@@ -131,6 +145,9 @@ import type {
   RecallMemoriesData,
   RecallMemoriesErrors,
   RecallMemoriesResponses,
+  RecoverConsolidationData,
+  RecoverConsolidationErrors,
+  RecoverConsolidationResponses,
   ReflectData,
   ReflectErrors,
   ReflectResponses,
@@ -922,6 +939,48 @@ export const createOrUpdateBank = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Import bank template
+ *
+ * Import a bank template manifest to create or update a bank's configuration, mental models, and directives. If the bank does not exist it is created. Config fields are applied as per-bank overrides. Mental models are matched by id, directives by name — existing ones are updated, new ones are created. Use dry_run=true to validate the manifest without applying changes.
+ */
+export const importBankTemplate = <ThrowOnError extends boolean = false>(
+  options: Options<ImportBankTemplateData, ThrowOnError>,
+) =>
+  (options.client ?? client).post<
+    ImportBankTemplateResponses,
+    ImportBankTemplateErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/import", ...options });
+
+/**
+ * Export bank template
+ *
+ * Export a bank's current configuration, mental models, and directives as a template manifest. The exported manifest can be imported into another bank to replicate the setup.
+ */
+export const exportBankTemplate = <ThrowOnError extends boolean = false>(
+  options: Options<ExportBankTemplateData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    ExportBankTemplateResponses,
+    ExportBankTemplateErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/export", ...options });
+
+/**
+ * Get bank template JSON Schema
+ *
+ * Returns the JSON Schema for the bank template manifest format. Use this to validate template manifests before importing.
+ */
+export const getBankTemplateSchema = <ThrowOnError extends boolean = false>(
+  options?: Options<GetBankTemplateSchemaData, ThrowOnError>,
+) =>
+  (options?.client ?? client).get<
+    GetBankTemplateSchemaResponses,
+    unknown,
+    ThrowOnError
+  >({ url: "/v1/bank-template-schema", ...options });
+
+/**
  * Clear all observations
  *
  * Delete all observations for a memory bank. This is useful for resetting the consolidated knowledge.
@@ -934,6 +993,20 @@ export const clearObservations = <ThrowOnError extends boolean = false>(
     ClearObservationsErrors,
     ThrowOnError
   >({ url: "/v1/default/banks/{bank_id}/observations", ...options });
+
+/**
+ * Recover failed consolidation
+ *
+ * Reset all memories that were permanently marked as failed during consolidation (after exhausting all LLM retries and adaptive batch splitting) so they are picked up again on the next consolidation run. Does not delete any observations.
+ */
+export const recoverConsolidation = <ThrowOnError extends boolean = false>(
+  options: Options<RecoverConsolidationData, ThrowOnError>,
+) =>
+  (options.client ?? client).post<
+    RecoverConsolidationResponses,
+    RecoverConsolidationErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/consolidation/recover", ...options });
 
 /**
  * Clear observations for a memory
@@ -1209,3 +1282,31 @@ export const fileRetain = <ThrowOnError extends boolean = false>(
       ...options.headers,
     },
   });
+
+/**
+ * List audit logs
+ *
+ * List audit log entries for a bank, ordered by most recent first.
+ */
+export const listAuditLogs = <ThrowOnError extends boolean = false>(
+  options: Options<ListAuditLogsData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    ListAuditLogsResponses,
+    ListAuditLogsErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/audit-logs", ...options });
+
+/**
+ * Audit log statistics
+ *
+ * Get audit log counts grouped by time bucket for charting.
+ */
+export const auditLogStats = <ThrowOnError extends boolean = false>(
+  options: Options<AuditLogStatsData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    AuditLogStatsResponses,
+    AuditLogStatsErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/audit-logs/stats", ...options });

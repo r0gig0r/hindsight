@@ -343,6 +343,7 @@ impl App {
                             include: None,
                             tags: None,
                             tags_match: TagsMatch::Any,
+                            tag_groups: None,
                         };
 
                         let result = client.recall(&bank_id, &request, false)
@@ -361,6 +362,10 @@ impl App {
                             response_schema: None,
                             tags: None,
                             tags_match: TagsMatch::Any,
+                            tag_groups: None,
+                            fact_types: None,
+                            exclude_mental_models: false,
+                            exclude_mental_model_ids: None,
                         };
 
                         let result = client.reflect(&bank_id, &request, false)

@@ -39,9 +39,11 @@ import { Switch } from "@/components/ui/switch";
 import { MemoryDetailPanel } from "./memory-detail-panel";
 import { MemoryDetailModal } from "./memory-detail-modal";
 import { Graph2D, convertHindsightGraphData, GraphNode } from "./graph-2d";
+import { Constellation } from "./constellation";
+import { ScatterChart, Plus, FileText } from "lucide-react";
 
 type FactType = "world" | "experience" | "observation";
-type ViewMode = "graph" | "table" | "timeline";
+type ViewMode = "graph" | "table" | "timeline" | "constellation";
 
 interface DataViewProps {
   factType: FactType;
@@ -49,7 +51,7 @@ interface DataViewProps {
 
 export function DataView({ factType }: DataViewProps) {
   const { currentBank } = useBank();
-  const [viewMode, setViewMode] = useState<ViewMode>("graph");
+  const [viewMode, setViewMode] = useState<ViewMode>("constellation");
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -227,29 +229,15 @@ export function DataView({ factType }: DataViewProps) {
   // Reset to first page when filters change
   useEffect(() => {
     setCurrentPage(1);
-  }, [searchQuery, tagFilters]);
+  }, [tagFilters]);
 
-  // Debounce ref for text search
-  const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // Trigger server-side reload when text filter changes (debounced 300ms)
-  useEffect(() => {
-    if (searchDebounceRef.current) {
-      clearTimeout(searchDebounceRef.current);
+  // Trigger text search on Enter key
+  const executeSearch = () => {
+    if (currentBank) {
+      setCurrentPage(1);
+      loadData(undefined, searchQuery || undefined, tagFilters.length > 0 ? tagFilters : undefined);
     }
-    searchDebounceRef.current = setTimeout(() => {
-      if (currentBank) {
-        loadData(
-          undefined,
-          searchQuery || undefined,
-          tagFilters.length > 0 ? tagFilters : undefined
-        );
-      }
-    }, 300);
-    return () => {
-      if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
-    };
-  }, [searchQuery]);
+  };
 
   // Trigger server-side reload immediately when tag filters change
   useEffect(() => {
@@ -285,6 +273,26 @@ export function DataView({ factType }: DataViewProps) {
           <RefreshCw className="w-8 h-8 mx-auto mb-3 text-muted-foreground animate-spin" />
           <p className="text-muted-foreground">Loading memories...</p>
         </div>
+      ) : data && data.total_units === 0 ? (
+        <div className="text-center py-20">
+          <FileText className="w-10 h-10 mx-auto mb-4 text-muted-foreground/50" />
+          <h3 className="text-base font-medium text-foreground mb-1">No memories yet</h3>
+          <p className="text-sm text-muted-foreground mb-6">
+            Add a document to start building this memory bank.
+          </p>
+          <Button
+            variant="default"
+            size="sm"
+            className="gap-1.5"
+            onClick={() => {
+              const btn = document.querySelector<HTMLButtonElement>("[data-add-document]");
+              btn?.click();
+            }}
+          >
+            <Plus className="w-4 h-4" />
+            Add Document
+          </Button>
+        </div>
       ) : data ? (
         <>
           {/* Always visible filters */}
@@ -292,12 +300,22 @@ export function DataView({ factType }: DataViewProps) {
             <div className="flex items-center gap-2">
               {/* Text search */}
               <div className="relative max-w-xs flex-1">
-                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
+                {loading ? (
+                  <RefreshCw className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none animate-spin" />
+                ) : (
+                  <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
+                )}
                 <Input
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Filter by text or context..."
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      executeSearch();
+                    }
+                  }}
+                  placeholder="Filter by text or context (press Enter)..."
                   className="pl-8 h-9"
                 />
               </div>
@@ -356,7 +374,11 @@ export function DataView({ factType }: DataViewProps) {
                       onClick={() => {
                         const newLimit = Math.min(data.total_units, fetchLimit + 1000);
                         setFetchLimit(newLimit);
-                        loadData(newLimit);
+                        loadData(
+                          newLimit,
+                          searchQuery || undefined,
+                          tagFilters.length > 0 ? tagFilters : undefined
+                        );
                       }}
                       className="ml-2 text-primary hover:underline"
                     >
@@ -411,6 +433,17 @@ export function DataView({ factType }: DataViewProps) {
               )}
             </div>
             <div className="flex items-center gap-2 bg-muted rounded-lg p-1">
+              <button
+                onClick={() => setViewMode("constellation")}
+                className={`px-3 py-1.5 rounded-md text-sm font-medium transition-all flex items-center gap-1.5 ${
+                  viewMode === "constellation"
+                    ? "bg-background text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <ScatterChart className="w-4 h-4" />
+                Constellation
+              </button>
               <button
                 onClick={() => setViewMode("graph")}
                 className={`px-3 py-1.5 rounded-md text-sm font-medium transition-all flex items-center gap-1.5 ${
@@ -674,6 +707,92 @@ export function DataView({ factType }: DataViewProps) {
                   )}
                 </div>
               </div>
+            </div>
+          )}
+
+          {viewMode === "constellation" && (
+            <div className="flex gap-0">
+              <div className="flex-1 min-w-0 border border-border rounded-lg overflow-hidden">
+                <Constellation
+                  data={graph2DData}
+                  height={700}
+                  onNodeClick={handleGraphNodeClick}
+                  nodeColorFn={nodeColorFn}
+                  linkColorFn={linkColorFn}
+                />
+              </div>
+
+              {/* Right Toggle Button */}
+              <button
+                onClick={() => setShowControlPanel(!showControlPanel)}
+                className="flex-shrink-0 w-5 h-[700px] bg-transparent hover:bg-muted/50 flex items-center justify-center transition-colors"
+                title={showControlPanel ? "Hide panel" : "Show panel"}
+              >
+                {showControlPanel ? (
+                  <ChevronRight className="w-3 h-3 text-muted-foreground" />
+                ) : (
+                  <ChevronLeft className="w-3 h-3 text-muted-foreground" />
+                )}
+              </button>
+
+              {/* Right Panel — reuse the same panel as graph view */}
+              {showControlPanel && (
+                <div className="w-72 flex-shrink-0 border border-border rounded-lg bg-muted/20 overflow-y-auto h-[700px]">
+                  {selectedGraphNode ? (
+                    <MemoryDetailPanel
+                      memory={selectedGraphNode}
+                      onClose={() => setSelectedGraphNode(null)}
+                      inPanel
+                      bankId={currentBank || undefined}
+                    />
+                  ) : (
+                    <div className="p-4 space-y-4">
+                      <h3 className="text-sm font-semibold text-foreground">Constellation View</h3>
+                      <p className="text-xs text-muted-foreground">
+                        Canvas-rendered memory map with spatial label deconfliction. Scroll to zoom,
+                        drag to pan, hover to explore entity connections. Click a memory to view
+                        details.
+                      </p>
+                      <div className="space-y-2 pt-2">
+                        <h4 className="text-xs font-medium text-muted-foreground">Link types</h4>
+                        {Object.entries({
+                          semantic: "#0074d9",
+                          temporal: "#009296",
+                          entity: "#f59e0b",
+                          causal: "#8b5cf6",
+                        }).map(([type, color]) => (
+                          <div
+                            key={type}
+                            className="flex items-center gap-2 cursor-pointer"
+                            onClick={() => toggleLinkType(type)}
+                          >
+                            <div
+                              className="w-3 h-3 rounded-full"
+                              style={{
+                                backgroundColor: color,
+                                opacity: visibleLinkTypes.has(type) ? 1 : 0.2,
+                              }}
+                            />
+                            <span
+                              className={`text-xs capitalize ${visibleLinkTypes.has(type) ? "text-foreground" : "text-muted-foreground line-through"}`}
+                            >
+                              {type}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="text-xs text-muted-foreground space-y-1 pt-2">
+                        <div>
+                          Nodes: <span className="text-foreground">{graph2DData.nodes.length}</span>
+                        </div>
+                        <div>
+                          Links: <span className="text-foreground">{graph2DData.links.length}</span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -1003,7 +1122,7 @@ function TimelineView({
     });
 
     return Object.entries(groups)
-      .sort(([a], [b]) => a.localeCompare(b))
+      .sort(([, a], [, b]) => a.date.getTime() - b.date.getTime())
       .map(([key, { items, date }]) => ({
         key,
         label: getGroupLabel(key, date),

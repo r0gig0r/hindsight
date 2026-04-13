@@ -132,7 +132,7 @@ export function formatMemoriesCompact(results: MemoryResult[]): string {
 
   return results
     .map((r) => {
-      const type = TYPE_LABELS[r.type] || r.type;
+      const type = (r.type ? TYPE_LABELS[r.type] : undefined) || r.type || 'fact';
       const dateSource = r.occurred_start || r.mentioned_at;
       const date = dateSource ? formatRelativeDate(dateSource) : '';
       const cleanText = stripMarkdown(r.text);

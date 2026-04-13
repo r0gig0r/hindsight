@@ -16,6 +16,7 @@ import { BankStatsView } from "@/components/bank-stats-view";
 import { BankOperationsView } from "@/components/bank-operations-view";
 import { MentalModelsView } from "@/components/mental-models-view";
 import { WebhooksView } from "@/components/webhooks-view";
+import { AuditLogsView } from "@/components/audit-logs-view";
 import { useFeatures } from "@/lib/features-context";
 import { useBank } from "@/lib/bank-context";
 import { client } from "@/lib/api";
@@ -37,11 +38,11 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { Brain, Trash2, Loader2, MoreVertical, Pencil, RotateCcw } from "lucide-react";
+import { Brain, Download, Trash2, Loader2, MoreVertical, Pencil, RotateCcw } from "lucide-react";
 
 type NavItem = "recall" | "reflect" | "data" | "documents" | "entities" | "profile";
 type DataSubTab = "world" | "experience" | "observations" | "mental-models";
-type BankConfigTab = "general" | "configuration" | "webhooks";
+type BankConfigTab = "general" | "configuration" | "webhooks" | "audit-logs";
 
 export default function BankPage() {
   const params = useParams();
@@ -62,6 +63,7 @@ export default function BankPage() {
   const [showClearObservationsDialog, setShowClearObservationsDialog] = useState(false);
   const [isClearingObservations, setIsClearingObservations] = useState(false);
   const [isConsolidating, setIsConsolidating] = useState(false);
+  const [isRecoveringConsolidation, setIsRecoveringConsolidation] = useState(false);
   const [showResetConfigDialog, setShowResetConfigDialog] = useState(false);
   const [isResettingConfig, setIsResettingConfig] = useState(false);
 
@@ -137,6 +139,22 @@ export default function BankPage() {
     }
   };
 
+  const handleRecoverConsolidation = async () => {
+    if (!bankId) return;
+
+    setIsRecoveringConsolidation(true);
+    try {
+      const result = await client.recoverConsolidation(bankId);
+      toast.success(
+        `Recovered ${result.retried_count} failed ${result.retried_count === 1 ? "memory" : "memories"} for re-consolidation`
+      );
+    } catch (error) {
+      // Error toast is shown automatically by the API client interceptor
+    } finally {
+      setIsRecoveringConsolidation(false);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-background flex flex-col">
       <BankSelector />
@@ -165,6 +183,23 @@ export default function BankPage() {
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end" className="w-48">
                       <DropdownMenuItem
+                        onClick={async () => {
+                          if (!bankId) return;
+                          try {
+                            const manifest = await client.exportBankTemplate(bankId);
+                            const json = JSON.stringify(manifest, null, 2);
+                            await navigator.clipboard.writeText(json);
+                            toast.success("Template copied to clipboard");
+                          } catch {
+                            toast.error("Failed to export template");
+                          }
+                        }}
+                      >
+                        <Download className="w-4 h-4 mr-2" />
+                        Export Template
+                      </DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
                         onClick={handleTriggerConsolidation}
                         disabled={isConsolidating || !observationsEnabled}
                         title={
@@ -177,6 +212,23 @@ export default function BankPage() {
                           <Brain className="w-4 h-4 mr-2" />
                         )}
                         {isConsolidating ? "Consolidating..." : "Run Consolidation"}
+                        {!observationsEnabled && (
+                          <span className="ml-auto text-xs text-muted-foreground">Off</span>
+                        )}
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onClick={handleRecoverConsolidation}
+                        disabled={isRecoveringConsolidation || !observationsEnabled}
+                        title={
+                          !observationsEnabled ? "Observations feature is not enabled" : undefined
+                        }
+                      >
+                        {isRecoveringConsolidation ? (
+                          <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                        ) : (
+                          <RotateCcw className="w-4 h-4 mr-2" />
+                        )}
+                        {isRecoveringConsolidation ? "Recovering..." : "Recover Consolidation"}
                         {!observationsEnabled && (
                           <span className="ml-auto text-xs text-muted-foreground">Off</span>
                         )}
@@ -264,6 +316,19 @@ export default function BankPage() {
                         <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary" />
                       )}
                     </button>
+                    <button
+                      onClick={() => handleBankConfigTabChange("audit-logs")}
+                      className={`px-6 py-3 font-semibold text-sm transition-all relative ${
+                        bankConfigTab === "audit-logs"
+                          ? "text-primary"
+                          : "text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      Audit Logs
+                      {bankConfigTab === "audit-logs" && (
+                        <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary" />
+                      )}
+                    </button>
                   </div>
                 </div>
 
@@ -293,6 +358,14 @@ export default function BankPage() {
                         bank.
                       </p>
                       <WebhooksView />
+                    </div>
+                  )}
+                  {bankConfigTab === "audit-logs" && (
+                    <div>
+                      <p className="text-sm text-muted-foreground mb-4">
+                        View audit trail of all operations performed on this memory bank.
+                      </p>
+                      <AuditLogsView />
                     </div>
                   )}
                 </div>

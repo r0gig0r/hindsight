@@ -13,6 +13,7 @@ import CodeSnippet from '@site/src/components/CodeSnippet';
 {/* Import raw source files */}
 import documentsPy from '!!raw-loader!@site/examples/api/documents.py';
 import documentsMjs from '!!raw-loader!@site/examples/api/documents.mjs';
+import documentsGo from '!!raw-loader!@site/examples/api/documents.go';
 
 :::tip Prerequisites
 Make sure you've completed the [Quick Start](./quickstart) and understand [how retain works](./retain).
@@ -61,6 +62,9 @@ hindsight memory retain-files my-bank docs/
 ```
 
 </TabItem>
+<TabItem value="go" label="Go">
+<CodeSnippet code={documentsGo} section="document-retain" language="go" />
+</TabItem>
 </Tabs>
 
 ## Update Documents
@@ -85,6 +89,9 @@ hindsight memory retain my-bank "Project deadline: April 15 (extended)" --doc-id
 ```
 
 </TabItem>
+<TabItem value="go" label="Go">
+<CodeSnippet code={documentsGo} section="document-update" language="go" />
+</TabItem>
 </Tabs>
 
 ## Get Document
@@ -104,6 +111,9 @@ Retrieve a document's original text and metadata. This is useful for expanding d
 hindsight document get my-bank meeting-2024-03-15
 ```
 
+</TabItem>
+<TabItem value="go" label="Go">
+<CodeSnippet code={documentsGo} section="document-get" language="go" />
 </TabItem>
 </Tabs>
 
@@ -129,6 +139,9 @@ hindsight document update-tags my-bank meeting-2024-03-15
 ```
 
 </TabItem>
+<TabItem value="go" label="Go">
+<CodeSnippet code={documentsGo} section="document-update" language="go" />
+</TabItem>
 </Tabs>
 
 :::info Observations are re-consolidated
@@ -153,11 +166,62 @@ hindsight document delete my-bank meeting-2024-03-15
 ```
 
 </TabItem>
+<TabItem value="go" label="Go">
+<CodeSnippet code={documentsGo} section="document-delete" language="go" />
+</TabItem>
 </Tabs>
 
 :::warning
 Deleting a document permanently removes all memories extracted from it. This action cannot be undone.
 :::
+
+## List Documents
+
+List documents in a bank with optional filtering by ID and tags.
+
+<Tabs>
+<TabItem value="python" label="Python">
+<CodeSnippet code={documentsPy} section="document-list" language="python" />
+</TabItem>
+<TabItem value="node" label="Node.js">
+<CodeSnippet code={documentsMjs} section="document-list" language="javascript" />
+</TabItem>
+<TabItem value="cli" label="CLI">
+
+```bash
+# List all documents
+hindsight document list my-bank
+
+# Filter by ID substring
+hindsight document list my-bank --q report
+
+# Filter by tags
+hindsight document list my-bank --tags team-a --tags team-b
+```
+
+</TabItem>
+<TabItem value="go" label="Go">
+<CodeSnippet code={documentsGo} section="document-list" language="go" />
+</TabItem>
+</Tabs>
+
+### Filtering Options
+
+| Parameter | Description |
+|---|---|
+| `q` | Case-insensitive substring match on document ID. `report` matches `report-2024`, `annual-report`, etc. |
+| `tags` | Filter by document tags. Accepts multiple values. |
+| `tags_match` | How to match tags (default: `any_strict`). See below. |
+| `limit` / `offset` | Pagination. Default limit is 100. |
+
+**`tags_match` modes:**
+
+| Mode | Behaviour |
+|---|---|
+| `any_strict` *(default)* | Document must have **at least one** of the specified tags. Untagged docs excluded. |
+| `any` | Same as `any_strict` but also includes untagged documents. |
+| `all_strict` | Document must have **all** specified tags. Untagged docs excluded. |
+| `all` | Same as `all_strict` but also includes untagged documents. |
 
 ## Document Response Format
 

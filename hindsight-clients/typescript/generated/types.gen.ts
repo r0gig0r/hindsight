@@ -41,6 +41,140 @@ export type AsyncOperationSubmitResponse = {
 };
 
 /**
+ * AuditLogEntry
+ *
+ * A single audit log entry.
+ */
+export type AuditLogEntry = {
+  /**
+   * Id
+   */
+  id: string;
+  /**
+   * Action
+   */
+  action: string;
+  /**
+   * Transport
+   */
+  transport: string;
+  /**
+   * Bank Id
+   */
+  bank_id: string | null;
+  /**
+   * Started At
+   */
+  started_at: string | null;
+  /**
+   * Ended At
+   */
+  ended_at: string | null;
+  /**
+   * Duration Ms
+   *
+   * Server-computed duration in milliseconds (started_at → ended_at). Null if not yet completed.
+   */
+  duration_ms?: number | null;
+  /**
+   * Request
+   */
+  request: {
+    [key: string]: unknown;
+  } | null;
+  /**
+   * Response
+   */
+  response: {
+    [key: string]: unknown;
+  } | null;
+  /**
+   * Metadata
+   */
+  metadata: {
+    [key: string]: unknown;
+  };
+};
+
+/**
+ * AuditLogListResponse
+ *
+ * Response model for list audit logs endpoint.
+ */
+export type AuditLogListResponse = {
+  /**
+   * Bank Id
+   */
+  bank_id: string;
+  /**
+   * Total
+   */
+  total: number;
+  /**
+   * Limit
+   */
+  limit: number;
+  /**
+   * Offset
+   */
+  offset: number;
+  /**
+   * Items
+   */
+  items: Array<AuditLogEntry>;
+};
+
+/**
+ * AuditLogStatsBucket
+ *
+ * A single time bucket in audit log stats.
+ */
+export type AuditLogStatsBucket = {
+  /**
+   * Time
+   */
+  time: string;
+  /**
+   * Actions
+   */
+  actions: {
+    [key: string]: number;
+  };
+  /**
+   * Total
+   */
+  total: number;
+};
+
+/**
+ * AuditLogStatsResponse
+ *
+ * Response model for audit log stats endpoint.
+ */
+export type AuditLogStatsResponse = {
+  /**
+   * Bank Id
+   */
+  bank_id: string;
+  /**
+   * Period
+   */
+  period: string;
+  /**
+   * Trunc
+   */
+  trunc: string;
+  /**
+   * Start
+   */
+  start: string;
+  /**
+   * Buckets
+   */
+  buckets: Array<AuditLogStatsBucket>;
+};
+
+/**
  * BackgroundResponse
  *
  * Response model for background update. Deprecated: use MissionResponse instead.
@@ -249,6 +383,263 @@ export type BankStatsResponse = {
    * Total number of observations
    */
   total_observations?: number;
+};
+
+/**
+ * BankTemplateConfig
+ *
+ * Bank configuration fields within a template manifest.
+ *
+ * Only includes configurable (per-bank) fields. Credential fields
+ * (API keys, base URLs) are intentionally excluded for security.
+ */
+export type BankTemplateConfig = {
+  /**
+   * Reflect Mission
+   *
+   * Mission/context for Reflect operations
+   */
+  reflect_mission?: string | null;
+  /**
+   * Retain Mission
+   *
+   * Steers what gets extracted during retain
+   */
+  retain_mission?: string | null;
+  /**
+   * Retain Extraction Mode
+   *
+   * Fact extraction mode: 'concise' (default), 'verbose', or 'custom'
+   */
+  retain_extraction_mode?: string | null;
+  /**
+   * Retain Custom Instructions
+   *
+   * Custom extraction prompt (when mode='custom')
+   */
+  retain_custom_instructions?: string | null;
+  /**
+   * Retain Chunk Size
+   *
+   * Max token size for each content chunk
+   */
+  retain_chunk_size?: number | null;
+  /**
+   * Enable Observations
+   *
+   * Toggle observation consolidation
+   */
+  enable_observations?: boolean | null;
+  /**
+   * Observations Mission
+   *
+   * Controls what gets synthesised
+   */
+  observations_mission?: string | null;
+  /**
+   * Disposition Skepticism
+   *
+   * Skepticism trait (1-5)
+   */
+  disposition_skepticism?: number | null;
+  /**
+   * Disposition Literalism
+   *
+   * Literalism trait (1-5)
+   */
+  disposition_literalism?: number | null;
+  /**
+   * Disposition Empathy
+   *
+   * Empathy trait (1-5)
+   */
+  disposition_empathy?: number | null;
+  /**
+   * Entity Labels
+   *
+   * Controlled vocabulary for entity labels
+   */
+  entity_labels?: Array<{
+    [key: string]: unknown;
+  }> | null;
+  /**
+   * Entities Allow Free Form
+   *
+   * Allow entities outside the label vocabulary
+   */
+  entities_allow_free_form?: boolean | null;
+};
+
+/**
+ * BankTemplateDirective
+ *
+ * A directive definition within a bank template manifest.
+ *
+ * Directives are matched by name on re-import: existing directives
+ * with the same name are updated, new ones are created.
+ */
+export type BankTemplateDirective = {
+  /**
+   * Name
+   *
+   * Human-readable name for the directive (used as match key on re-import)
+   */
+  name: string;
+  /**
+   * Content
+   *
+   * The directive text to inject into prompts
+   */
+  content: string;
+  /**
+   * Priority
+   *
+   * Higher priority directives are injected first
+   */
+  priority?: number;
+  /**
+   * Is Active
+   *
+   * Whether this directive is active
+   */
+  is_active?: boolean;
+  /**
+   * Tags
+   *
+   * Tags for filtering
+   */
+  tags?: Array<string>;
+};
+
+/**
+ * BankTemplateImportResponse
+ *
+ * Response model for the bank template import endpoint.
+ */
+export type BankTemplateImportResponse = {
+  /**
+   * Bank Id
+   *
+   * Bank that was imported into
+   */
+  bank_id: string;
+  /**
+   * Config Applied
+   *
+   * Whether bank config was updated
+   */
+  config_applied: boolean;
+  /**
+   * Mental Models Created
+   *
+   * IDs of newly created mental models
+   */
+  mental_models_created?: Array<string>;
+  /**
+   * Mental Models Updated
+   *
+   * IDs of updated mental models
+   */
+  mental_models_updated?: Array<string>;
+  /**
+   * Directives Created
+   *
+   * Names of newly created directives
+   */
+  directives_created?: Array<string>;
+  /**
+   * Directives Updated
+   *
+   * Names of updated directives
+   */
+  directives_updated?: Array<string>;
+  /**
+   * Operation Ids
+   *
+   * Operation IDs for mental model content generation (async)
+   */
+  operation_ids?: Array<string>;
+  /**
+   * Dry Run
+   *
+   * True if this was a validation-only run
+   */
+  dry_run?: boolean;
+};
+
+/**
+ * BankTemplateManifest
+ *
+ * A bank template manifest for import/export.
+ *
+ * Version field enables forward-compatible schema evolution: the API
+ * auto-upgrades older manifest versions to the current schema on import.
+ */
+export type BankTemplateManifest = {
+  /**
+   * Version
+   *
+   * Manifest schema version (currently '1')
+   */
+  version: string;
+  /**
+   * Bank configuration to apply. Omit to leave config unchanged.
+   */
+  bank?: BankTemplateConfig | null;
+  /**
+   * Mental Models
+   *
+   * Mental models to create or update (matched by id). Omit to leave unchanged.
+   */
+  mental_models?: Array<BankTemplateMentalModel> | null;
+  /**
+   * Directives
+   *
+   * Directives to create or update (matched by name). Omit to leave unchanged.
+   */
+  directives?: Array<BankTemplateDirective> | null;
+};
+
+/**
+ * BankTemplateMentalModel
+ *
+ * A mental model definition within a bank template manifest.
+ */
+export type BankTemplateMentalModel = {
+  /**
+   * Id
+   *
+   * Unique ID for the mental model (alphanumeric lowercase with hyphens)
+   */
+  id: string;
+  /**
+   * Name
+   *
+   * Human-readable name for the mental model
+   */
+  name: string;
+  /**
+   * Source Query
+   *
+   * The query to run to generate content
+   */
+  source_query: string;
+  /**
+   * Tags
+   *
+   * Tags for scoped visibility
+   */
+  tags?: Array<string>;
+  /**
+   * Max Tokens
+   *
+   * Maximum tokens for generated content
+   */
+  max_tokens?: number;
+  /**
+   * Trigger settings
+   */
+  trigger?: MentalModelTriggerOutput;
 };
 
 /**
@@ -595,7 +986,7 @@ export type CreateMentalModelRequest = {
   /**
    * Trigger settings
    */
-  trigger?: MentalModelTrigger;
+  trigger?: MentalModelTriggerInput;
 };
 
 /**
@@ -820,6 +1211,22 @@ export type DocumentResponse = {
    * Tags associated with this document
    */
   tags?: Array<string>;
+  /**
+   * Document Metadata
+   *
+   * Document metadata
+   */
+  document_metadata?: {
+    [key: string]: unknown;
+  } | null;
+  /**
+   * Retain Params
+   *
+   * Parameters used during retain
+   */
+  retain_params?: {
+    [key: string]: unknown;
+  } | null;
 };
 
 /**
@@ -1244,6 +1651,18 @@ export type MemoryItem = {
     | "all_combinations"
     | Array<Array<string>>
     | null;
+  /**
+   * Strategy
+   *
+   * Named retain strategy for this item. Overrides the bank's default strategy for this item only. Strategies are defined in the bank config under 'retain_strategies'.
+   */
+  strategy?: string | null;
+  /**
+   * Update Mode
+   *
+   * How to handle an existing document with the same document_id. 'replace' (default) deletes old data and reprocesses from scratch. 'append' concatenates new content to the existing document text and reprocesses.
+   */
+  update_mode?: "replace" | "append" | null;
 };
 
 /**
@@ -1279,13 +1698,13 @@ export type MentalModelResponse = {
   /**
    * Source Query
    */
-  source_query: string;
+  source_query?: string | null;
   /**
    * Content
    *
    * The mental model content as well-formatted markdown (auto-generated from reflect endpoint)
    */
-  content: string;
+  content?: string | null;
   /**
    * Tags
    */
@@ -1293,8 +1712,8 @@ export type MentalModelResponse = {
   /**
    * Max Tokens
    */
-  max_tokens?: number;
-  trigger?: MentalModelTrigger;
+  max_tokens?: number | null;
+  trigger?: MentalModelTriggerOutput | null;
   /**
    * Last Refreshed At
    */
@@ -1318,13 +1737,91 @@ export type MentalModelResponse = {
  *
  * Trigger settings for a mental model.
  */
-export type MentalModelTrigger = {
+export type MentalModelTriggerInput = {
   /**
    * Refresh After Consolidation
    *
    * If true, refresh this mental model after observations consolidation (real-time mode)
    */
   refresh_after_consolidation?: boolean;
+  /**
+   * Fact Types
+   *
+   * Filter which fact types are retrieved during reflect. None means all types (world, experience, observation).
+   */
+  fact_types?: Array<"world" | "experience" | "observation"> | null;
+  /**
+   * Exclude Mental Models
+   *
+   * If true, exclude all mental models from the reflect loop (skip search_mental_models tool).
+   */
+  exclude_mental_models?: boolean;
+  /**
+   * Exclude Mental Model Ids
+   *
+   * Exclude specific mental models by ID from the reflect loop.
+   */
+  exclude_mental_model_ids?: Array<string> | null;
+  /**
+   * Tags Match
+   *
+   * Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Set to 'any' to include untagged memories alongside tagged ones during refresh.
+   */
+  tags_match?: "any" | "all" | "any_strict" | "all_strict" | null;
+  /**
+   * Tag Groups
+   *
+   * Compound boolean tag expressions to use during refresh instead of the model's own tags. When set, these tag groups are passed to reflect and the model's flat tags are NOT used for filtering. Supports nested and/or/not expressions for complex tag-based scoping.
+   */
+  tag_groups?: Array<
+    TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput
+  > | null;
+};
+
+/**
+ * MentalModelTrigger
+ *
+ * Trigger settings for a mental model.
+ */
+export type MentalModelTriggerOutput = {
+  /**
+   * Refresh After Consolidation
+   *
+   * If true, refresh this mental model after observations consolidation (real-time mode)
+   */
+  refresh_after_consolidation?: boolean;
+  /**
+   * Fact Types
+   *
+   * Filter which fact types are retrieved during reflect. None means all types (world, experience, observation).
+   */
+  fact_types?: Array<"world" | "experience" | "observation"> | null;
+  /**
+   * Exclude Mental Models
+   *
+   * If true, exclude all mental models from the reflect loop (skip search_mental_models tool).
+   */
+  exclude_mental_models?: boolean;
+  /**
+   * Exclude Mental Model Ids
+   *
+   * Exclude specific mental models by ID from the reflect loop.
+   */
+  exclude_mental_model_ids?: Array<string> | null;
+  /**
+   * Tags Match
+   *
+   * Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Set to 'any' to include untagged memories alongside tagged ones during refresh.
+   */
+  tags_match?: "any" | "all" | "any_strict" | "all_strict" | null;
+  /**
+   * Tag Groups
+   *
+   * Compound boolean tag expressions to use during refresh instead of the model's own tags. When set, these tag groups are passed to reflect and the model's flat tags are NOT used for filtering. Supports nested and/or/not expressions for complex tag-based scoping.
+   */
+  tag_groups?: Array<
+    TagGroupLeaf | TagGroupAndOutput | TagGroupOrOutput | TagGroupNotOutput
+  > | null;
 };
 
 /**
@@ -1488,6 +1985,14 @@ export type RecallRequest = {
    * How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), 'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged).
    */
   tags_match?: "any" | "all" | "any_strict" | "all_strict";
+  /**
+   * Tag Groups
+   *
+   * Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}.
+   */
+  tag_groups?: Array<
+    TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput
+  > | null;
 };
 
 /**
@@ -1592,6 +2097,18 @@ export type RecallResult = {
    * Source Fact Ids
    */
   source_fact_ids?: Array<string> | null;
+};
+
+/**
+ * RecoverConsolidationResponse
+ *
+ * Response model for recovering failed consolidation.
+ */
+export type RecoverConsolidationResponse = {
+  /**
+   * Retried Count
+   */
+  retried_count: number;
 };
 
 /**
@@ -1791,6 +2308,32 @@ export type ReflectRequest = {
    * How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), 'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged).
    */
   tags_match?: "any" | "all" | "any_strict" | "all_strict";
+  /**
+   * Tag Groups
+   *
+   * Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}.
+   */
+  tag_groups?: Array<
+    TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput
+  > | null;
+  /**
+   * Fact Types
+   *
+   * Filter which fact types are retrieved during reflect. None means all types (world, experience, observation).
+   */
+  fact_types?: Array<"world" | "experience" | "observation"> | null;
+  /**
+   * Exclude Mental Models
+   *
+   * If true, exclude all mental models from the reflect loop (skip search_mental_models tool).
+   */
+  exclude_mental_models?: boolean;
+  /**
+   * Exclude Mental Model Ids
+   *
+   * Exclude specific mental models by ID from the reflect loop.
+   */
+  exclude_mental_model_ids?: Array<string> | null;
 };
 
 /**
@@ -1942,9 +2485,15 @@ export type RetainResponse = {
   /**
    * Operation Id
    *
-   * Operation ID for tracking async operations. Use GET /v1/default/banks/{bank_id}/operations to list operations. Only present when async=true.
+   * Operation ID for tracking async operations. Use GET /v1/default/banks/{bank_id}/operations to list operations. Only present when async=true. When items use different per-item strategies, use operation_ids instead.
    */
   operation_id?: string | null;
+  /**
+   * Operation Ids
+   *
+   * Operation IDs when items were submitted as multiple strategy groups (async=true with mixed per-item strategies). operation_id is set to the first entry for backward compatibility.
+   */
+  operation_ids?: Array<string> | null;
   /**
    * Token usage metrics for LLM calls during fact extraction (only present for synchronous operations)
    */
@@ -1989,6 +2538,102 @@ export type SourceFactsIncludeOptions = {
    * Maximum tokens of source facts per observation (-1 = unlimited)
    */
   max_tokens_per_observation?: number;
+};
+
+/**
+ * TagGroupAnd
+ *
+ * Compound AND group: all child filters must match.
+ */
+export type TagGroupAndInput = {
+  /**
+   * And
+   */
+  and: Array<
+    TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput
+  >;
+};
+
+/**
+ * TagGroupAnd
+ *
+ * Compound AND group: all child filters must match.
+ */
+export type TagGroupAndOutput = {
+  /**
+   * And
+   */
+  and: Array<
+    TagGroupLeaf | TagGroupAndOutput | TagGroupOrOutput | TagGroupNotOutput
+  >;
+};
+
+/**
+ * TagGroupLeaf
+ *
+ * A leaf tag filter: matches memories by tag list and match mode.
+ */
+export type TagGroupLeaf = {
+  /**
+   * Tags
+   */
+  tags: Array<string>;
+  /**
+   * Match
+   */
+  match?: "any" | "all" | "any_strict" | "all_strict";
+};
+
+/**
+ * TagGroupNot
+ *
+ * Compound NOT group: child filter must NOT match.
+ */
+export type TagGroupNotInput = {
+  /**
+   * Not
+   */
+  not: TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput;
+};
+
+/**
+ * TagGroupNot
+ *
+ * Compound NOT group: child filter must NOT match.
+ */
+export type TagGroupNotOutput = {
+  /**
+   * Not
+   */
+  not: TagGroupLeaf | TagGroupAndOutput | TagGroupOrOutput | TagGroupNotOutput;
+};
+
+/**
+ * TagGroupOr
+ *
+ * Compound OR group: at least one child filter must match.
+ */
+export type TagGroupOrInput = {
+  /**
+   * Or
+   */
+  or: Array<
+    TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput
+  >;
+};
+
+/**
+ * TagGroupOr
+ *
+ * Compound OR group: at least one child filter must match.
+ */
+export type TagGroupOrOutput = {
+  /**
+   * Or
+   */
+  or: Array<
+    TagGroupLeaf | TagGroupAndOutput | TagGroupOrOutput | TagGroupNotOutput
+  >;
 };
 
 /**
@@ -2160,7 +2805,7 @@ export type UpdateMentalModelRequest = {
   /**
    * Trigger settings
    */
-  trigger?: MentalModelTrigger | null;
+  trigger?: MentalModelTriggerInput | null;
 };
 
 /**
@@ -2215,6 +2860,20 @@ export type ValidationError = {
    * Error Type
    */
   type: string;
+  /**
+   * Input
+   */
+  input?: unknown;
+  /**
+   * Context
+   */
+  ctx?: {
+    [key: string]: unknown;
+  };
+  /**
+   * URL
+   */
+  url?: string;
 };
 
 /**
@@ -2936,6 +3595,12 @@ export type ListMentalModelsData = {
      */
     tags_match?: "any" | "all" | "exact";
     /**
+     * Detail
+     *
+     * Detail level: 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response)
+     */
+    detail?: "metadata" | "content" | "full";
+    /**
      * Limit
      */
     limit?: number;
@@ -3062,7 +3727,14 @@ export type GetMentalModelData = {
      */
     mental_model_id: string;
   };
-  query?: never;
+  query?: {
+    /**
+     * Detail
+     *
+     * Detail level: 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response)
+     */
+    detail?: "metadata" | "content" | "full";
+  };
   url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}";
 };
 
@@ -4127,6 +4799,103 @@ export type CreateOrUpdateBankResponses = {
 export type CreateOrUpdateBankResponse =
   CreateOrUpdateBankResponses[keyof CreateOrUpdateBankResponses];
 
+export type ImportBankTemplateData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: {
+    /**
+     * Dry Run
+     *
+     * Validate only, do not apply changes
+     */
+    dry_run?: boolean;
+  };
+  url: "/v1/default/banks/{bank_id}/import";
+};
+
+export type ImportBankTemplateErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type ImportBankTemplateError =
+  ImportBankTemplateErrors[keyof ImportBankTemplateErrors];
+
+export type ImportBankTemplateResponses = {
+  /**
+   * Successful Response
+   */
+  200: BankTemplateImportResponse;
+};
+
+export type ImportBankTemplateResponse =
+  ImportBankTemplateResponses[keyof ImportBankTemplateResponses];
+
+export type ExportBankTemplateData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/export";
+};
+
+export type ExportBankTemplateErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type ExportBankTemplateError =
+  ExportBankTemplateErrors[keyof ExportBankTemplateErrors];
+
+export type ExportBankTemplateResponses = {
+  /**
+   * Successful Response
+   */
+  200: BankTemplateManifest;
+};
+
+export type ExportBankTemplateResponse =
+  ExportBankTemplateResponses[keyof ExportBankTemplateResponses];
+
+export type GetBankTemplateSchemaData = {
+  body?: never;
+  path?: never;
+  query?: never;
+  url: "/v1/bank-template-schema";
+};
+
+export type GetBankTemplateSchemaResponses = {
+  /**
+   * Successful Response
+   */
+  200: unknown;
+};
+
 export type ClearObservationsData = {
   body?: never;
   headers?: {
@@ -4164,6 +4933,44 @@ export type ClearObservationsResponses = {
 
 export type ClearObservationsResponse =
   ClearObservationsResponses[keyof ClearObservationsResponses];
+
+export type RecoverConsolidationData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/consolidation/recover";
+};
+
+export type RecoverConsolidationErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type RecoverConsolidationError =
+  RecoverConsolidationErrors[keyof RecoverConsolidationErrors];
+
+export type RecoverConsolidationResponses = {
+  /**
+   * Successful Response
+   */
+  200: RecoverConsolidationResponse;
+};
+
+export type RecoverConsolidationResponse2 =
+  RecoverConsolidationResponses[keyof RecoverConsolidationResponses];
 
 export type ClearMemoryObservationsData = {
   body?: never;
@@ -4688,3 +5495,127 @@ export type FileRetainResponses = {
 
 export type FileRetainResponse2 =
   FileRetainResponses[keyof FileRetainResponses];
+
+export type ListAuditLogsData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: {
+    /**
+     * Action
+     *
+     * Filter by action type
+     */
+    action?: string | null;
+    /**
+     * Transport
+     *
+     * Filter by transport (http, mcp, system)
+     */
+    transport?: string | null;
+    /**
+     * Start Date
+     *
+     * Filter from this ISO datetime (inclusive)
+     */
+    start_date?: string | null;
+    /**
+     * End Date
+     *
+     * Filter until this ISO datetime (exclusive)
+     */
+    end_date?: string | null;
+    /**
+     * Limit
+     *
+     * Max items to return
+     */
+    limit?: number;
+    /**
+     * Offset
+     *
+     * Offset for pagination
+     */
+    offset?: number;
+  };
+  url: "/v1/default/banks/{bank_id}/audit-logs";
+};
+
+export type ListAuditLogsErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type ListAuditLogsError = ListAuditLogsErrors[keyof ListAuditLogsErrors];
+
+export type ListAuditLogsResponses = {
+  /**
+   * Successful Response
+   */
+  200: AuditLogListResponse;
+};
+
+export type ListAuditLogsResponse =
+  ListAuditLogsResponses[keyof ListAuditLogsResponses];
+
+export type AuditLogStatsData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: {
+    /**
+     * Action
+     *
+     * Filter by action type
+     */
+    action?: string | null;
+    /**
+     * Period
+     *
+     * Time period: 1d, 7d, or 30d
+     */
+    period?: string;
+  };
+  url: "/v1/default/banks/{bank_id}/audit-logs/stats";
+};
+
+export type AuditLogStatsErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type AuditLogStatsError = AuditLogStatsErrors[keyof AuditLogStatsErrors];
+
+export type AuditLogStatsResponses = {
+  /**
+   * Successful Response
+   */
+  200: AuditLogStatsResponse;
+};
+
+export type AuditLogStatsResponse2 =
+  AuditLogStatsResponses[keyof AuditLogStatsResponses];

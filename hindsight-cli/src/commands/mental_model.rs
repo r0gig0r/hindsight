@@ -43,9 +43,11 @@ pub fn list(
                         );
 
                         // Show content preview
-                        let preview: String = mental_model.content.chars().take(80).collect();
-                        let ellipsis = if mental_model.content.len() > 80 { "..." } else { "" };
-                        println!("    {}{}", ui::dim(&preview), ellipsis);
+                        if let Some(ref content) = mental_model.content {
+                            let preview: String = content.chars().take(80).collect();
+                            let ellipsis = if content.len() > 80 { "..." } else { "" };
+                            println!("    {}{}", ui::dim(&preview), ellipsis);
+                        }
 
                         println!();
                     }
@@ -93,12 +95,16 @@ pub fn get(
 }
 
 /// Create a new mental model
+#[allow(clippy::too_many_arguments)]
 pub fn create(
     client: &ApiClient,
     bank_id: &str,
     name: &str,
     source_query: &str,
     id: Option<&str>,
+    tags: Vec<String>,
+    max_tokens: i64,
+    trigger_refresh_after_consolidation: bool,
     verbose: bool,
     output_format: OutputFormat,
 ) -> Result<()> {
@@ -108,13 +114,28 @@ pub fn create(
         None
     };
 
+    // Only send a trigger when the user opted in, so the server's default
+    // behaviour is preserved otherwise.
+    let trigger = if trigger_refresh_after_consolidation {
+        Some(types::MentalModelTriggerInput {
+            refresh_after_consolidation: true,
+            exclude_mental_models: false,
+            exclude_mental_model_ids: None,
+            fact_types: None,
+            tag_groups: None,
+            tags_match: None,
+        })
+    } else {
+        None
+    };
+
     let request = types::CreateMentalModelRequest {
         id: id.map(|s| s.to_string()),
         name: name.to_string(),
         source_query: source_query.to_string(),
-        max_tokens: 2048,
-        tags: vec![],
-        trigger: None,
+        max_tokens,
+        tags,
+        trigger,
     };
 
     let response = client.create_mental_model(bank_id, &request, verbose);
@@ -137,16 +158,29 @@ pub fn create(
 }
 
 /// Update a mental model
+#[allow(clippy::too_many_arguments)]
 pub fn update(
     client: &ApiClient,
     bank_id: &str,
     mental_model_id: &str,
     name: Option<String>,
+    source_query: Option<String>,
+    max_tokens: Option<i64>,
+    tags: Option<Vec<String>>,
+    trigger_refresh_after_consolidation: Option<bool>,
     verbose: bool,
     output_format: OutputFormat,
 ) -> Result<()> {
-    if name.is_none() {
-        anyhow::bail!("--name must be provided");
+    if name.is_none()
+        && source_query.is_none()
+        && max_tokens.is_none()
+        && tags.is_none()
+        && trigger_refresh_after_consolidation.is_none()
+    {
+        anyhow::bail!(
+            "At least one of --name, --source-query, --max-tokens, --tags, or \
+             --trigger-refresh-after-consolidation must be provided"
+        );
     }
 
     let spinner = if output_format == OutputFormat::Pretty {
@@ -155,12 +189,23 @@ pub fn update(
         None
     };
 
+    // Only build a trigger override when the user actually passed the flag;
+    // sending None leaves the existing trigger config untouched on the server.
+    let trigger = trigger_refresh_after_consolidation.map(|refresh| types::MentalModelTriggerInput {
+        refresh_after_consolidation: refresh,
+        exclude_mental_models: false,
+        exclude_mental_model_ids: None,
+        fact_types: None,
+        tag_groups: None,
+        tags_match: None,
+    });
+
     let request = types::UpdateMentalModelRequest {
         name,
-        source_query: None,
-        max_tokens: None,
-        tags: None,
-        trigger: None,
+        source_query,
+        max_tokens,
+        tags,
+        trigger,
     };
 
     let response = client.update_mental_model(bank_id, mental_model_id, &request, verbose);
@@ -272,16 +317,69 @@ pub fn refresh(
     }
 }
 
+/// Get the change history of a mental model
+pub fn history(
+    client: &ApiClient,
+    bank_id: &str,
+    mental_model_id: &str,
+    verbose: bool,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let spinner = if output_format == OutputFormat::Pretty {
+        Some(ui::create_spinner("Fetching mental model history..."))
+    } else {
+        None
+    };
+
+    let response = client.get_mental_model_history(bank_id, mental_model_id, verbose);
+
+    if let Some(mut sp) = spinner {
+        sp.finish();
+    }
+
+    match response {
+        Ok(history) => {
+            if output_format == OutputFormat::Pretty {
+                ui::print_section_header(&format!("History: {}", mental_model_id));
+
+                if let Some(entries) = history.as_array() {
+                    if entries.is_empty() {
+                        println!("  {}", ui::dim("No history entries found."));
+                    } else {
+                        for entry in entries {
+                            let changed_at = entry.get("changed_at").and_then(|v| v.as_str()).unwrap_or("unknown");
+                            let previous = entry.get("previous_content").and_then(|v| v.as_str()).unwrap_or("(none)");
+                            println!("  {} {}", ui::dim("Changed at:"), changed_at);
+                            let preview: String = previous.chars().take(80).collect();
+                            let ellipsis = if previous.len() > 80 { "..." } else { "" };
+                            println!("  {} {}{}", ui::dim("Previous:"), ui::dim(&preview), ellipsis);
+                            println!();
+                        }
+                    }
+                }
+            } else {
+                output::print_output(&history, output_format)?;
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 // Helper function to print mental model details
 fn print_mental_model_detail(mental_model: &types::MentalModelResponse) {
     ui::print_section_header(&mental_model.name);
 
     println!("  {} {}", ui::dim("ID:"), ui::gradient_start(&mental_model.id));
-    println!("  {} {}", ui::dim("Source Query:"), &mental_model.source_query);
+    if let Some(ref source_query) = mental_model.source_query {
+        println!("  {} {}", ui::dim("Source Query:"), source_query);
+    }
 
-    println!();
-    println!("{}", ui::gradient_text("─── Content ───"));
-    println!();
-    println!("{}", &mental_model.content);
-    println!();
+    if let Some(ref content) = mental_model.content {
+        println!();
+        println!("{}", ui::gradient_text("─── Content ───"));
+        println!();
+        println!("{}", content);
+        println!();
+    }
 }

@@ -7,7 +7,7 @@ info:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0.html
   title: Hindsight HTTP API
-  version: 0.4.17
+  version: 0.5.0
 servers:
 - url: /
 paths:
@@ -656,6 +656,23 @@ paths:
           title: Tags Match
           type: string
         style: form
+      - description: "Detail level: 'metadata' (names/tags only), 'content' (adds\
+          \ content/config), 'full' (includes reflect_response)"
+        explode: true
+        in: query
+        name: detail
+        required: false
+        schema:
+          default: full
+          description: "Detail level: 'metadata' (names/tags only), 'content' (adds\
+            \ content/config), 'full' (includes reflect_response)"
+          enum:
+          - metadata
+          - content
+          - full
+          title: Detail
+          type: string
+        style: form
       - explode: true
         in: query
         name: limit
@@ -810,6 +827,23 @@ paths:
           title: Mental Model Id
           type: string
         style: simple
+      - description: "Detail level: 'metadata' (names/tags only), 'content' (adds\
+          \ content/config), 'full' (includes reflect_response)"
+        explode: true
+        in: query
+        name: detail
+        required: false
+        schema:
+          default: full
+          description: "Detail level: 'metadata' (names/tags only), 'content' (adds\
+            \ content/config), 'full' (includes reflect_response)"
+          enum:
+          - metadata
+          - content
+          - full
+          title: Detail
+          type: string
+        style: form
       - explode: false
         in: header
         name: authorization
@@ -2068,6 +2102,111 @@ paths:
       summary: Create or update memory bank
       tags:
       - Banks
+  /v1/default/banks/{bank_id}/import:
+    post:
+      description: "Import a bank template manifest to create or update a bank's configuration,\
+        \ mental models, and directives. If the bank does not exist it is created.\
+        \ Config fields are applied as per-bank overrides. Mental models are matched\
+        \ by id, directives by name — existing ones are updated, new ones are created.\
+        \ Use dry_run=true to validate the manifest without applying changes."
+      operationId: import_bank_template
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - description: "Validate only, do not apply changes"
+        explode: true
+        in: query
+        name: dry_run
+        required: false
+        schema:
+          default: false
+          description: "Validate only, do not apply changes"
+          title: Dry Run
+          type: boolean
+        style: form
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BankTemplateImportResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Import bank template
+      tags:
+      - Bank Templates
+  /v1/default/banks/{bank_id}/export:
+    get:
+      description: "Export a bank's current configuration, mental models, and directives\
+        \ as a template manifest. The exported manifest can be imported into another\
+        \ bank to replicate the setup."
+      operationId: export_bank_template
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BankTemplateManifest'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Export bank template
+      tags:
+      - Bank Templates
+  /v1/bank-template-schema:
+    get:
+      description: Returns the JSON Schema for the bank template manifest format.
+        Use this to validate template manifests before importing.
+      operationId: get_bank_template_schema
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      summary: Get bank template JSON Schema
+      tags:
+      - Bank Templates
   /v1/default/banks/{bank_id}/observations:
     delete:
       description: Delete all observations for a memory bank. This is useful for resetting
@@ -2104,6 +2243,46 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       summary: Clear all observations
+      tags:
+      - Banks
+  /v1/default/banks/{bank_id}/consolidation/recover:
+    post:
+      description: Reset all memories that were permanently marked as failed during
+        consolidation (after exhausting all LLM retries and adaptive batch splitting)
+        so they are picked up again on the next consolidation run. Does not delete
+        any observations.
+      operationId: recover_consolidation
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoverConsolidationResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Recover failed consolidation
       tags:
       - Banks
   /v1/default/banks/{bank_id}/memories/{memory_id}/observations:
@@ -2742,6 +2921,161 @@ paths:
       summary: Convert files to memories
       tags:
       - Files
+  /v1/default/banks/{bank_id}/audit-logs:
+    get:
+      description: "List audit log entries for a bank, ordered by most recent first."
+      operationId: list_audit_logs
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - description: Filter by action type
+        explode: true
+        in: query
+        name: action
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      - description: "Filter by transport (http, mcp, system)"
+        explode: true
+        in: query
+        name: transport
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      - description: Filter from this ISO datetime (inclusive)
+        explode: true
+        in: query
+        name: start_date
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      - description: Filter until this ISO datetime (exclusive)
+        explode: true
+        in: query
+        name: end_date
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      - description: Max items to return
+        explode: true
+        in: query
+        name: limit
+        required: false
+        schema:
+          default: 50
+          description: Max items to return
+          maximum: 500
+          minimum: 1
+          title: Limit
+          type: integer
+        style: form
+      - description: Offset for pagination
+        explode: true
+        in: query
+        name: offset
+        required: false
+        schema:
+          default: 0
+          description: Offset for pagination
+          minimum: 0
+          title: Offset
+          type: integer
+        style: form
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditLogListResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: List audit logs
+      tags:
+      - Audit
+  /v1/default/banks/{bank_id}/audit-logs/stats:
+    get:
+      description: Get audit log counts grouped by time bucket for charting.
+      operationId: audit_log_stats
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - description: Filter by action type
+        explode: true
+        in: query
+        name: action
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      - description: "Time period: 1d, 7d, or 30d"
+        explode: true
+        in: query
+        name: period
+        required: false
+        schema:
+          default: 7d
+          description: "Time period: 1d, 7d, or 30d"
+          title: Period
+          type: string
+        style: form
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditLogStatsResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Audit log statistics
+      tags:
+      - Audit
 components:
   schemas:
     AddBackgroundRequest:
@@ -2779,6 +3113,185 @@ components:
       - operation_id
       - status
       title: AsyncOperationSubmitResponse
+    AuditLogEntry:
+      description: A single audit log entry.
+      example:
+        duration_ms: 5
+        request:
+          key: ""
+        metadata:
+          key: ""
+        bank_id: bank_id
+        response:
+          key: ""
+        action: action
+        started_at: started_at
+        id: id
+        transport: transport
+        ended_at: ended_at
+      properties:
+        id:
+          title: Id
+          type: string
+        action:
+          title: Action
+          type: string
+        transport:
+          title: Transport
+          type: string
+        bank_id:
+          nullable: true
+          type: string
+        started_at:
+          nullable: true
+          type: string
+        ended_at:
+          nullable: true
+          type: string
+        duration_ms:
+          nullable: true
+          type: integer
+        request:
+          additionalProperties: {}
+          nullable: true
+        response:
+          additionalProperties: {}
+          nullable: true
+        metadata:
+          additionalProperties: {}
+          title: Metadata
+      required:
+      - action
+      - bank_id
+      - ended_at
+      - id
+      - metadata
+      - request
+      - response
+      - started_at
+      - transport
+      title: AuditLogEntry
+    AuditLogListResponse:
+      description: Response model for list audit logs endpoint.
+      example:
+        total: 0
+        offset: 1
+        bank_id: bank_id
+        limit: 6
+        items:
+        - duration_ms: 5
+          request:
+            key: ""
+          metadata:
+            key: ""
+          bank_id: bank_id
+          response:
+            key: ""
+          action: action
+          started_at: started_at
+          id: id
+          transport: transport
+          ended_at: ended_at
+        - duration_ms: 5
+          request:
+            key: ""
+          metadata:
+            key: ""
+          bank_id: bank_id
+          response:
+            key: ""
+          action: action
+          started_at: started_at
+          id: id
+          transport: transport
+          ended_at: ended_at
+      properties:
+        bank_id:
+          title: Bank Id
+          type: string
+        total:
+          title: Total
+          type: integer
+        limit:
+          title: Limit
+          type: integer
+        offset:
+          title: Offset
+          type: integer
+        items:
+          items:
+            $ref: '#/components/schemas/AuditLogEntry'
+          type: array
+      required:
+      - bank_id
+      - items
+      - limit
+      - offset
+      - total
+      title: AuditLogListResponse
+    AuditLogStatsBucket:
+      description: A single time bucket in audit log stats.
+      example:
+        total: 6
+        time: time
+        actions:
+          key: 0
+      properties:
+        time:
+          title: Time
+          type: string
+        actions:
+          additionalProperties:
+            type: integer
+          title: Actions
+        total:
+          title: Total
+          type: integer
+      required:
+      - actions
+      - time
+      - total
+      title: AuditLogStatsBucket
+    AuditLogStatsResponse:
+      description: Response model for audit log stats endpoint.
+      example:
+        period: period
+        trunc: trunc
+        bank_id: bank_id
+        buckets:
+        - total: 6
+          time: time
+          actions:
+            key: 0
+        - total: 6
+          time: time
+          actions:
+            key: 0
+        start: start
+      properties:
+        bank_id:
+          title: Bank Id
+          type: string
+        period:
+          title: Period
+          type: string
+        trunc:
+          title: Trunc
+          type: string
+        start:
+          title: Start
+          type: string
+        buckets:
+          items:
+            $ref: '#/components/schemas/AuditLogStatsBucket'
+          type: array
+      required:
+      - bank_id
+      - buckets
+      - period
+      - start
+      - trunc
+      title: AuditLogStatsResponse
     BackgroundResponse:
       description: "Response model for background update. Deprecated: use MissionResponse\
         \ instead."
@@ -3012,6 +3525,242 @@ components:
       - total_links
       - total_nodes
       title: BankStatsResponse
+    BankTemplateConfig:
+      description: |-
+        Bank configuration fields within a template manifest.
+
+        Only includes configurable (per-bank) fields. Credential fields
+        (API keys, base URLs) are intentionally excluded for security.
+      properties:
+        reflect_mission:
+          nullable: true
+          type: string
+        retain_mission:
+          nullable: true
+          type: string
+        retain_extraction_mode:
+          nullable: true
+          type: string
+        retain_custom_instructions:
+          nullable: true
+          type: string
+        retain_chunk_size:
+          nullable: true
+          type: integer
+        enable_observations:
+          nullable: true
+          type: boolean
+        observations_mission:
+          nullable: true
+          type: string
+        disposition_skepticism:
+          maximum: 5.0
+          minimum: 1.0
+          nullable: true
+          type: integer
+        disposition_literalism:
+          maximum: 5.0
+          minimum: 1.0
+          nullable: true
+          type: integer
+        disposition_empathy:
+          maximum: 5.0
+          minimum: 1.0
+          nullable: true
+          type: integer
+        entity_labels:
+          items:
+            additionalProperties: {}
+          nullable: true
+          type: array
+        entities_allow_free_form:
+          nullable: true
+          type: boolean
+      title: BankTemplateConfig
+    BankTemplateDirective:
+      description: |-
+        A directive definition within a bank template manifest.
+
+        Directives are matched by name on re-import: existing directives
+        with the same name are updated, new ones are created.
+      properties:
+        name:
+          description: Human-readable name for the directive (used as match key on
+            re-import)
+          title: Name
+          type: string
+        content:
+          description: The directive text to inject into prompts
+          title: Content
+          type: string
+        priority:
+          default: 0
+          description: Higher priority directives are injected first
+          title: Priority
+          type: integer
+        is_active:
+          default: true
+          description: Whether this directive is active
+          title: Is Active
+          type: boolean
+        tags:
+          default: []
+          description: Tags for filtering
+          items:
+            type: string
+          type: array
+      required:
+      - content
+      - name
+      title: BankTemplateDirective
+    BankTemplateImportResponse:
+      description: Response model for the bank template import endpoint.
+      example:
+        operation_ids:
+        - operation_ids
+        - operation_ids
+        directives_created:
+        - directives_created
+        - directives_created
+        bank_id: bank_id
+        mental_models_updated:
+        - mental_models_updated
+        - mental_models_updated
+        directives_updated:
+        - directives_updated
+        - directives_updated
+        config_applied: true
+        mental_models_created:
+        - mental_models_created
+        - mental_models_created
+        dry_run: false
+      properties:
+        bank_id:
+          description: Bank that was imported into
+          title: Bank Id
+          type: string
+        config_applied:
+          description: Whether bank config was updated
+          title: Config Applied
+          type: boolean
+        mental_models_created:
+          default: []
+          description: IDs of newly created mental models
+          items:
+            type: string
+          type: array
+        mental_models_updated:
+          default: []
+          description: IDs of updated mental models
+          items:
+            type: string
+          type: array
+        directives_created:
+          default: []
+          description: Names of newly created directives
+          items:
+            type: string
+          type: array
+        directives_updated:
+          default: []
+          description: Names of updated directives
+          items:
+            type: string
+          type: array
+        operation_ids:
+          default: []
+          description: Operation IDs for mental model content generation (async)
+          items:
+            type: string
+          type: array
+        dry_run:
+          default: false
+          description: True if this was a validation-only run
+          title: Dry Run
+          type: boolean
+      required:
+      - bank_id
+      - config_applied
+      title: BankTemplateImportResponse
+    BankTemplateManifest:
+      description: |-
+        A bank template manifest for import/export.
+
+        Version field enables forward-compatible schema evolution: the API
+        auto-upgrades older manifest versions to the current schema on import.
+      example:
+        bank:
+          disposition_empathy: 5
+          enable_observations: true
+          reflect_mission: You are helping a support agent remember customer interactions.
+          retain_mission: "Extract customer issues, resolutions, and sentiment."
+        directives:
+        - content: Always respond with empathy and understanding.
+          name: Always be empathetic
+          priority: 10
+        mental_models:
+        - id: sentiment-overview
+          name: Customer Sentiment Overview
+          source_query: What is the overall sentiment trend?
+          trigger:
+            refresh_after_consolidation: true
+        version: "1"
+      properties:
+        version:
+          description: Manifest schema version (currently '1')
+          title: Version
+          type: string
+        bank:
+          $ref: '#/components/schemas/BankTemplateConfig'
+        mental_models:
+          items:
+            $ref: '#/components/schemas/BankTemplateMentalModel'
+          nullable: true
+          type: array
+        directives:
+          items:
+            $ref: '#/components/schemas/BankTemplateDirective'
+          nullable: true
+          type: array
+      required:
+      - version
+      title: BankTemplateManifest
+    BankTemplateMentalModel:
+      description: A mental model definition within a bank template manifest.
+      properties:
+        id:
+          description: Unique ID for the mental model (alphanumeric lowercase with
+            hyphens)
+          title: Id
+          type: string
+        name:
+          description: Human-readable name for the mental model
+          title: Name
+          type: string
+        source_query:
+          description: The query to run to generate content
+          title: Source Query
+          type: string
+        tags:
+          default: []
+          description: Tags for scoped visibility
+          items:
+            type: string
+          type: array
+        max_tokens:
+          default: 2048
+          description: Maximum tokens for generated content
+          maximum: 8192.0
+          minimum: 256.0
+          title: Max Tokens
+          type: integer
+        trigger:
+          $ref: '#/components/schemas/MentalModelTrigger-Output'
+      required:
+      - id
+      - name
+      - source_query
+      title: BankTemplateMentalModel
     Body_file_retain:
       properties:
         files:
@@ -3307,7 +4056,7 @@ components:
           title: Max Tokens
           type: integer
         trigger:
-          $ref: '#/components/schemas/MentalModelTrigger'
+          $ref: '#/components/schemas/MentalModelTrigger-Input'
       required:
       - name
       - source_query
@@ -3536,9 +4285,15 @@ components:
         bank_id: user123
         content_hash: abc123
         created_at: 2024-01-15T10:30:00Z
+        document_metadata:
+          channel: '#general'
+          source: slack
         id: session_1
         memory_unit_count: 15
         original_text: Full document text here...
+        retain_params:
+          context: Team meeting notes
+          event_date: 2024-01-15
         tags:
         - user_a
         - session_123
@@ -3571,6 +4326,12 @@ components:
           items:
             type: string
           type: array
+        document_metadata:
+          additionalProperties: {}
+          nullable: true
+        retain_params:
+          additionalProperties: {}
+          nullable: true
       required:
       - bank_id
       - content_hash
@@ -3844,12 +4605,18 @@ components:
           loc:
           - ValidationError_loc_inner
           - ValidationError_loc_inner
+          input: ""
+          ctx: "{}"
           type: type
+          url: url
         - msg: msg
           loc:
           - ValidationError_loc_inner
           - ValidationError_loc_inner
+          input: ""
+          ctx: "{}"
           type: type
+          url: url
       properties:
         detail:
           items:
@@ -4014,6 +4781,15 @@ components:
           type: array
         observation_scopes:
           $ref: '#/components/schemas/ObservationScopes'
+        strategy:
+          nullable: true
+          type: string
+        update_mode:
+          enum:
+          - replace
+          - append
+          nullable: true
+          type: string
       required:
       - content
       title: MemoryItem
@@ -4031,6 +4807,23 @@ components:
           id: id
           trigger:
             refresh_after_consolidation: false
+            tag_groups:
+            - match: any_strict
+              tags:
+              - tags
+              - tags
+            - match: any_strict
+              tags:
+              - tags
+              - tags
+            fact_types:
+            - world
+            - world
+            exclude_mental_model_ids:
+            - exclude_mental_model_ids
+            - exclude_mental_model_ids
+            tags_match: any
+            exclude_mental_models: false
           last_refreshed_at: last_refreshed_at
           content: content
           tags:
@@ -4046,6 +4839,23 @@ components:
           id: id
           trigger:
             refresh_after_consolidation: false
+            tag_groups:
+            - match: any_strict
+              tags:
+              - tags
+              - tags
+            - match: any_strict
+              tags:
+              - tags
+              - tags
+            fact_types:
+            - world
+            - world
+            exclude_mental_model_ids:
+            - exclude_mental_model_ids
+            - exclude_mental_model_ids
+            tags_match: any
+            exclude_mental_models: false
           last_refreshed_at: last_refreshed_at
           content: content
           tags:
@@ -4072,6 +4882,23 @@ components:
         id: id
         trigger:
           refresh_after_consolidation: false
+          tag_groups:
+          - match: any_strict
+            tags:
+            - tags
+            - tags
+          - match: any_strict
+            tags:
+            - tags
+            - tags
+          fact_types:
+          - world
+          - world
+          exclude_mental_model_ids:
+          - exclude_mental_model_ids
+          - exclude_mental_model_ids
+          tags_match: any
+          exclude_mental_models: false
         last_refreshed_at: last_refreshed_at
         content: content
         tags:
@@ -4088,12 +4915,10 @@ components:
           title: Name
           type: string
         source_query:
-          title: Source Query
+          nullable: true
           type: string
         content:
-          description: The mental model content as well-formatted markdown (auto-generated
-            from reflect endpoint)
-          title: Content
+          nullable: true
           type: string
         tags:
           default: []
@@ -4101,11 +4926,10 @@ components:
             type: string
           type: array
         max_tokens:
-          default: 2048
-          title: Max Tokens
+          nullable: true
           type: integer
         trigger:
-          $ref: '#/components/schemas/MentalModelTrigger'
+          $ref: '#/components/schemas/MentalModelTrigger-Output'
         last_refreshed_at:
           nullable: true
           type: string
@@ -4117,15 +4941,11 @@ components:
           nullable: true
       required:
       - bank_id
-      - content
       - id
       - name
-      - source_query
       title: MentalModelResponse
-    MentalModelTrigger:
+    MentalModelTrigger-Input:
       description: Trigger settings for a mental model.
-      example:
-        refresh_after_consolidation: false
       properties:
         refresh_after_consolidation:
           default: false
@@ -4133,6 +4953,101 @@ components:
             \ (real-time mode)"
           title: Refresh After Consolidation
           type: boolean
+        fact_types:
+          items:
+            enum:
+            - world
+            - experience
+            - observation
+            type: string
+          nullable: true
+          type: array
+        exclude_mental_models:
+          default: false
+          description: "If true, exclude all mental models from the reflect loop (skip\
+            \ search_mental_models tool)."
+          title: Exclude Mental Models
+          type: boolean
+        exclude_mental_model_ids:
+          items:
+            type: string
+          nullable: true
+          type: array
+        tags_match:
+          enum:
+          - any
+          - all
+          - any_strict
+          - all_strict
+          nullable: true
+          type: string
+        tag_groups:
+          items:
+            $ref: '#/components/schemas/MentalModelTrigger_Input_tag_groups_inner'
+          nullable: true
+          type: array
+      title: MentalModelTrigger
+    MentalModelTrigger-Output:
+      description: Trigger settings for a mental model.
+      example:
+        refresh_after_consolidation: false
+        tag_groups:
+        - match: any_strict
+          tags:
+          - tags
+          - tags
+        - match: any_strict
+          tags:
+          - tags
+          - tags
+        fact_types:
+        - world
+        - world
+        exclude_mental_model_ids:
+        - exclude_mental_model_ids
+        - exclude_mental_model_ids
+        tags_match: any
+        exclude_mental_models: false
+      properties:
+        refresh_after_consolidation:
+          default: false
+          description: "If true, refresh this mental model after observations consolidation\
+            \ (real-time mode)"
+          title: Refresh After Consolidation
+          type: boolean
+        fact_types:
+          items:
+            enum:
+            - world
+            - experience
+            - observation
+            type: string
+          nullable: true
+          type: array
+        exclude_mental_models:
+          default: false
+          description: "If true, exclude all mental models from the reflect loop (skip\
+            \ search_mental_models tool)."
+          title: Exclude Mental Models
+          type: boolean
+        exclude_mental_model_ids:
+          items:
+            type: string
+          nullable: true
+          type: array
+        tags_match:
+          enum:
+          - any
+          - all
+          - any_strict
+          - all_strict
+          nullable: true
+          type: string
+        tag_groups:
+          items:
+            $ref: '#/components/schemas/MentalModelTrigger_Output_tag_groups_inner'
+          nullable: true
+          type: array
       title: MentalModelTrigger
     OperationResponse:
       description: Response model for a single async operation.
@@ -4314,6 +5229,11 @@ components:
           - all_strict
           title: Tags Match
           type: string
+        tag_groups:
+          items:
+            $ref: '#/components/schemas/MentalModelTrigger_Input_tag_groups_inner'
+          nullable: true
+          type: array
       required:
       - query
       title: RecallRequest
@@ -4441,6 +5361,17 @@ components:
       - id
       - text
       title: RecallResult
+    RecoverConsolidationResponse:
+      description: Response model for recovering failed consolidation.
+      example:
+        retried_count: 42
+      properties:
+        retried_count:
+          title: Retried Count
+          type: integer
+      required:
+      - retried_count
+      title: RecoverConsolidationResponse
     ReflectBasedOn:
       description: "Evidence the response is based on: memories, mental models, and\
         \ directives."
@@ -4620,6 +5551,31 @@ components:
           - all_strict
           title: Tags Match
           type: string
+        tag_groups:
+          items:
+            $ref: '#/components/schemas/MentalModelTrigger_Input_tag_groups_inner'
+          nullable: true
+          type: array
+        fact_types:
+          items:
+            enum:
+            - world
+            - experience
+            - observation
+            type: string
+          nullable: true
+          type: array
+        exclude_mental_models:
+          default: false
+          description: "If true, exclude all mental models from the reflect loop (skip\
+            \ search_mental_models tool)."
+          title: Exclude Mental Models
+          type: boolean
+        exclude_mental_model_ids:
+          items:
+            type: string
+          nullable: true
+          type: array
       required:
       - query
       title: ReflectRequest
@@ -4785,6 +5741,11 @@ components:
         operation_id:
           nullable: true
           type: string
+        operation_ids:
+          items:
+            type: string
+          nullable: true
+          type: array
         usage:
           $ref: '#/components/schemas/TokenUsage'
       required:
@@ -4829,6 +5790,86 @@ components:
           title: Max Tokens Per Observation
           type: integer
       title: SourceFactsIncludeOptions
+    TagGroupAnd-Input:
+      description: "Compound AND group: all child filters must match."
+      properties:
+        and:
+          items:
+            $ref: '#/components/schemas/MentalModelTrigger_Input_tag_groups_inner'
+          type: array
+      required:
+      - and
+      title: TagGroupAnd
+    TagGroupAnd-Output:
+      description: "Compound AND group: all child filters must match."
+      properties:
+        and:
+          items:
+            $ref: '#/components/schemas/MentalModelTrigger_Output_tag_groups_inner'
+          type: array
+      required:
+      - and
+      title: TagGroupAnd
+    TagGroupLeaf:
+      description: "A leaf tag filter: matches memories by tag list and match mode."
+      example:
+        match: any_strict
+        tags:
+        - tags
+        - tags
+      properties:
+        tags:
+          items:
+            type: string
+          type: array
+        match:
+          default: any_strict
+          enum:
+          - any
+          - all
+          - any_strict
+          - all_strict
+          title: Match
+          type: string
+      required:
+      - tags
+      title: TagGroupLeaf
+    TagGroupNot-Input:
+      description: "Compound NOT group: child filter must NOT match."
+      properties:
+        not:
+          $ref: '#/components/schemas/Not'
+      required:
+      - not
+      title: TagGroupNot
+    TagGroupNot-Output:
+      description: "Compound NOT group: child filter must NOT match."
+      properties:
+        not:
+          $ref: '#/components/schemas/Not_1'
+      required:
+      - not
+      title: TagGroupNot
+    TagGroupOr-Input:
+      description: "Compound OR group: at least one child filter must match."
+      properties:
+        or:
+          items:
+            $ref: '#/components/schemas/MentalModelTrigger_Input_tag_groups_inner'
+          type: array
+      required:
+      - or
+      title: TagGroupOr
+    TagGroupOr-Output:
+      description: "Compound OR group: at least one child filter must match."
+      properties:
+        or:
+          items:
+            $ref: '#/components/schemas/MentalModelTrigger_Output_tag_groups_inner'
+          type: array
+      required:
+      - or
+      title: TagGroupOr
     TagItem:
       description: Single tag with usage count.
       properties:
@@ -4975,7 +6016,7 @@ components:
           nullable: true
           type: array
         trigger:
-          $ref: '#/components/schemas/MentalModelTrigger'
+          $ref: '#/components/schemas/MentalModelTrigger-Input'
       title: UpdateMentalModelRequest
     UpdateWebhookRequest:
       description: Request model for updating a webhook. Only provided fields are
@@ -5018,7 +6059,10 @@ components:
         loc:
         - ValidationError_loc_inner
         - ValidationError_loc_inner
+        input: ""
+        ctx: "{}"
         type: type
+        url: url
       properties:
         loc:
           items:
@@ -5029,6 +6073,13 @@ components:
           type: string
         type:
           title: Error Type
+          type: string
+        input: {}
+        ctx:
+          title: Context
+          type: object
+        url:
+          title: URL
           type: string
       required:
       - loc
@@ -5324,6 +6375,32 @@ components:
         \ which combinations to use."
       nullable: true
       title: ObservationScopes
+    MentalModelTrigger_Input_tag_groups_inner:
+      anyOf:
+      - $ref: '#/components/schemas/TagGroupLeaf'
+      - $ref: '#/components/schemas/TagGroupAnd-Input'
+      - $ref: '#/components/schemas/TagGroupOr-Input'
+      - $ref: '#/components/schemas/TagGroupNot-Input'
+    MentalModelTrigger_Output_tag_groups_inner:
+      anyOf:
+      - $ref: '#/components/schemas/TagGroupLeaf'
+      - $ref: '#/components/schemas/TagGroupAnd-Output'
+      - $ref: '#/components/schemas/TagGroupOr-Output'
+      - $ref: '#/components/schemas/TagGroupNot-Output'
+    Not:
+      anyOf:
+      - $ref: '#/components/schemas/TagGroupLeaf'
+      - $ref: '#/components/schemas/TagGroupAnd-Input'
+      - $ref: '#/components/schemas/TagGroupOr-Input'
+      - $ref: '#/components/schemas/TagGroupNot-Input'
+      title: Not
+    Not_1:
+      anyOf:
+      - $ref: '#/components/schemas/TagGroupLeaf'
+      - $ref: '#/components/schemas/TagGroupAnd-Output'
+      - $ref: '#/components/schemas/TagGroupOr-Output'
+      - $ref: '#/components/schemas/TagGroupNot-Output'
+      title: Not
     ValidationError_loc_inner:
       anyOf:
       - type: string

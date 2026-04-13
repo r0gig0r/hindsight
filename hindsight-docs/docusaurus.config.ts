@@ -83,18 +83,25 @@ const config: Config = {
         docs: {
           sidebarPath: './sidebars.ts',
           routeBasePath: '/',
-          // Only show "next" version in development or when INCLUDE_CURRENT_VERSION=true
-          // In production, only show released versions from versions.json
+          // Whether to include the "current" (Next / unreleased) docs version.
+          //
+          // Controlled by the single explicit env var INCLUDE_CURRENT_VERSION.
+          // `start-docs.sh` sets it to "true" so local dev always sees Next;
+          // production builds leave it unset so only released versions ship.
+          //
+          // We deliberately do NOT sniff NODE_ENV here — it's unreliable
+          // across Docusaurus hot-reload paths and used to cause the Next
+          // version to disappear intermittently when editing files.
           onlyIncludeVersions: (() => {
-            const isDev = process.env.NODE_ENV === 'development' || process.env.INCLUDE_CURRENT_VERSION === 'true';
+            const includeCurrent = process.env.INCLUDE_CURRENT_VERSION === 'true';
+            let released: string[] = [];
             try {
-              const versions = require('./versions.json') as string[];
-              // In dev mode, explicitly include 'current' (Next) + all released versions
-              // In production, only show released versions
-              return isDev ? ['current', ...versions] : versions;
+              released = require('./versions.json') as string[];
             } catch {
-              return undefined; // No versions yet, show current
+              // No versions.json yet — nothing has been released.
+              return undefined;
             }
+            return includeCurrent ? ['current', ...released] : released;
           })(),
           // Disable version badges on all versions
           versions: (() => {
@@ -116,7 +123,7 @@ const config: Config = {
           showReadingTime: true,
           blogTitle: 'Hindsight Blog',
           blogDescription: 'Updates, insights, and deep dives into agent memory',
-          postsPerPage: 10,
+          postsPerPage: 'ALL',
           blogSidebarCount: 0,
         },
         theme: {
@@ -165,6 +172,18 @@ const config: Config = {
     ],
   ],
 
+  plugins: [
+    [
+      '@docusaurus/plugin-content-docs',
+      {
+        id: 'integrations',
+        path: './docs-integrations',
+        routeBasePath: 'sdks/integrations',
+        sidebarPath: false,
+      },
+    ],
+  ],
+
   themes: [
     '@docusaurus/theme-mermaid',
     [
@@ -203,23 +222,16 @@ const config: Config = {
       items: [
         {
           type: 'doc',
-          docId: 'developer/installation',
+          docId: 'developer/index',
           position: 'left',
           label: 'Developer',
           className: 'navbar-item-developer',
         },
         {
-          type: 'doc',
-          docId: 'sdks/python',
+          to: '/integrations',
           position: 'left',
-          label: 'SDKs',
-          className: 'navbar-item-sdks',
-        },
-        {
-          to: '/faq',
-          position: 'left',
-          label: 'FAQ',
-          className: 'navbar-item-faq',
+          label: 'Integrations',
+          className: 'navbar-item-integrations',
         },
         {
           to: '/changelog',
@@ -234,22 +246,61 @@ const config: Config = {
           className: 'navbar-item-resources',
           items: [
             {
+              to: '/templates',
+              label: 'Bank Templates Hub',
+              customProps: { icon: 'lu-layout-template' },
+            },
+            {
+              to: '/best-practices',
+              label: 'Best Practices',
+              customProps: { icon: 'lu-star' },
+            },
+            {
+              to: '/faq',
+              label: 'FAQ',
+              customProps: { icon: 'lu-circle-help' },
+            },
+            {
               to: '/cookbook',
               label: 'Cookbook',
+              customProps: { icon: 'lu-book' },
             },
             {
               to: '/blog',
               label: 'Blog',
+              customProps: { icon: 'lu-rss' },
             },
             {
               to: '/api-reference',
               label: 'API Reference',
+              customProps: { icon: 'lu-book-open' },
             },
             {
               href: 'https://join.slack.com/t/hindsight-space/shared_invite/zt-3nhbm4w29-LeSJ5Ixi6j8PdiYOCPlOgg',
               label: 'Community',
+              customProps: { icon: 'si-slack' },
+            },
+            {
+              href: 'https://benchmarks.hindsight.vectorize.io/',
+              label: 'Benchmarks',
+              customProps: { icon: 'lu-chart-bar' },
+            },
+            {
+              href: 'https://benchmarks.hindsight.vectorize.io/',
+              label: 'Which Model Should I Use?',
+              customProps: { icon: 'lu-cpu' },
+            },
+            {
+              href: 'https://arxiv.org/abs/2512.12818',
+              label: 'Paper',
+              customProps: { icon: 'lu-file-text' },
             },
           ],
+        },
+        {
+          type: 'docsVersionDropdown',
+          position: 'right',
+          className: 'navbar-item-version',
         },
         {
           href: 'https://ui.hindsight.vectorize.io/signup',
@@ -258,15 +309,10 @@ const config: Config = {
           className: 'navbar-item-cloud',
         },
         {
-          type: 'docsVersionDropdown',
-          position: 'right',
-          className: 'navbar-item-version',
-        },
-        {
           href: 'https://github.com/vectorize-io/hindsight',
           position: 'right',
+          label: 'GitHub',
           className: 'header-github-link',
-          'aria-label': 'GitHub repository',
         },
       ],
     },
@@ -285,7 +331,7 @@ const config: Config = {
               to: '/developer/installation',
             },
             {
-              label: 'SDKs',
+              label: 'Clients & Integrations',
               to: '/sdks/python',
             },
             {

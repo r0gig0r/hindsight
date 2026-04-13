@@ -2,7 +2,7 @@
 sidebar_position: 5
 ---
 
-# Embedded SDK (hindsight-embed)
+# Daemon CLI (hindsight-embed)
 
 Zero-configuration local memory system with automatic daemon management. Perfect for development, prototyping, and single-user applications.
 
@@ -88,7 +88,7 @@ The daemon starts automatically on first use!
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HINDSIGHT_EMBED_LLM_API_KEY` | **Required**. API key for LLM provider | - |
-| `HINDSIGHT_EMBED_LLM_PROVIDER` | LLM provider: `openai`, `anthropic`, `gemini`, `groq`, `ollama` | `openai` |
+| `HINDSIGHT_EMBED_LLM_PROVIDER` | LLM provider: `openai`, `anthropic`, `gemini`, `groq`, `minimax`, `ollama` | `openai` |
 | `HINDSIGHT_EMBED_LLM_MODEL` | Model name | `gpt-4o-mini` |
 | `HINDSIGHT_EMBED_BANK_ID` | Default memory bank ID | `default` |
 | `HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT` | Seconds before daemon auto-exits when idle (0 = never) | `300` |
@@ -244,4 +244,4 @@ hindsight-embed configure
 - High-availability requirements
 - Multi-tenant applications
 
-For production deployments, use the [API Service](/developer/services) with external PostgreSQL instead.
+For production deployments, use the [API Service](../developer/services.md) with external PostgreSQL instead.

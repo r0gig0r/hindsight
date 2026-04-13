@@ -56,7 +56,7 @@ def get_daemon_url(profile: str | None = None) -> str:
     return _manager.get_url(profile)
 
 
-def ensure_daemon_running(config: dict, profile: str | None = None) -> bool:
+def ensure_daemon_running(config: dict, profile: str | None = None, extra_args: list[str] | None = None) -> bool:
     """
     Ensure daemon is running, starting it if needed.
 
@@ -64,6 +64,7 @@ def ensure_daemon_running(config: dict, profile: str | None = None) -> bool:
         config: Configuration dict with LLM settings (accepts both simple keys
                 like "llm_api_key" and env var format like "HINDSIGHT_API_LLM_API_KEY").
         profile: Profile name (None = resolve from priority).
+        extra_args: Extra CLI arguments to pass to hindsight-api (e.g. ["--offline"]).
 
     Returns:
         True if daemon is running.
@@ -71,7 +72,7 @@ def ensure_daemon_running(config: dict, profile: str | None = None) -> bool:
     if profile is None:
         profile = resolve_active_profile()
 
-    return _manager.ensure_running(config, profile)
+    return _manager.ensure_running(config, profile, extra_args=extra_args)
 
 
 def stop_daemon(profile: str | None = None) -> bool:
@@ -102,6 +103,67 @@ def is_daemon_running(profile: str | None = None) -> bool:
         profile = resolve_active_profile()
 
     return _manager.is_running(profile)
+
+
+def start_ui(profile: str | None = None, ui_port: int | None = None, hostname: str = "0.0.0.0") -> bool:
+    """Start the control plane UI.
+
+    Args:
+        profile: Profile name (None = resolve from priority).
+        ui_port: Port for the UI. Defaults to daemon_port + 10000.
+        hostname: Hostname to bind to. Defaults to 0.0.0.0.
+
+    Returns:
+        True if UI started successfully.
+    """
+    if profile is None:
+        profile = resolve_active_profile()
+    return _manager.start_ui(profile, ui_port, hostname)
+
+
+def stop_ui(profile: str | None = None, ui_port: int | None = None) -> bool:
+    """Stop the control plane UI.
+
+    Args:
+        profile: Profile name (None = resolve from priority).
+        ui_port: Port the UI is running on. Defaults to daemon_port + 10000.
+
+    Returns:
+        True if UI stopped successfully.
+    """
+    if profile is None:
+        profile = resolve_active_profile()
+    return _manager.stop_ui(profile, ui_port)
+
+
+def is_ui_running(profile: str | None = None, ui_port: int | None = None) -> bool:
+    """Check if the UI is running.
+
+    Args:
+        profile: Profile name (None = resolve from priority).
+        ui_port: Port to check. Defaults to daemon_port + 10000.
+
+    Returns:
+        True if UI is running and responsive.
+    """
+    if profile is None:
+        profile = resolve_active_profile()
+    return _manager.is_ui_running(profile, ui_port)
+
+
+def get_ui_url(profile: str | None = None, ui_port: int | None = None) -> str:
+    """Get UI URL for a profile.
+
+    Args:
+        profile: Profile name (None = resolve from priority).
+        ui_port: Port for the UI. Defaults to daemon_port + 10000.
+
+    Returns:
+        URL for the UI.
+    """
+    if profile is None:
+        profile = resolve_active_profile()
+    return _manager.get_ui_url(profile, ui_port)
 
 
 def find_cli_binary() -> Path | None:

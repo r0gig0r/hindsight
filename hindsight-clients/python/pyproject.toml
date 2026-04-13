@@ -1,6 +1,6 @@
 [project]
 name = "hindsight-client"
-version = "0.4.17"
+version = "0.5.0"
 description = "Python client for Hindsight - Semantic memory system with personality-driven thinking"
 authors = [
     {name = "Hindsight Team"}
@@ -20,7 +20,7 @@ dependencies = [
 test = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
-    "requests>=2.28.0",
+    "requests>=2.33.0",
 ]
 
 [build-system]

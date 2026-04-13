@@ -5,18 +5,21 @@ Biomimetic long-term memory for [OpenClaw](https://openclaw.ai) using [Hindsight
 ## Quick Start
 
 ```bash
-# 1. Configure your LLM provider for memory extraction
-# Option A: OpenAI
-export OPENAI_API_KEY="sk-your-key"
-
-# Option B: Claude Code (no API key needed)
-export HINDSIGHT_API_LLM_PROVIDER=claude-code
-
-# Option C: OpenAI Codex (no API key needed)
-export HINDSIGHT_API_LLM_PROVIDER=openai-codex
-
-# 2. Install and enable the plugin
+# 1. Install the plugin
 openclaw plugins install @vectorize-io/hindsight-openclaw
+
+# 2. Configure the LLM provider used for memory extraction.
+
+# Option A — OpenAI (or any OpenAI-compatible provider)
+openclaw config set plugins.entries.hindsight-openclaw.config.llmProvider openai
+openclaw config set plugins.entries.hindsight-openclaw.config.llmApiKey \
+    --ref-source env --ref-provider default --ref-id OPENAI_API_KEY
+
+# Option B — Claude Code (no API key needed)
+openclaw config set plugins.entries.hindsight-openclaw.config.llmProvider claude-code
+
+# Option C — OpenAI Codex (no API key needed)
+openclaw config set plugins.entries.hindsight-openclaw.config.llmProvider openai-codex
 
 # 3. Start OpenClaw
 openclaw gateway
@@ -24,11 +27,40 @@ openclaw gateway
 
 That's it! The plugin will automatically start capturing and recalling memories.
 
+`llmApiKey` is marked sensitive — `openclaw config set ... --ref-source env` writes a
+SecretRef that resolves the value from your `OPENAI_API_KEY` environment variable at
+runtime, so the key is never stored in plaintext on disk. `--ref-source file` and
+`--ref-source exec` are also supported for mounted-secret and Vault-style setups.
+
+## Migrating from 0.5.x
+
+0.6.0 removes all process-environment reads from the plugin. Configuration that
+previously came from shell env vars must now go through OpenClaw's plugin config
+(with SecretRef for credentials). Concrete mappings:
+
+| Old (0.5.x) | New (0.6.0) |
+|---|---|
+| `OPENAI_API_KEY=…` (auto-detected) | `openclaw config set plugins.entries.hindsight-openclaw.config.llmProvider openai` <br> `openclaw config set plugins.entries.hindsight-openclaw.config.llmApiKey --ref-source env --ref-id OPENAI_API_KEY` |
+| `HINDSIGHT_API_LLM_PROVIDER=…` | `openclaw config set plugins.entries.hindsight-openclaw.config.llmProvider …` |
+| `HINDSIGHT_API_LLM_MODEL=…` | `openclaw config set plugins.entries.hindsight-openclaw.config.llmModel …` |
+| `HINDSIGHT_API_LLM_API_KEY=…` | `openclaw config set plugins.entries.hindsight-openclaw.config.llmApiKey --ref-source env --ref-id …` |
+| `HINDSIGHT_API_LLM_BASE_URL=…` | `openclaw config set plugins.entries.hindsight-openclaw.config.llmBaseUrl …` |
+| `HINDSIGHT_EMBED_API_URL=…` | `openclaw config set plugins.entries.hindsight-openclaw.config.hindsightApiUrl …` |
+| `HINDSIGHT_EMBED_API_TOKEN=…` | `openclaw config set plugins.entries.hindsight-openclaw.config.hindsightApiToken --ref-source env --ref-id …` |
+| `HINDSIGHT_BANK_ID=…` | `openclaw config set plugins.entries.hindsight-openclaw.config.bankId …` |
+| `llmApiKeyEnv: "MY_KEY"` (plugin config) | `llmApiKey` configured as a SecretRef with `--ref-id MY_KEY` |
+
+If your shell already exports `OPENAI_API_KEY`, the SecretRef config above resolves
+to the same value at startup — no need to change your shell setup, just point the
+plugin at the variable explicitly. Run `openclaw config validate` after migrating
+to confirm the new shape parses cleanly.
+
 ## Features
 
-- **Auto-capture** and **auto-recall** of memories each turn
+- **Auto-capture** and **auto-recall** of memories each turn, injected into system prompt space so recalled memories stay out of the visible chat transcript
 - **Memory isolation** — configurable per agent, channel, user, or provider via `dynamicBankGranularity`
-- **Retention controls** — choose which message roles to retain and toggle auto-retain on/off
+- **Historical backfill CLI** — import prior OpenClaw session history into Hindsight using the active plugin bank-routing config by default
+- **Retention controls** — choose which message roles to retain, toggle auto-retain on/off, and stamp retained documents with consistent tags/source metadata
 
 ## Configuration
 
@@ -42,13 +74,17 @@ Optional settings in `~/.openclaw/openclaw.json` under `plugins.entries.hindsigh
 | `embedVersion` | `"latest"` | hindsight-embed version |
 | `embedPackagePath` | — | Local path to `hindsight-embed` package for development |
 | `bankMission` | — | Agent identity/purpose stored on the memory bank. Helps the engine understand context for better fact extraction. Set once per bank — not a recall prompt. |
-| `llmProvider` | auto-detect | LLM provider override for memory extraction (`openai`, `anthropic`, `gemini`, `groq`, `ollama`, `openai-codex`, `claude-code`) |
-| `llmModel` | provider default | LLM model override used with `llmProvider` |
-| `llmApiKeyEnv` | provider standard env var | Custom env var name for the provider API key |
+| `llmProvider` | — | LLM provider for memory extraction (`openai`, `anthropic`, `gemini`, `groq`, `ollama`, `openai-codex`, `claude-code`). Required unless `hindsightApiUrl` is set. |
+| `llmModel` | provider default | LLM model used with `llmProvider` |
+| `llmApiKey` | — | API key for the LLM provider. **Sensitive** — set via `openclaw config set ... --ref-source env --ref-id OPENAI_API_KEY` to reference an env var (or `--ref-source file`/`exec` for mounted-secret/Vault sources). |
+| `llmBaseUrl` | — | Optional base URL override for OpenAI-compatible providers (e.g. `https://openrouter.ai/api/v1`) |
 | `dynamicBankId` | `true` | Enable per-context memory banks |
+| `bankId` | — | Static bank ID used when `dynamicBankId` is `false`. |
 | `bankIdPrefix` | — | Prefix for bank IDs (e.g. `"prod"`) |
+| `retainTags` | `[]` | Tags applied to every retained document, useful for cross-agent/source labeling (e.g. `source_system:openclaw`, `agent:agentname`) |
+| `retainSource` | `"openclaw"` | `source` value written into retained document metadata |
 | `dynamicBankGranularity` | `["agent", "channel", "user"]` | Fields used to derive bank ID. Options: `agent`, `channel`, `user`, `provider` |
-| `excludeProviders` | `[]` | Message providers to skip for recall/retain (e.g. `slack`, `telegram`, `discord`) |
+| `excludeProviders` | `["heartbeat"]` | Message providers to skip for recall/retain (e.g. `heartbeat`, `slack`, `telegram`, `discord`) |
 | `autoRecall` | `true` | Auto-inject memories before each turn. Set to `false` when the agent has its own recall tool. |
 | `autoRetain` | `true` | Auto-retain conversations after each turn |
 | `retainRoles` | `["user", "assistant"]` | Which message roles to retain. Options: `user`, `assistant`, `system`, `tool` |
@@ -61,9 +97,47 @@ Optional settings in `~/.openclaw/openclaw.json` under `plugins.entries.hindsigh
 | `recallTopK` | — | Max number of memories to inject per turn. Applied after API response as a hard cap. |
 | `recallContextTurns` | `1` | Number of user turns to include when composing recall query context. `1` keeps latest-message-only behavior. |
 | `recallMaxQueryChars` | `800` | Maximum character length for the composed recall query before calling recall. |
-| `recallPromptPreamble` | built-in string | Prompt text placed above recalled memories in the injected `<hindsight_memories>` block. |
+| `recallPromptPreamble` | built-in string | Prompt text placed above recalled memories in the injected `<hindsight_memories>` system-context block. |
 | `hindsightApiUrl` | — | External Hindsight API URL (skips local daemon) |
-| `hindsightApiToken` | — | Auth token for external API |
+| `hindsightApiToken` | — | Auth token for external API. **Sensitive** — set via `openclaw config set ... --ref-source env --ref-id HINDSIGHT_API_TOKEN`. |
+| `ignoreSessionPatterns` | `[]` | Session key glob patterns to skip entirely — no recall, no retain (e.g. `["agent:*:cron:**"]`) |
+| `statelessSessionPatterns` | `[]` | Session key glob patterns for read-only sessions — retain is always skipped; recall is skipped when `skipStatelessSessions` is `true` (e.g. `["agent:*:subagent:**", "agent:*:heartbeat:**"]`) |
+| `skipStatelessSessions` | `true` | When `true`, sessions matching `statelessSessionPatterns` also skip recall. Set to `false` to allow recall but still skip retain. |
+
+### Session pattern filtering
+
+`ignoreSessionPatterns` and `statelessSessionPatterns` accept glob patterns matched against the session key (format: `agent:<agentId>:<type>:<uuid>`).
+
+Glob syntax:
+- `*` — matches any characters except `:` (single segment)
+- `**` — matches anything including `:` (multiple segments)
+
+| Pattern | Matches |
+|---|---|
+| `agent:*:cron:**` | All cron sessions for any agent |
+| `agent:*:subagent:**` | All subagent sessions for any agent |
+| `agent:main:**` | All sessions under the `main` agent |
+
+**Difference between the two options:**
+
+| | `ignoreSessionPatterns` | `statelessSessionPatterns` |
+|---|---|---|
+| Retain | Skipped | Always skipped |
+| Recall | Skipped | Skipped only when `skipStatelessSessions: true` |
+
+**Example config** — exclude cron jobs from memory entirely, allow subagents to read but not write memories:
+
+```json
+{
+  "ignoreSessionPatterns": ["agent:*:cron:**"],
+  "statelessSessionPatterns": ["agent:*:subagent:**"],
+  "skipStatelessSessions": false
+}
+```
+
+## Retention details
+
+Retained documents use stable session-scoped IDs like `openclaw:agent:agentname:discord:channel:123:turn:000001` (or `...:window:000002` for chunked retention), and include richer metadata such as `session_key`, `agent_id`, `provider`, `channel_id`, `thread_id`, `sender_id`, `turn_index`, and `retention_scope`.
 
 ## Documentation
 
@@ -104,6 +178,51 @@ tail -f ~/.hindsight/profiles/openclaw.log
 # List profiles
 uvx hindsight-embed@latest profile list
 ```
+
+## Backfilling Existing OpenClaw History
+
+The package includes a config-aware backfill CLI for importing historical OpenClaw sessions into Hindsight.
+
+By default it mirrors the active plugin settings for:
+
+- `dynamicBankId`
+- `dynamicBankGranularity`
+- `bankIdPrefix`
+- local daemon vs external `hindsightApiUrl`
+
+Dry-run example:
+
+```bash
+npx --package @vectorize-io/hindsight-openclaw hindsight-openclaw-backfill \
+  --openclaw-root ~/.openclaw \
+  --dry-run
+```
+
+Direct invocation from a built checkout:
+
+```bash
+node dist/backfill.js --openclaw-root ~/.openclaw --dry-run
+```
+
+Migration-oriented overrides are explicit:
+
+```bash
+node dist/backfill.js \
+  --openclaw-root ~/.openclaw \
+  --bank-strategy agent \
+  --agent proj-run \
+  --resume \
+  --max-pending-operations 10
+```
+
+Useful options:
+
+- `--agent <id>` limit import to selected agents
+- `--exclude-archive` ignore `sessions-archive-from-migration_backup`
+- `--bank-strategy mirror-config|agent|fixed`
+- `--resume` skip only entries already finalized as completed
+- `--checkpoint <path>` store progress outside the default location
+- `--wait-until-drained` block until the touched bank queues have finished and checkpoint state can be finalized
 
 ## Links
 

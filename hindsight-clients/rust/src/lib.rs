@@ -72,6 +72,8 @@ mod tests {
                     entities: None,
                     tags: None,
                     observation_scopes: None,
+                    strategy: None,
+                    update_mode: None,
                 },
                 types::MemoryItem {
                     content: "Bob works with Alice on the search team".to_string(),
@@ -82,6 +84,8 @@ mod tests {
                     entities: None,
                     tags: None,
                     observation_scopes: None,
+                    strategy: None,
+                    update_mode: None,
                 },
             ],
             document_tags: None,
@@ -103,6 +107,7 @@ mod tests {
             types: None,
             tags: None,
             tags_match: types::TagsMatch::Any,
+            tag_groups: None,
         };
         let recall_response = client
             .recall_memories(&bank_id, None, &recall_request)

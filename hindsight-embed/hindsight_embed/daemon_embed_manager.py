@@ -20,7 +20,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from .embed_manager import EmbedManager
-from .profile_manager import ProfileManager, resolve_active_profile
+from .profile_manager import UI_PORT_OFFSET, ProfileManager, resolve_active_profile
 
 logger = logging.getLogger(__name__)
 console = Console(stderr=True)
@@ -91,7 +91,7 @@ class DaemonEmbedManager(EmbedManager):
     def _find_api_command(self) -> list[str]:
         """Find the command to run hindsight-api."""
         # Check if we're in development mode
-        dev_api_path = Path(__file__).parent.parent.parent / "hindsight-api"
+        dev_api_path = Path(__file__).parent.parent.parent / "hindsight-api-slim"
         if dev_api_path.exists() and (dev_api_path / "pyproject.toml").exists():
             return ["uv", "run", "--project", str(dev_api_path), "hindsight-api"]
 
@@ -101,12 +101,113 @@ class DaemonEmbedManager(EmbedManager):
         api_version = os.getenv("HINDSIGHT_EMBED_API_VERSION", __version__)
         return ["uvx", f"hindsight-api@{api_version}"]
 
-    def _start_daemon(self, config: dict, profile: str) -> bool:
+    @staticmethod
+    def _is_port_in_use(port: int) -> bool:
+        """Check if a port is in use using a socket connection (cross-platform)."""
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1)
+            return sock.connect_ex(("127.0.0.1", port)) == 0
+
+    @staticmethod
+    def _find_pid_on_port(port: int) -> int | None:
+        """Find the PID of the process listening on a port."""
+        import platform
+
+        try:
+            if platform.system() == "Windows":
+                # Use netstat on Windows
+                result = subprocess.run(
+                    ["netstat", "-ano", "-p", "TCP"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.splitlines():
+                        if f"127.0.0.1:{port}" in line and "LISTENING" in line:
+                            return int(line.strip().split()[-1])
+            else:
+                # Use lsof on macOS/Linux
+                result = subprocess.run(
+                    ["lsof", "-ti", f":{port}", "-sTCP:LISTEN"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return int(result.stdout.strip().split()[0])
+        except (subprocess.TimeoutExpired, ValueError, OSError, FileNotFoundError):
+            pass
+        return None
+
+    @staticmethod
+    def _kill_process(pid: int) -> bool:
+        """Kill a process by PID and wait for it to exit. Returns True if process is gone."""
+        import signal
+
+        try:
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(50):
+                time.sleep(0.1)
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    return True
+        except OSError:
+            return True  # Already gone
+        return False
+
+    def _clear_port(self, port: int) -> bool:
+        """
+        Ensure the port is free before starting a daemon.
+
+        If the port is occupied by a hindsight daemon, stop it gracefully.
+        If occupied by something else, return False.
+
+        Returns:
+            True if port is free (or was freed), False if occupied by non-hindsight process.
+        """
+        if not self._is_port_in_use(port):
+            return True
+
+        # Port is occupied — check if it's a hindsight daemon via /health
+        try:
+            with httpx.Client(timeout=2) as client:
+                response = client.get(f"http://127.0.0.1:{port}/health")
+                if response.status_code != 200:
+                    logger.warning(f"Port {port} is in use by another process")
+                    return False
+        except Exception:
+            logger.warning(f"Port {port} is in use by another process")
+            return False
+
+        # It's a hindsight daemon — find its PID and stop it
+        pid = self._find_pid_on_port(port)
+        if pid is None:
+            logger.warning(f"Port {port} has a hindsight daemon but could not find its PID")
+            return False
+
+        logger.info(f"Stopping existing daemon on port {port} (PID {pid})")
+        if self._kill_process(pid):
+            logger.info(f"Old daemon (PID {pid}) stopped")
+            return True
+
+        logger.warning(f"Old daemon (PID {pid}) did not stop in time")
+        return False
+
+    def _start_daemon(self, config: dict, profile: str, extra_args: list[str] | None = None) -> bool:
         """Start the daemon in background."""
         paths = self._profile_manager.resolve_profile_paths(profile)
         profile_label = f"profile '{profile}'" if profile else "default profile"
         daemon_log = paths.log
         port = paths.port
+
+        # Ensure port is free before starting (handles stale daemons from version upgrades)
+        if not self._clear_port(port):
+            logger.error(f"Cannot start daemon: port {port} is in use by a non-hindsight process")
+            return False
 
         # Load profile's .env file and merge with provided config
         # This fixes issue #305 where profile env vars were ignored
@@ -151,15 +252,6 @@ class DaemonEmbedManager(EmbedManager):
         if "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT" not in env:
             env["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] = str(DEFAULT_DAEMON_IDLE_TIMEOUT)
 
-        # On macOS, force CPU for embeddings/reranker to avoid MPS issues
-        import platform
-
-        if platform.system() == "Darwin":
-            if "HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU" not in env:
-                env["HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU"] = "1"
-            if "HINDSIGHT_API_RERANKER_LOCAL_FORCE_CPU" not in env:
-                env["HINDSIGHT_API_RERANKER_LOCAL_FORCE_CPU"] = "1"
-
         # Get idle timeout from env
         idle_timeout = int(env.get("HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT", str(DEFAULT_DAEMON_IDLE_TIMEOUT)))
 
@@ -175,6 +267,8 @@ class DaemonEmbedManager(EmbedManager):
             "--port",
             str(port),
         ]
+        if extra_args:
+            cmd.extend(extra_args)
 
         try:
             # Start daemon
@@ -318,17 +412,215 @@ class DaemonEmbedManager(EmbedManager):
         """
         try:
             api_config = {k: v for k, v in config.items() if k.startswith("HINDSIGHT_API_")}
+            if not api_config:
+                return
             self._profile_manager.create_profile(profile, port, api_config)
         except Exception as e:
             logger.debug(f"Failed to register profile '{profile}' in metadata: {e}")
 
-    def ensure_running(self, config: dict, profile: str) -> bool:
+    def _find_ui_command(self) -> list[str]:
+        """Find the command to run the control plane UI."""
+        # Check if we're in development mode (monorepo)
+        dev_cp_path = Path(__file__).parent.parent.parent / "hindsight-control-plane"
+        cli_js = dev_cp_path / "bin" / "cli.js"
+        if cli_js.exists():
+            return ["node", str(cli_js)]
+
+        # Use npx to run the published control plane package
+        from . import __version__
+
+        cp_version = os.getenv("HINDSIGHT_EMBED_CP_VERSION", __version__)
+        return ["npx", f"@vectorize-io/hindsight-control-plane@{cp_version}"]
+
+    def get_ui_url(self, profile: str, ui_port: int | None = None, hostname: str | None = None) -> str:
+        """Get the URL for the UI serving this profile."""
+        if ui_port is None:
+            paths = self._profile_manager.resolve_profile_paths(profile)
+            ui_port = paths.port + UI_PORT_OFFSET
+        host = hostname or "0.0.0.0"
+        return f"http://{host}:{ui_port}"
+
+    def is_ui_running(self, profile: str, ui_port: int | None = None) -> bool:
+        """Check if the UI is running and responsive."""
+        # Always health-check on 127.0.0.1 regardless of bind hostname
+        ui_url = self.get_ui_url(profile, ui_port, hostname="127.0.0.1")
+        try:
+            with httpx.Client(timeout=2) as client:
+                response = client.get(f"{ui_url}/api/health")
+                return response.status_code == 200
+        except Exception:
+            return False
+
+    def start_ui(self, profile: str, ui_port: int | None = None, hostname: str = "0.0.0.0") -> bool:
+        """Start the control plane UI in background.
+
+        Args:
+            profile: Profile name.
+            ui_port: Port for the UI. Defaults to daemon_port + 10000.
+            hostname: Hostname to bind to. Defaults to 0.0.0.0.
+
+        Returns:
+            True if UI started successfully.
+        """
+        paths = self._profile_manager.resolve_profile_paths(profile)
+        if ui_port is None:
+            ui_port = paths.port + UI_PORT_OFFSET
+
+        if self.is_ui_running(profile, ui_port):
+            logger.debug(f"UI already running for profile '{profile}' on port {ui_port}")
+            return True
+
+        profile_label = f"profile '{profile}'" if profile else "default profile"
+        api_url = self.get_url(profile)
+        ui_log = paths.ui_log
+
+        # Build environment
+        env = os.environ.copy()
+        env["PORT"] = str(ui_port)
+        env["HOSTNAME"] = hostname
+        env["HINDSIGHT_CP_DATAPLANE_API_URL"] = api_url
+
+        # Create log directory
+        ui_log.parent.mkdir(parents=True, exist_ok=True)
+
+        # Build command
+        cmd = self._find_ui_command() + [
+            "--port",
+            str(ui_port),
+            "--hostname",
+            hostname,
+            "--api-url",
+            api_url,
+        ]
+
+        try:
+            log_file = open(ui_log, "w")
+            subprocess.Popen(
+                cmd,
+                env=env,
+                start_new_session=True,
+                stdout=log_file,
+                stderr=log_file,
+            )
+
+            # Wait for UI to be ready
+            start_time = time.time()
+            title = f"[bold cyan]Starting UI[/bold cyan] [dim]({profile or 'default'} @ :{ui_port})[/dim]"
+            log_lines = [f"Starting UI for {profile_label}...", ""]
+
+            with Live(console=console, auto_refresh=False) as live:
+                content = Text("\n".join(log_lines), style="dim")
+                panel = Panel(content, title=title, border_style="cyan", padding=(1, 2))
+                live.update(panel)
+                live.refresh()
+
+                while time.time() - start_time < 30:
+                    if self.is_ui_running(profile, ui_port):
+                        log_lines.append(f"✓ UI started at http://127.0.0.1:{ui_port}")
+                        log_lines.append(f"Logs: {ui_log}")
+                        content = Text("\n".join(log_lines), style="dim")
+                        success_title = (
+                            f"[bold green]✓ UI Started[/bold green] [dim]({profile or 'default'} @ :{ui_port})[/dim]"
+                        )
+                        panel = Panel(content, title=success_title, border_style="green", padding=(1, 2))
+                        live.update(panel)
+                        live.refresh()
+                        console.print()
+                        return True
+
+                    elapsed = int(time.time() - start_time)
+                    status_msg = f"⏳ Waiting for UI... ({elapsed}s elapsed)"
+                    if log_lines and log_lines[-1].startswith("⏳"):
+                        log_lines[-1] = status_msg
+                    else:
+                        log_lines.append(status_msg)
+
+                    content = Text("\n".join(log_lines), style="dim")
+                    panel = Panel(content, title=title, border_style="cyan", padding=(1, 2))
+                    live.update(panel)
+                    live.refresh()
+                    time.sleep(0.5)
+
+            # Timeout
+            console.print(
+                Panel(
+                    Text(f"UI failed to start (timeout)\n\nSee full log: {ui_log}", style="dim"),
+                    title=f"[bold red]✗ UI Failed (Timeout)[/bold red] [dim](:{ui_port})[/dim]",
+                    border_style="red",
+                    padding=(1, 2),
+                )
+            )
+            console.print()
+            return False
+
+        except FileNotFoundError:
+            error_msg = (
+                f"Command not found: {cmd[0]}\nFull command: {' '.join(cmd)}\n\nInstall Node.js and npx to run the UI."
+            )
+            console.print(
+                Panel(
+                    Text(error_msg, style="red"),
+                    title="[bold red]✗ Command Not Found[/bold red]",
+                    border_style="red",
+                    padding=(1, 2),
+                )
+            )
+            console.print()
+            return False
+        except Exception as e:
+            error_msg = f"Failed to start UI: {e}\n\nCommand: {' '.join(cmd)}\nLog file: {ui_log}"
+            console.print(
+                Panel(
+                    Text(error_msg, style="red"),
+                    title="[bold red]✗ UI Startup Error[/bold red]",
+                    border_style="red",
+                    padding=(1, 2),
+                )
+            )
+            console.print()
+            return False
+
+    def stop_ui(self, profile: str, ui_port: int | None = None) -> bool:
+        """Stop the UI for this profile.
+
+        Args:
+            profile: Profile name.
+            ui_port: Port the UI is running on. Defaults to daemon_port + 10000.
+
+        Returns:
+            True if stopped successfully.
+        """
+        paths = self._profile_manager.resolve_profile_paths(profile)
+        if ui_port is None:
+            ui_port = paths.port + UI_PORT_OFFSET
+
+        if not self.is_ui_running(profile, ui_port):
+            logger.debug(f"UI not running for profile '{profile}'")
+            return True
+
+        pid = self._find_pid_on_port(ui_port)
+        if pid is not None:
+            logger.debug(f"Found UI PID {pid} on port {ui_port}")
+            self._kill_process(pid)
+        else:
+            logger.warning(f"Could not find PID for UI port {ui_port}")
+
+        # Wait for health check to fail
+        for _ in range(30):
+            if not self.is_ui_running(profile, ui_port):
+                return True
+            time.sleep(0.1)
+
+        return not self.is_ui_running(profile, ui_port)
+
+    def ensure_running(self, config: dict, profile: str, extra_args: list[str] | None = None) -> bool:
         """
         Ensure daemon is running, starting it if needed.
 
         Args:
             config: Environment configuration dict (HINDSIGHT_API_* vars)
             profile: Profile name for isolation
+            extra_args: Extra CLI arguments to pass to hindsight-api (e.g. ["--offline"])
 
         Returns:
             True if daemon is running (started or already running), False on failure
@@ -339,7 +631,7 @@ class DaemonEmbedManager(EmbedManager):
                 paths = self._profile_manager.resolve_profile_paths(profile)
                 self._register_profile(profile, paths.port, config)
             return True
-        return self._start_daemon(config, profile)
+        return self._start_daemon(config, profile, extra_args=extra_args)
 
     def stop(self, profile: str) -> bool:
         """
@@ -359,32 +651,12 @@ class DaemonEmbedManager(EmbedManager):
         paths = self._profile_manager.resolve_profile_paths(profile)
         port = paths.port
 
-        # Find PID by port
-        try:
-            result = subprocess.run(
-                ["lsof", "-ti", f":{port}", "-sTCP:LISTEN"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                pid = int(result.stdout.strip().split()[0])
-                logger.debug(f"Found daemon PID {pid} on port {port}")
-
-                # Send SIGTERM
-                os.kill(pid, 15)
-
-                # Wait for process to exit
-                for _ in range(50):
-                    time.sleep(0.1)
-                    try:
-                        os.kill(pid, 0)
-                    except OSError:
-                        break
-            else:
-                logger.warning(f"Could not find PID for port {port}")
-        except (subprocess.TimeoutExpired, ValueError, OSError, FileNotFoundError) as e:
-            logger.warning(f"Could not find/kill daemon by port: {e}")
+        pid = self._find_pid_on_port(port)
+        if pid is not None:
+            logger.debug(f"Found daemon PID {pid} on port {port}")
+            self._kill_process(pid)
+        else:
+            logger.warning(f"Could not find PID for port {port}")
 
         # Wait for health check to fail
         for _ in range(30):

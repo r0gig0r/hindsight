@@ -108,6 +108,9 @@ cd "$PYTHON_CLIENT_DIR"
 # Run openapi-generator via Docker (pinned version for reproducibility)
 # Use --platform linux/amd64 to ensure identical output on both macOS (arm64) and Linux CI (amd64)
 # Use --user to match current user's UID/GID so generated files are writable
+# Note: the generator may exit non-zero due to a known bug writing
+# README_onlypackage.mustache, but all API/model files are generated
+# before that step, so we allow the failure and verify files below.
 docker run --rm \
     --platform linux/amd64 \
     --user "$(id -u):$(id -g)" \
@@ -118,7 +121,13 @@ docker run --rm \
     -i /local/openapi.json \
     -g python \
     -o /local/out \
-    -c /local/config.yaml
+    -c /local/config.yaml || true
+
+# Verify critical generated files exist
+if [ ! -f "$PYTHON_CLIENT_DIR/hindsight_client_api/api_client.py" ]; then
+    echo "❌ Error: Python client generation failed - api_client.py not found"
+    exit 1
+fi
 
 echo "Organizing generated files..."
 
@@ -138,6 +147,11 @@ if [ -f "$README_BACKUP" ]; then
     cp "$README_BACKUP" "$README_FILE"
     rm "$README_BACKUP"
 fi
+
+# Create PEP 561 py.typed marker files for type checker support
+echo "📦 Creating PEP 561 py.typed marker files..."
+touch "$PYTHON_CLIENT_DIR/hindsight_client_api/py.typed"
+touch "$PYTHON_CLIENT_DIR/hindsight_client/py.typed"
 
 # Keep our custom pyproject.toml (don't let generator overwrite it)
 if [ -f "setup.py" ]; then
@@ -332,6 +346,37 @@ rm -f "$TYPESCRIPT_CLIENT_DIR/index.ts"
 echo "Generating from $OPENAPI_SPEC..."
 cd "$TYPESCRIPT_CLIENT_DIR"
 npm run generate
+
+# Patch client.gen.ts for Deno compatibility.
+# Deno's Request constructor rejects a 'client' field in RequestInit because
+# 'client' is a reserved Deno.HttpClient option name, causing a TypeError.
+# We destructure it out before spreading opts into RequestInit.
+echo "Patching client.gen.ts for Deno compatibility..."
+cd "$PROJECT_ROOT"
+python3 << PATCH_SCRIPT
+CLIENT_GEN = "$TYPESCRIPT_CLIENT_DIR/generated/client/client.gen.ts"
+with open(CLIENT_GEN) as f:
+    content = f.read()
+OLD = '''    const requestInit: ReqInit = {
+      redirect: "follow",
+      ...opts,
+      body: getValidRequestBody(opts),
+    };'''
+NEW = '''    // Exclude hey-api internal fields that conflict with Deno's RequestInit.client
+    const { client: _client, ...optsForRequest } = opts as typeof opts & { client?: unknown };
+    const requestInit: ReqInit = {
+      redirect: "follow",
+      ...optsForRequest,
+      body: getValidRequestBody(opts),
+    };'''
+if OLD in content:
+    content = content.replace(OLD, NEW)
+    with open(CLIENT_GEN, "w") as f:
+        f.write(content)
+    print("  ✓ client.gen.ts patched successfully")
+else:
+    print("  ⚠ Could not find expected pattern in client.gen.ts - skipping patch")
+PATCH_SCRIPT
 
 echo "✓ TypeScript client generated at $TYPESCRIPT_CLIENT_DIR"
 echo ""

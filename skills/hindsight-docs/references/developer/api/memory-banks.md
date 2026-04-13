@@ -42,9 +42,15 @@ await client.createBank('my-bank');
 hindsight bank create my-bank
 ```
 
+### Go
+
+```go
+# Section 'create-bank' not found in api/memory-banks.go
+```
+
 ## Bank Configuration
 
-Each memory bank can be configured independently per operation. Configuration can be set via the [bank config API](#updating-configuration), the [Control Plane UI](/), or [server-wide environment variables](/developer/configuration).
+Each memory bank can be configured independently per operation. Configuration can be set via the [bank config API](#updating-configuration), the Control Plane UI, or [server-wide environment variables](../configuration.md).
 
 ### retain_mission {#retain-configuration}
 
@@ -77,7 +83,74 @@ Maximum number of characters per chunk when splitting content for fact extractio
 
 Default: `3000`
 
-See [Retain configuration](/developer/configuration#retain) for environment variable names and defaults.
+See [Retain configuration](../configuration.md#retain) for environment variable names and defaults.
+
+### entity_labels {#entity-labels}
+
+Defines a controlled vocabulary of `key:value` classification labels extracted at retain time and stored as entities. Because labels become entities, they automatically link memories in the knowledge graph (two memories with `pedagogy:scaffolding` are linked), improve semantic and BM25 retrieval, and optionally filter memories via the standard `tags`/`tags_match` API when `tag: true` is set on a group.
+
+Each entry in `entity_labels` is a **label group** — one classification dimension:
+
+```json
+{
+  "entity_labels": [
+    {
+      "key": "engagement",
+      "description": "Student engagement level during the session",
+      "type": "value",
+      "optional": true,
+      "values": [
+        { "value": "active",  "description": "Student is actively participating" },
+        { "value": "passive", "description": "Student is listening but not participating" }
+      ]
+    },
+    {
+      "key": "pedagogy",
+      "description": "Teaching strategies used",
+      "type": "multi-values",
+      "values": [
+        { "value": "scaffolding",          "description": "Breaking complex tasks into smaller steps" },
+        { "value": "direct_instruction",   "description": "Explicit explanation by the teacher" },
+        { "value": "socratic_questioning", "description": "Guiding through questions rather than answers" }
+      ]
+    }
+  ]
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `key` | — | Label group identifier. Becomes the prefix in `key:value` entities. |
+| `description` | `""` | Shown to the LLM to guide label assignment. |
+| `type` | `"value"` | `"value"` → pick one enum value; `"multi-values"` → pick multiple; `"text"` → free-form string. |
+| `values` | `[]` | Allowed values for `"value"` and `"multi-values"` types. Ignored for `"text"`. |
+| `optional` | `true` | When `true` the LLM may skip the label if not applicable. When `false` the LLM must always assign a value. Has no effect on `"multi-values"` groups (always optional). |
+| `tag` | `false` | When `true`, extracted `key:value` labels are also written as tags on the memory unit, enabling filtering via `tags`/`tags_match` in recall/reflect. |
+
+**Enum groups** (`type: "value"` or `type: "multi-values"`): the LLM picks from the predefined `values` list; anything outside the list is silently dropped. Vocabulary stays stable and graph links stay tight. Use `"multi-values"` when a fact can belong to several values at once.
+
+**Free-text groups** (`type: "text"`): the LLM writes any string. Use the `description` field to provide examples and guidance. Graph clustering is less reliable than with enum groups because the model may phrase the same concept differently across sessions.
+
+```json
+{
+  "key": "topic",
+  "description": "Specific subject being discussed. Examples: algebra, quadratic equations, geometry.",
+  "type": "text",
+  "optional": true,
+  "values": []
+}
+```
+
+### entities_allow_free_form
+
+By default, entity labels are extracted **alongside** regular named entities (people, places, concepts). Set to `false` to disable free-form extraction so only label entities are stored:
+
+```json
+{
+  "entity_labels": [...],
+  "entities_allow_free_form": false
+}
+```
 
 ### enable_observations {#observations-configuration}
 
@@ -105,7 +178,7 @@ Total token budget for source facts included with observations in the consolidat
 
 Per-observation token cap for source facts in the consolidation prompt. Each observation independently gets at most this many tokens of source facts, preventing a single observation with many source facts from consuming the entire budget. `-1` = unlimited. Leave unset to use the server default (`256`).
 
-See [Observations configuration](/developer/configuration#observations) for environment variable names and defaults.
+See [Observations configuration](../configuration.md#observations) for environment variable names and defaults.
 
 ### reflect_mission
 
@@ -145,6 +218,22 @@ await client.updateBankConfig('architect-bank', {
     dispositionLiteralism: 4,   // Focuses on concrete specs
     dispositionEmpathy: 2,      // Prioritizes technical facts
 });
+```
+
+### CLI
+
+```bash
+hindsight bank create architect-bank \
+  --mission "You're a senior software architect - keep track of system designs, technology decisions, and architectural patterns. Prefer simplicity over cutting-edge." \
+  --skepticism 4 \
+  --literalism 4 \
+  --empathy 2
+```
+
+### Go
+
+```go
+# Section 'bank-with-disposition' not found in api/memory-banks.go
 ```
 
 | Value | Behaviour |
@@ -233,6 +322,24 @@ await client.updateBankConfig('my-bank', {
 });
 ```
 
+### CLI
+
+```bash
+hindsight bank set-config my-bank \
+  --retain-mission "Always include technical decisions, API design choices, and architectural trade-offs. Ignore meeting logistics and social exchanges." \
+  --retain-extraction-mode verbose \
+  --observations-mission "Observations are stable facts about people and projects. Always include preferences, skills, and recurring patterns. Ignore one-off events." \
+  --disposition-skepticism 4 \
+  --disposition-literalism 4 \
+  --disposition-empathy 2
+```
+
+### Go
+
+```go
+# Section 'update-bank-config' not found in api/memory-banks.go
+```
+
 You can update any subset of fields — only the keys you provide are changed.
 
 ### Reading the Current Configuration
@@ -255,6 +362,22 @@ const { config, overrides } = await client.getBankConfig('my-bank');
 // overrides — only fields overridden at the bank level
 ```
 
+### CLI
+
+```bash
+# Returns resolved config (server defaults merged with bank overrides)
+hindsight bank config my-bank
+
+# Show only bank-specific overrides
+hindsight bank config my-bank --overrides-only
+```
+
+### Go
+
+```go
+# Section 'get-bank-config' not found in api/memory-banks.go
+```
+
 The response distinguishes:
 - **`config`** — the fully resolved configuration (server defaults merged with bank overrides)
 - **`overrides`** — only the fields explicitly overridden for this bank
@@ -275,9 +398,22 @@ client.reset_bank_config("my-bank")
 await client.resetBankConfig('my-bank');
 ```
 
+### CLI
+
+```bash
+# Remove all bank-level overrides, reverting to server defaults
+hindsight bank reset-config my-bank -y
+```
+
+### Go
+
+```go
+# Section 'reset-bank-config' not found in api/memory-banks.go
+```
+
 This removes all bank-level overrides. The bank reverts to server-wide defaults (set via environment variables).
 
-You can also update configuration directly from the [Control Plane UI](/) — navigate to a bank and open the **Configuration** tab.
+You can also update configuration directly from the Control Plane UI — navigate to a bank and open the **Configuration** tab.
 
 ---
 
@@ -324,6 +460,21 @@ const directive = await client.createDirective(
 console.log(`Created directive: ${directive.id}`);
 ```
 
+### CLI
+
+```bash
+# Create a directive (hard rule for reflect)
+hindsight directive create "$BANK_ID" \
+  "Formal Language" \
+  "Always respond in formal English, avoiding slang and colloquialisms."
+```
+
+### Go
+
+```go
+# Section 'create-directive' not found in api/directives.go
+```
+
 ### Listing Directives
 
 ### Python
@@ -345,6 +496,19 @@ const directives = await client.listDirectives(BANK_ID);
 for (const d of directives.items) {
     console.log(`- ${d.name}: ${d.content.slice(0, 50)}...`);
 }
+```
+
+### CLI
+
+```bash
+# List all directives in a bank
+hindsight directive list "$BANK_ID"
+```
+
+### Go
+
+```go
+# Section 'list-directives' not found in api/directives.go
 ```
 
 ### Updating Directives
@@ -373,6 +537,18 @@ const updated = await client.updateDirective(BANK_ID, directiveId, {
 console.log(`Directive active: ${updated.is_active}`);
 ```
 
+### CLI
+
+```bash
+# Section 'update-directive' not found in api/directives.sh
+```
+
+### Go
+
+```go
+# Section 'update-directive' not found in api/directives.go
+```
+
 ### Deleting Directives
 
 ### Python
@@ -390,6 +566,18 @@ client.delete_directive(
 ```javascript
 // Delete a directive
 await client.deleteDirective(BANK_ID, directiveId);
+```
+
+### CLI
+
+```bash
+# Section 'delete-directive' not found in api/directives.sh
+```
+
+### Go
+
+```go
+# Section 'delete-directive' not found in api/directives.go
 ```
 
 ### Directives vs Disposition

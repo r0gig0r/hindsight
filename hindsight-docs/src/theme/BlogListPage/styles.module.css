@@ -1,33 +1,50 @@
 .blogPage {
   max-width: 1280px;
   margin: 0 auto;
-  padding: 4rem 2rem 6rem;
+  padding: 2rem 2rem 6rem;
 }
 
-/* ── Header ─────────────────────────────────────── */
-.header {
-  text-align: center;
+/* ── Section ─────────────────────────────────────── */
+.section {
   margin-bottom: 4rem;
 }
 
-.headerTitle {
-  font-size: 3rem;
-  font-weight: 800;
-  background: linear-gradient(135deg, #0074d9, #009296);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-  margin-bottom: 0.75rem;
-  line-height: 1.15;
-  letter-spacing: -0.03em;
+.sectionHeader {
+  margin-bottom: 2rem;
 }
 
-.headerSubtitle {
-  font-size: 1.05rem;
+.sectionHeaderRow {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  margin-bottom: 0.4rem;
+}
+
+.sectionTitle {
+  font-size: 1.6rem;
+  font-weight: 700;
+  margin: 0;
+  color: var(--ifm-heading-color);
+  letter-spacing: -0.02em;
+}
+
+.sectionViewAll {
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--ifm-color-primary);
+  text-decoration: none !important;
+  white-space: nowrap;
+}
+
+.sectionViewAll:hover {
+  text-decoration: underline !important;
+}
+
+.sectionSubtitle {
+  font-size: 0.95rem;
   color: var(--ifm-color-emphasis-600);
-  max-width: 520px;
-  margin: 0 auto;
-  line-height: 1.7;
+  margin: 0;
+  line-height: 1.6;
 }
 
 /* ── Section ─────────────────────────────────────── */
@@ -93,9 +110,6 @@
     gap: 2rem;
   }
 
-  .headerTitle {
-    font-size: 2.25rem;
-  }
 }
 
 /* ── Card ────────────────────────────────────────── */
@@ -214,6 +228,8 @@
   font-weight: 500;
   color: var(--ifm-color-primary);
   text-decoration: none !important;
+  background: none;
+  cursor: pointer;
   transition: background 0.15s ease, border-color 0.15s ease;
 }
 

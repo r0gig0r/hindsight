@@ -2,6 +2,14 @@
   "id": "hindsight-openclaw",
   "name": "Hindsight Memory",
   "kind": "memory",
+  "configContracts": {
+    "secretInputs": {
+      "paths": [
+        { "path": "llmApiKey", "expected": "string" },
+        { "path": "hindsightApiToken", "expected": "string" }
+      ]
+    }
+  },
   "configSchema": {
     "type": "object",
     "properties": {
@@ -27,7 +35,7 @@
       },
       "llmProvider": {
         "type": "string",
-        "description": "LLM provider for Hindsight memory (e.g. 'openai', 'anthropic', 'gemini', 'groq', 'ollama', 'openai-codex', 'claude-code'). Takes priority over auto-detection but not over HINDSIGHT_API_LLM_PROVIDER env var.",
+        "description": "LLM provider for Hindsight memory (e.g. 'openai', 'anthropic', 'gemini', 'groq', 'ollama', 'openai-codex', 'claude-code').",
         "enum": [
           "openai",
           "anthropic",
@@ -42,9 +50,13 @@
         "type": "string",
         "description": "LLM model to use (e.g. 'gpt-4o-mini', 'claude-3-5-haiku-20241022'). Used with llmProvider."
       },
-      "llmApiKeyEnv": {
+      "llmApiKey": {
+        "type": ["string", "object"],
+        "description": "API key for the LLM provider used by the Hindsight memory daemon. Set via 'openclaw config set ... --ref-source env --ref-id OPENAI_API_KEY' to reference an env var without storing plaintext."
+      },
+      "llmBaseUrl": {
         "type": "string",
-        "description": "Name of the env var holding the API key (e.g. 'MY_CUSTOM_KEY'). If not set, uses the standard env var for the chosen provider."
+        "description": "Optional base URL override for OpenAI-compatible providers (e.g. 'https://openrouter.ai/api/v1')."
       },
       "embedPackagePath": {
         "type": "string",
@@ -60,7 +72,7 @@
         "description": "External Hindsight API URL (e.g. 'https://mcp.hindsight.devcraft.team'). When set, skips local daemon and connects directly to this API."
       },
       "hindsightApiToken": {
-        "type": "string",
+        "type": ["string", "object"],
         "description": "API token for external Hindsight API authentication. Required if the external API has authentication enabled."
       },
       "dynamicBankId": {
@@ -68,9 +80,25 @@
         "description": "Enable per-user memory banks. When true, memories are isolated by user per channel (e.g., slack-U123, telegram-456789). When false, all users share a single 'openclaw' bank.",
         "default": true
       },
+      "bankId": {
+        "type": "string",
+        "description": "Static bank ID used when dynamicBankId is false."
+      },
       "bankIdPrefix": {
         "type": "string",
         "description": "Optional prefix for bank IDs (e.g., 'prod' results in 'prod-slack-U123'). Useful for separating environments."
+      },
+      "retainTags": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Tags applied to every retained document (e.g. ['source_system:openclaw', 'agent:agentname'])."
+      },
+      "retainSource": {
+        "type": "string",
+        "description": "Source value written into retained document metadata. Defaults to 'openclaw'.",
+        "default": "openclaw"
       },
       "autoRecall": {
         "type": "boolean",
@@ -82,7 +110,8 @@
         "items": {
           "type": "string"
         },
-        "description": "Message providers to exclude from recall and retain (e.g. ['telegram', 'discord'])"
+        "description": "Message providers to exclude from recall and retain (e.g. ['heartbeat', 'telegram', 'discord'])",
+        "default": ["heartbeat"]
       },
       "dynamicBankGranularity": {
         "type": "array",
@@ -188,10 +217,62 @@
         "description": "Text shown above recalled memories in the injected context block.",
         "default": "Relevant memories from past conversations (prioritize recent when conflicting). Only use memories that are directly useful to continue this conversation; ignore the rest:"
       },
+      "recallTimeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "description": "Timeout for auto-recall in milliseconds. Increase if recall times out with high budget.",
+        "default": 10000
+      },
+      "recallInjectionPosition": {
+        "type": "string",
+        "enum": ["prepend", "append", "user"],
+        "description": "Where to inject recalled memories. 'prepend' = start of system prompt (default), 'append' = end of system prompt (preserves prompt cache), 'user' = before user message.",
+        "default": "prepend"
+      },
       "debug": {
         "type": "boolean",
-        "description": "Enable debug logging for Hindsight plugin operations.",
+        "description": "Enable debug logging for Hindsight plugin operations. Equivalent to logLevel: 'debug'.",
         "default": false
+      },
+      "logLevel": {
+        "type": "string",
+        "description": "Console log verbosity. 'off' = no output, 'error' = errors only, 'warning' = errors + warnings, 'info' = key events + periodic summaries, 'debug' = all details.",
+        "enum": ["off", "error", "warning", "info", "debug"],
+        "default": "info"
+      },
+      "logSummaryIntervalMs": {
+        "type": "number",
+        "description": "Interval in ms to batch retain/recall log summaries. 0 = log every event individually. Default: 300000 (5 min).",
+        "default": 300000
+      },
+      "retainQueuePath": {
+        "type": "string",
+        "description": "Path to JSONL file for buffering failed retains (external API mode only). Default: ~/.openclaw/data/hindsight-retain-queue.jsonl"
+      },
+      "retainQueueMaxAgeMs": {
+        "type": "number",
+        "description": "Max age in ms for queued retain items. -1 = keep forever.",
+        "default": -1
+      },
+      "retainQueueFlushIntervalMs": {
+        "type": "number",
+        "description": "How often to attempt flushing queued retains in ms. Default: 60000 (1 min).",
+        "default": 60000
+      },
+      "ignoreSessionPatterns": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Session key glob patterns to skip entirely (no recall, no retain). E.g. [\"agent:main:**\", \"agent:*:cron:**\"]. * matches non-colon chars, ** matches anything."
+      },
+      "statelessSessionPatterns": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Session key glob patterns for read-only sessions: retain is always skipped, recall is skipped when skipStatelessSessions is true. E.g. [\"agent:*:subagent:**\", \"agent:*:heartbeat:**\"]."
+      },
+      "skipStatelessSessions": {
+        "type": "boolean",
+        "description": "When true (default), sessions matching statelessSessionPatterns also skip recall. When false, they can recall but never retain.",
+        "default": true
       }
     },
     "additionalProperties": false
@@ -221,9 +302,14 @@
       "label": "LLM Model",
       "placeholder": "e.g. gpt-4o-mini, claude-3-5-haiku-20241022"
     },
-    "llmApiKeyEnv": {
-      "label": "API Key Env Var",
-      "placeholder": "e.g. MY_CUSTOM_API_KEY (optional)"
+    "llmApiKey": {
+      "label": "LLM API Key",
+      "placeholder": "API key for the chosen LLM provider",
+      "sensitive": true
+    },
+    "llmBaseUrl": {
+      "label": "LLM Base URL",
+      "placeholder": "e.g. https://openrouter.ai/api/v1 (optional)"
     },
     "embedPackagePath": {
       "label": "Local Package Path (Dev)",
@@ -239,15 +325,28 @@
     },
     "hindsightApiToken": {
       "label": "External API Token",
-      "placeholder": "API token if external API requires authentication"
+      "placeholder": "API token if external API requires authentication",
+      "sensitive": true
     },
     "dynamicBankId": {
       "label": "Dynamic Bank IDs",
       "placeholder": "true (isolate memories per channel)"
     },
+    "bankId": {
+      "label": "Static Bank ID",
+      "placeholder": "e.g. openclaw, shared-bank (used when dynamicBankId is false)"
+    },
     "bankIdPrefix": {
       "label": "Bank ID Prefix",
       "placeholder": "e.g., prod, staging (optional)"
+    },
+    "retainTags": {
+      "label": "Retain Tags",
+      "placeholder": "e.g. ['source_system:openclaw', 'agent:agentname']"
+    },
+    "retainSource": {
+      "label": "Retain Source",
+      "placeholder": "openclaw"
     },
     "autoRecall": {
       "label": "Auto-Recall",
@@ -255,7 +354,7 @@
     },
     "excludeProviders": {
       "label": "Excluded Providers",
-      "placeholder": "e.g. telegram, discord"
+      "placeholder": "e.g. heartbeat, telegram, discord"
     },
     "dynamicBankGranularity": {
       "label": "Bank Granularity",
@@ -309,8 +408,47 @@
       "label": "Recall Prompt Preamble",
       "placeholder": "Instruction shown above recalled memories in injected context"
     },
+    "recallTimeoutMs": {
+      "label": "Recall Timeout (ms)",
+      "placeholder": "10000 (default)"
+    },
+    "recallInjectionPosition": {
+      "label": "Recall Injection Position",
+      "placeholder": "prepend, append, or user"
+    },
     "debug": {
       "label": "Debug"
+    },
+    "logLevel": {
+      "label": "Log Level"
+    },
+    "logSummaryIntervalMs": {
+      "label": "Log Summary Interval (ms)",
+      "placeholder": "300000"
+    },
+    "retainQueuePath": {
+      "label": "Retain Queue File Path",
+      "placeholder": "~/.openclaw/data/hindsight-retain-queue.jsonl"
+    },
+    "retainQueueMaxAgeMs": {
+      "label": "Retain Queue Max Age (ms)",
+      "placeholder": "-1 (forever)"
+    },
+    "retainQueueFlushIntervalMs": {
+      "label": "Retain Queue Flush Interval (ms)",
+      "placeholder": "60000"
+    },
+    "ignoreSessionPatterns": {
+      "label": "Ignore Session Patterns",
+      "placeholder": "e.g. [\"agent:main:**\", \"agent:*:cron:**\"]"
+    },
+    "statelessSessionPatterns": {
+      "label": "Stateless Session Patterns",
+      "placeholder": "e.g. [\"agent:*:subagent:**\", \"agent:*:heartbeat:**\"]"
+    },
+    "skipStatelessSessions": {
+      "label": "Skip Stateless Sessions",
+      "placeholder": "true (default)"
     }
   }
 }
