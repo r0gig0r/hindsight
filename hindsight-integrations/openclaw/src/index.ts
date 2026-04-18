@@ -102,10 +102,10 @@ export interface BankScopedClient {
     req: {
       query: string;
       maxTokens?: number;
-      budget?: 'low' | 'mid' | 'high';
-      types?: Array<'world' | 'experience' | 'observation'>;
+      budget?: "low" | "mid" | "high";
+      types?: Array<"world" | "experience" | "observation">;
     },
-    timeoutMs?: number,
+    timeoutMs?: number
   ): Promise<RecallResponse>;
   setMission(mission: string): Promise<void>;
 }
@@ -145,10 +145,10 @@ function scopeClient(c: HindsightClient, bankId: string): BankScopedClient {
     },
     async recallExp(req, timeoutMs) {
       // [FORK] Direct HTTP call to recall_exp endpoint (not in generated SDK)
-      const baseUrl = clientOptions?.baseUrl?.replace(/\/$/, '') ?? '';
+      const baseUrl = clientOptions?.baseUrl?.replace(/\/$/, "") ?? "";
       const url = `${baseUrl}/v1/default/banks/${encodeURIComponent(bankId)}/memories/recall_exp`;
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (clientOptions?.apiKey) headers['Authorization'] = `Bearer ${clientOptions.apiKey}`;
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (clientOptions?.apiKey) headers["Authorization"] = `Bearer ${clientOptions.apiKey}`;
       const body = JSON.stringify({
         query: req.query,
         max_tokens: req.maxTokens,
@@ -158,7 +158,7 @@ function scopeClient(c: HindsightClient, bankId: string): BankScopedClient {
       const controller = new AbortController();
       const timer = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
       try {
-        const res = await fetch(url, { method: 'POST', headers, body, signal: controller.signal });
+        const res = await fetch(url, { method: "POST", headers, body, signal: controller.signal });
         if (!res.ok) throw new Error(`recall_exp HTTP ${res.status}: ${await res.text()}`);
         return (await res.json()) as RecallResponse;
       } finally {

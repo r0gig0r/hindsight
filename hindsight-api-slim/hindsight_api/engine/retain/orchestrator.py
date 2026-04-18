@@ -1044,9 +1044,7 @@ async def _streaming_retain_batch(
                     # Also filter batch_extracted to stay in sync
                     batch_extracted = [f for f, d in zip(batch_extracted, is_dup_flags) if not d]
                     batch_processed = non_dup_facts
-                log_buffer.append(
-                    f"  [FORK] Deduplication: {dup_count} duplicates in {time.time() - dedup_start:.3f}s"
-                )
+                log_buffer.append(f"  [FORK] Deduplication: {dup_count} duplicates in {time.time() - dedup_start:.3f}s")
                 if not batch_processed:
                     log_buffer.append("  [FORK] All facts were duplicates, skipping write")
                     return

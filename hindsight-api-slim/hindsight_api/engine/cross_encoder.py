@@ -471,10 +471,7 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
             raw = response.json()
             # Handle both TEI format [{index, score}] and Infinity format {results: [{index, relevance_score}]}
             results = raw.get("results", raw) if isinstance(raw, dict) else raw
-            return [
-                (r["index"], r.get("score", r.get("relevance_score", 0.0)))
-                for r in results
-            ]
+            return [(r["index"], r.get("score", r.get("relevance_score", 0.0))) for r in results]
         except httpx.HTTPError as e:
             raise RuntimeError(f"TEI rerank request failed: {e}")
 
