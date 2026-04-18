@@ -520,7 +520,7 @@ Google's `gemini-embedding-001` produces 3072 dimensions natively but supports c
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HINDSIGHT_API_RERANKER_PROVIDER` | Provider: `local`, `tei`, `cohere`, `openrouter`, `zeroentropy`, `google`, `flashrank`, `litellm`, `litellm-sdk`, `jina-mlx`, or `rrf` | `local` |
+| `HINDSIGHT_API_RERANKER_PROVIDER` | Provider: `local`, `tei`, `cohere`, `openrouter`, `zeroentropy`, `siliconflow`, `google`, `flashrank`, `litellm`, `litellm-sdk`, `jina-mlx`, or `rrf` | `local` |
 | `HINDSIGHT_API_RERANKER_LOCAL_MODEL` | Model for local provider | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
 | `HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT` | Max concurrent local reranking (prevents CPU thrashing under load) | `4` |
 | `HINDSIGHT_API_RERANKER_LOCAL_TRUST_REMOTE_CODE` | Allow loading models with custom code (security risk, disabled by default) | `false` |
@@ -531,11 +531,12 @@ Google's `gemini-embedding-001` produces 3072 dimensions natively but supports c
 | `HINDSIGHT_API_RERANKER_TEI_URL` | TEI server URL | - |
 | `HINDSIGHT_API_RERANKER_TEI_BATCH_SIZE` | Batch size for TEI reranking | `128` |
 | `HINDSIGHT_API_RERANKER_TEI_MAX_CONCURRENT` | Max concurrent TEI reranking requests | `8` |
+| `HINDSIGHT_API_RERANKER_TEI_HTTP_TIMEOUT` | HTTP request timeout for TEI reranker (seconds). Increase when using a slower CPU-based reranker under load. | `30.0` |
 | `HINDSIGHT_API_RERANKER_OPENROUTER_API_KEY` | OpenRouter API key for reranking (falls back to `HINDSIGHT_API_OPENROUTER_API_KEY`, then `HINDSIGHT_API_LLM_API_KEY`) | - |
 | `HINDSIGHT_API_RERANKER_OPENROUTER_MODEL` | OpenRouter rerank model | `cohere/rerank-v3.5` |
 | `HINDSIGHT_API_RERANKER_COHERE_API_KEY` | Cohere API key for reranking | - |
 | `HINDSIGHT_API_RERANKER_COHERE_MODEL` | Cohere rerank model | `rerank-english-v3.0` |
-| `HINDSIGHT_API_RERANKER_COHERE_BASE_URL` | Custom base URL for Cohere-compatible API (e.g., Azure-hosted) | - |
+| `HINDSIGHT_API_RERANKER_COHERE_BASE_URL` | Custom base URL for any Cohere-compatible `/rerank` endpoint (Azure AI Foundry, Jina, Voyage, self-hosted BGE, etc.). When set, the `cohere` provider bypasses the Cohere SDK and calls the endpoint directly via HTTP. | - |
 | `HINDSIGHT_API_RERANKER_LITELLM_API_BASE` | LiteLLM proxy base URL for reranking | `http://localhost:4000` |
 | `HINDSIGHT_API_RERANKER_LITELLM_API_KEY` | LiteLLM proxy API key for reranking (optional, depends on proxy config) | - |
 | `HINDSIGHT_API_RERANKER_LITELLM_MODEL` | LiteLLM **proxy** rerank model (use provider prefix, e.g., `cohere/rerank-english-v3.0`) | `cohere/rerank-english-v3.0` |
@@ -546,6 +547,9 @@ Google's `gemini-embedding-001` produces 3072 dimensions natively but supports c
 | `HINDSIGHT_API_RERANKER_ZEROENTROPY_API_KEY` | ZeroEntropy API key for reranking | - |
 | `HINDSIGHT_API_RERANKER_ZEROENTROPY_MODEL` | ZeroEntropy rerank model (`zerank-2`, `zerank-2-small`) | `zerank-2` |
 | `HINDSIGHT_API_RERANKER_ZEROENTROPY_BASE_URL` | Custom base URL for ZeroEntropy-compatible API (e.g., mock server, proxy, or self-hosted deployment) | `https://api.zeroentropy.dev` |
+| `HINDSIGHT_API_RERANKER_SILICONFLOW_API_KEY` | SiliconFlow API key for reranking | - |
+| `HINDSIGHT_API_RERANKER_SILICONFLOW_MODEL` | SiliconFlow rerank model (e.g., `BAAI/bge-reranker-v2-m3`) | `BAAI/bge-reranker-v2-m3` |
+| `HINDSIGHT_API_RERANKER_SILICONFLOW_BASE_URL` | Base URL for the SiliconFlow `/rerank` endpoint | `https://api.siliconflow.cn/v1` |
 | `HINDSIGHT_API_RERANKER_GOOGLE_PROJECT_ID` | Google Cloud project ID for Discovery Engine reranking (falls back to `HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID`) | - |
 | `HINDSIGHT_API_RERANKER_GOOGLE_MODEL` | Google Discovery Engine ranking model | `semantic-ranker-default-004` |
 | `HINDSIGHT_API_RERANKER_GOOGLE_SERVICE_ACCOUNT_KEY` | Path to service account JSON key (falls back to `HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY`). If unset, uses ADC. | - |
@@ -578,17 +582,35 @@ export HINDSIGHT_API_RERANKER_PROVIDER=cohere
 export HINDSIGHT_API_RERANKER_COHERE_API_KEY=your-api-key
 export HINDSIGHT_API_RERANKER_COHERE_MODEL=rerank-english-v3.0
 
-# Azure-hosted Cohere - reranking via custom endpoint
+# Any Cohere-compatible /rerank endpoint (Azure AI Foundry, Jina, Voyage, self-hosted BGE, etc.)
+#
+# Setting HINDSIGHT_API_RERANKER_COHERE_BASE_URL switches the `cohere` provider
+# off the Cohere SDK and onto a plain HTTP client that speaks the standard
+# Cohere rerank wire format:
+#   Request:  POST {base_url}  (or {base_url}/rerank, depending on host)
+#             Authorization: Bearer <api_key>
+#             {"model": "...", "query": "...", "documents": [...], "return_documents": false}
+#   Response: {"results": [{"index": 0, "relevance_score": 0.9}, ...]}
+#
+# Any service implementing this contract works here. For Azure AI Foundry the
+# base_url is the full invoke URL; for SiliconFlow you can also use the
+# dedicated `siliconflow` provider below.
 export HINDSIGHT_API_RERANKER_PROVIDER=cohere
-export HINDSIGHT_API_RERANKER_COHERE_API_KEY=your-azure-api-key
-export HINDSIGHT_API_RERANKER_COHERE_MODEL=rerank-english-v3.0
-export HINDSIGHT_API_RERANKER_COHERE_BASE_URL=https://your-azure-cohere-endpoint.com
+export HINDSIGHT_API_RERANKER_COHERE_API_KEY=your-api-key
+export HINDSIGHT_API_RERANKER_COHERE_MODEL=rerank-english-v3.0  # whatever model the endpoint serves
+export HINDSIGHT_API_RERANKER_COHERE_BASE_URL=https://your-cohere-compatible-endpoint.com
 
 # ZeroEntropy - cloud-based reranking (state-of-the-art accuracy)
 export HINDSIGHT_API_RERANKER_PROVIDER=zeroentropy
 export HINDSIGHT_API_RERANKER_ZEROENTROPY_API_KEY=your-api-key
 export HINDSIGHT_API_RERANKER_ZEROENTROPY_MODEL=zerank-2  # or zerank-2-small
 # export HINDSIGHT_API_RERANKER_ZEROENTROPY_BASE_URL=https://your-custom-endpoint.com  # optional
+
+# SiliconFlow - cloud reranking via SiliconFlow's Cohere-compatible /rerank endpoint
+export HINDSIGHT_API_RERANKER_PROVIDER=siliconflow
+export HINDSIGHT_API_RERANKER_SILICONFLOW_API_KEY=your-api-key
+export HINDSIGHT_API_RERANKER_SILICONFLOW_MODEL=BAAI/bge-reranker-v2-m3
+# export HINDSIGHT_API_RERANKER_SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1  # default
 
 # LiteLLM proxy - unified gateway for multiple reranking providers (requires running LiteLLM proxy server)
 export HINDSIGHT_API_RERANKER_PROVIDER=litellm
@@ -667,6 +689,7 @@ For advanced authentication (JWT, OAuth, multi-tenant schemas), implement a cust
 | `HINDSIGHT_API_WORKERS` | Number of uvicorn worker processes | `1` |
 | `HINDSIGHT_API_LOG_LEVEL` | Log level: `debug`, `info`, `warning`, `error` | `info` |
 | `HINDSIGHT_API_LOG_FORMAT` | Log format: `text` or `json` (structured logging for cloud platforms) | `text` |
+| `HINDSIGHT_API_LOG_JSON_FIELDS` | Comma-separated allowlist of JSON log fields to emit (e.g. `severity,message,tenant`). Available: `severity`, `message`, `timestamp`, `logger`, `tenant`, `exception`. Empty = all fields. | `""` (all) |
 | `HINDSIGHT_API_MCP_ENABLED` | Enable MCP server at `/mcp/{bank_id}/` | `true` |
 
 ### Retrieval
@@ -685,6 +708,27 @@ For advanced authentication (JWT, OAuth, multi-tenant schemas), implement a cust
 
 - **`link_expansion`** (default): Fast graph expansion from semantic seeds via entity co-occurrence, semantic kNN, and causal links. Target latency under 100ms.
 
+#### Recall budget mapping
+
+The recall request takes a `budget` parameter (`low` / `mid` / `high`, default `mid`) that maps to an integer `thinking_budget` used by every retrieval method (semantic, BM25, graph, temporal). These knobs control that mapping. They are hierarchical — overridable per bank via the [config API](#hierarchical-configuration).
+
+Two functions are available:
+
+- **`fixed`** (default — preserves legacy behavior): `thinking_budget = recall_budget_fixed_<level>` (independent of `max_tokens`).
+- **`adaptive`**: `thinking_budget = round(max_tokens * recall_budget_adaptive_<level>)`, clamped to `[recall_budget_min, recall_budget_max]`. Useful when callers vary `max_tokens` and you want retrieval breadth to scale with the requested output size.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HINDSIGHT_API_RECALL_BUDGET_FUNCTION` | Mapping function: `fixed` or `adaptive`. | `fixed` |
+| `HINDSIGHT_API_RECALL_BUDGET_FIXED_LOW` | Items per retrieval method per fact type when `budget=low` and function is `fixed`. | `100` |
+| `HINDSIGHT_API_RECALL_BUDGET_FIXED_MID` | Items per retrieval method per fact type when `budget=mid` and function is `fixed`. | `300` |
+| `HINDSIGHT_API_RECALL_BUDGET_FIXED_HIGH` | Items per retrieval method per fact type when `budget=high` and function is `fixed`. | `1000` |
+| `HINDSIGHT_API_RECALL_BUDGET_ADAPTIVE_LOW` | Ratio of request `max_tokens` used when `budget=low` and function is `adaptive`. | `0.025` |
+| `HINDSIGHT_API_RECALL_BUDGET_ADAPTIVE_MID` | Ratio of request `max_tokens` used when `budget=mid` and function is `adaptive`. | `0.075` |
+| `HINDSIGHT_API_RECALL_BUDGET_ADAPTIVE_HIGH` | Ratio of request `max_tokens` used when `budget=high` and function is `adaptive`. | `0.25` |
+| `HINDSIGHT_API_RECALL_BUDGET_MIN` | Floor for the adaptive function (after clamping). | `20` |
+| `HINDSIGHT_API_RECALL_BUDGET_MAX` | Ceiling for the adaptive function (after clamping). | `2000` |
+
 ### Retain
 
 Controls the retain (memory ingestion) pipeline.
@@ -700,6 +744,7 @@ Controls the retain (memory ingestion) pipeline.
 | `HINDSIGHT_API_RETAIN_BATCH_ENABLED` | Use LLM Batch API for fact extraction (50% cost savings, only with async operations) | `false` |
 | `HINDSIGHT_API_RETAIN_MAX_CONCURRENT` | Max concurrent retain DB phases (HNSW reads + writes). Limits I/O contention during high-concurrency ingestion. | `4` |
 | `HINDSIGHT_API_RETAIN_BATCH_TOKENS` | Max characters per sub-batch for async retain auto-splitting | `10000` |
+| `HINDSIGHT_API_RETAIN_CHUNK_BATCH_SIZE` | Max chunks per streaming batch when retain ingests long documents. Each chunk produces roughly 17 facts, so the default 100 chunks ≈ 1700 facts per batch. Lower to cap memory/LLM pressure on large documents; raise for smaller chunks. Configurable per bank. | `100` |
 | `HINDSIGHT_API_RETAIN_ENTITY_LOOKUP` | Entity lookup method during retain: `full` (exact match) or `trigram` (fuzzy trigram matching) | `trigram` |
 | `HINDSIGHT_API_RETAIN_DEFAULT_STRATEGY` | Default retain strategy name. When set, all retain calls without an explicit `strategy` parameter use this strategy. | - |
 | `HINDSIGHT_API_RETAIN_BATCH_POLL_INTERVAL_SECONDS` | Batch API polling interval in seconds | `60` |
@@ -964,13 +1009,15 @@ For production deployments, use `s3`, `gcs`, or `azure` to avoid storing large b
 
 ### Observations (Experimental) {#observations}
 
-Observations are consolidated knowledge synthesized from facts.
+Observations are deduplicated, evidence-grounded knowledge consolidated from multiple facts. Each observation tracks its supporting memories, a proof count, and a computed freshness trend, and is refined — not overwritten — when new evidence arrives.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HINDSIGHT_API_ENABLE_OBSERVATIONS` | Enable observation consolidation | `true` |
 | `HINDSIGHT_API_ENABLE_OBSERVATION_HISTORY` | Track history of changes to each observation (previous content + timestamp). Disable to reduce storage if audit trails are not needed. | `true` |
+| `HINDSIGHT_API_CONSOLIDATION_MAX_ATTEMPTS` | Outer retry attempts for the consolidation LLM batch call. Each attempt uses the inner retry budget (`HINDSIGHT_API_CONSOLIDATION_LLM_MAX_RETRIES`). Worst-case API calls per batch = `MAX_ATTEMPTS × (LLM_MAX_RETRIES + 1)`. | `3` |
 | `HINDSIGHT_API_CONSOLIDATION_BATCH_SIZE` | Memories to load per batch (internal optimization) | `50` |
+| `HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND` | Maximum memories processed per consolidation round. When the limit is reached, the job yields its worker slot and re-queues itself so other banks get fair scheduling. Mental model refreshes only run on the final round. `0` = unlimited. Configurable per bank. | `100` |
 | `HINDSIGHT_API_CONSOLIDATION_MAX_TOKENS` | Max tokens for recall when finding related observations during consolidation | `1024` |
 | `HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE` | Number of facts sent to the LLM in a single consolidation call. Higher values reduce LLM calls and improve throughput at the cost of larger prompts. Set to `1` to disable batching. Configurable per bank. | `8` |
 | `HINDSIGHT_API_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS` | Total token budget for source facts included with observations in the consolidation prompt. `-1` = unlimited. Configurable per bank. | `-1` |
@@ -987,7 +1034,7 @@ Observations are consolidated knowledge synthesized from facts.
 
 **`HINDSIGHT_API_OBSERVATIONS_MISSION` — redefine what this bank synthesises**
 
-By default, observations are durable, specific facts synthesized from memories — the kind of knowledge that stays true over time (preferences, skills, relationships, recurring patterns). Ephemeral state is filtered out. Contradictions are tracked with temporal markers.
+By default, observations are durable, specific beliefs consolidated from memories — the kind of knowledge that stays true over time (preferences, skills, relationships, recurring patterns). Each one is grounded in the source memories that support it. Ephemeral state is filtered out. Contradictions are tracked with temporal markers rather than overwriting the prior belief.
 
 Set `HINDSIGHT_API_OBSERVATIONS_MISSION` to replace this definition entirely. Write a plain-language description of what observations should be for your use case. The LLM will use this instead of the default rules when deciding what to create or update. Leave it unset to keep the server default.
 
@@ -1026,6 +1073,16 @@ export HINDSIGHT_API_OBSERVATIONS_MISSION="Observations are recurring patterns i
 | `HINDSIGHT_API_REFLECT_WALL_TIMEOUT` | Wall-clock timeout in seconds for the entire reflect operation. If exceeded, the request returns HTTP 504. | `300` |
 | `HINDSIGHT_API_REFLECT_MISSION` | Global reflect mission (identity and reasoning framing). Overridden per bank via config API. | - |
 | `HINDSIGHT_API_REFLECT_SOURCE_FACTS_MAX_TOKENS` | Token budget for source facts in `search_observations` during reflect. `-1` disables source facts (default), `0` enables with no limit, `>0` enables with a token budget. Hierarchical — can be overridden per bank via config API. | `-1` |
+
+#### Internal recall (used by mental model refresh)
+
+These knobs control the recall tool that runs inside `reflect_async` (e.g. when refreshing a mental model). They are hierarchical — overridable per bank via the config API, and individually overridable per mental model via the `trigger.include_chunks`, `trigger.recall_max_tokens`, and `trigger.recall_chunks_max_tokens` fields.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HINDSIGHT_API_RECALL_INCLUDE_CHUNKS` | Whether the internal recall returns raw chunk text alongside facts. Set `false` to skip chunks and save prompt budget. | `true` |
+| `HINDSIGHT_API_RECALL_MAX_TOKENS` | Token budget for facts returned by the internal recall. | `2048` |
+| `HINDSIGHT_API_RECALL_CHUNKS_MAX_TOKENS` | Token budget for raw chunks returned by the internal recall. | `1000` |
 
 #### Disposition
 
@@ -1103,8 +1160,12 @@ Configuration for background task processing. By default, the API processes task
 | `HINDSIGHT_API_WORKER_POLL_INTERVAL_MS` | Database polling interval in milliseconds | `500` |
 | `HINDSIGHT_API_WORKER_MAX_RETRIES` | Max retries before marking task failed | `3` |
 | `HINDSIGHT_API_WORKER_HTTP_PORT` | HTTP port for worker metrics/health (worker CLI only) | `8889` |
-| `HINDSIGHT_API_WORKER_MAX_SLOTS` | Maximum concurrent tasks per worker | `10` |
-| `HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS` | Maximum concurrent consolidation tasks per worker | `2` |
+| `HINDSIGHT_API_WORKER_MAX_SLOTS` | Maximum concurrent tasks per worker (total across all operation types) | `10` |
+| `HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS` | Slots reserved for consolidation tasks within `WORKER_MAX_SLOTS` | `2` |
+
+:::note Slot reservation
+`WORKER_CONSOLIDATION_MAX_SLOTS` is a **reservation within** `WORKER_MAX_SLOTS`, not an additive pool. With the defaults (`MAX_SLOTS=10`, `CONSOLIDATION_MAX_SLOTS=2`), retain and other non-consolidation tasks may use at most `10 - 2 = 8` concurrent slots, leaving 2 always available for consolidation. This prevents consolidation from being starved when retain throughput continuously saturates the queue. Set `CONSOLIDATION_MAX_SLOTS=0` to give all slots to non-consolidation work.
+:::
 
 ### Performance Optimization
 
@@ -1124,9 +1185,13 @@ Configuration for background task processing. By default, the API processes task
 
 ### Audit Logging
 
+Audit logging captures mutating operations (retain, recall, reflect, bank config updates, etc.) into an `audit_log` table, queryable via the `/audit-logs` endpoint.
+
+**Audit logging is disabled by default.** With `HINDSIGHT_API_AUDIT_LOG_ENABLED=false`, the `audit_log` table stays empty and `/audit-logs` returns `{"total": 0, "items": []}` regardless of activity. Set the flag to `true` and restart the API to start capturing events.
+
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HINDSIGHT_API_AUDIT_LOG_ENABLED` | Master switch for audit logging | `false` |
+| `HINDSIGHT_API_AUDIT_LOG_ENABLED` | Master switch for audit logging. Must be `true` for any audit events to be written. | `false` |
 | `HINDSIGHT_API_AUDIT_LOG_ACTIONS` | Comma-separated allowlist of action types to audit (empty = all eligible actions) | `""` |
 | `HINDSIGHT_API_AUDIT_LOG_RETENTION_DAYS` | Number of days to retain audit log entries. `-1` = keep forever. | `-1` |
 
@@ -1289,6 +1354,33 @@ Configuration fields are categorized for security:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HINDSIGHT_API_ENABLE_BANK_CONFIG_API` | Enable per-bank config API | `true` |
+| `HINDSIGHT_API_DEFAULT_BANK_TEMPLATE` | Bank template manifest (JSON) applied automatically to every newly-created bank. See below. | _(unset)_ |
+
+##### `HINDSIGHT_API_DEFAULT_BANK_TEMPLATE`
+
+Server-level default bank template. When set, the manifest is applied once
+to every bank the server creates — triggered the first time a bank is
+touched (via `PUT /v1/default/banks/{bank_id}`, `/import`, `/retain`, etc.).
+The value is a JSON-encoded `BankTemplateManifest` with the same shape
+accepted by `POST /v1/default/banks/{bank_id}/import` (see the `bank`,
+`mental_models`, and `directives` sections in the Bank Templates API).
+
+Precedence: fields set by the template become per-bank overrides, so they
+take precedence over the equivalent `HINDSIGHT_API_*` env-var defaults
+(e.g. `HINDSIGHT_API_RETAIN_EXTRACTION_MODE`). Users can still override
+individual fields later via `PATCH /v1/default/banks/{bank_id}/config`;
+the template is **not** re-applied on subsequent accesses, so explicit
+overrides are never clobbered.
+
+A malformed manifest (bad JSON, unknown version, schema errors) is logged
+and ignored — bank creation still succeeds with plain defaults, so a
+broken server-level setting cannot wedge all callers.
+
+Example (compact, single-line JSON as required by env vars):
+
+```bash
+export HINDSIGHT_API_DEFAULT_BANK_TEMPLATE='{"version":"1","bank":{"reflect_mission":"Help support agents remember customer interactions.","retain_extraction_mode":"verbose","disposition_empathy":5},"directives":[{"name":"Be concise","content":"Always respond concisely.","priority":10}]}'
+```
 
 #### API Endpoints
 

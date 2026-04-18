@@ -31,6 +31,49 @@ export HINDSIGHT_API_URL=http://localhost:8888
 export HINDSIGHT_API_KEY=your-api-key
 ```
 
+### Named Profiles
+
+When you need to switch between multiple Hindsight deployments (e.g. local,
+staging, production) without constantly rewriting `~/.hindsight/config`, use
+named profiles. Each profile is a TOML file at
+`~/.hindsight/cli-profiles/<name>.toml` and is selected per-invocation with
+`-p/--profile` (or by setting `$HINDSIGHT_PROFILE`).
+
+```bash
+# Create (or overwrite) a profile
+hindsight profile create prod \
+  --api-url https://api.hindsight.vectorize.io \
+  --api-key hsk_...
+
+# List and inspect profiles
+hindsight profile list
+hindsight profile show prod
+
+# Use a profile for a single command
+hindsight -p prod bank list
+
+# Or make it sticky for the current shell
+export HINDSIGHT_PROFILE=prod
+hindsight bank list
+
+# Remove a profile
+hindsight profile delete prod -y
+```
+
+Profile files are written with `0600` permissions on Unix so the API key is
+only readable by the owner.
+
+**Configuration precedence** (highest first):
+
+1. Environment variables (`HINDSIGHT_API_URL`, `HINDSIGHT_API_KEY`)
+2. Named profile — explicit `-p <name>`, otherwise `$HINDSIGHT_PROFILE`
+3. Shared config file (`~/.hindsight/config`, written by `hindsight configure`)
+4. Default (`http://localhost:8888`)
+
+`HINDSIGHT_API_URL` / `HINDSIGHT_API_KEY` always override profile values, which
+makes it safe to use `-p` in scripts while letting CI inject credentials via
+environment.
+
 ## Core Commands
 
 ### Retain (Store Memory)
@@ -80,6 +123,13 @@ hindsight memory recall <bank_id> "hiking recommendations" \
 # Filter by fact type
 hindsight memory recall <bank_id> "query" --fact-type world,observation
 
+# Filter by tags
+hindsight memory recall <bank_id> "query" --tags work,project \
+  --tags-match all
+
+# Pin results to a specific time
+hindsight memory recall <bank_id> "query" --query-timestamp "2026-01-15T00:00:00Z"
+
 # Show trace information
 hindsight memory recall <bank_id> "query" --trace
 ```
@@ -96,6 +146,30 @@ hindsight memory reflect <bank_id> "Should I learn Python?" --context "career ad
 
 # Higher budget for complex questions
 hindsight memory reflect <bank_id> "Summarize my week" --budget high
+
+# Filter by fact type
+hindsight memory reflect <bank_id> "query" \
+  --fact-types world,experience \
+  --exclude-mental-models
+```
+
+### Memory History
+
+View the observation history for a specific memory unit:
+
+```bash
+hindsight memory history <bank_id> <memory_id>
+```
+
+### Clear Observations
+
+Remove all observations for a memory unit, keeping the core fact:
+
+```bash
+hindsight memory clear-observations <bank_id> <memory_id>
+
+# Skip confirmation prompt
+hindsight memory clear-observations <bank_id> <memory_id> -y
 ```
 
 ## Bank Management
@@ -110,6 +184,12 @@ hindsight bank list
 
 ```bash
 hindsight bank disposition <bank_id>
+```
+
+### Set Disposition
+
+```bash
+hindsight bank set-disposition <bank_id> --mission "..." --name "..."
 ```
 
 ### View Statistics
@@ -130,6 +210,25 @@ hindsight bank name <bank_id> "My Assistant"
 hindsight bank mission <bank_id> "I am a helpful AI assistant interested in technology"
 ```
 
+### Clear Observations (Bank-wide)
+
+Remove all observations across the entire bank:
+
+```bash
+hindsight bank clear-observations <bank_id>
+
+# Skip confirmation prompt
+hindsight bank clear-observations <bank_id> -y
+```
+
+### Recover Consolidation
+
+Recover from a failed or stuck consolidation:
+
+```bash
+hindsight bank consolidation-recover <bank_id>
+```
+
 ## Document Management
 
 ```bash
@@ -138,6 +237,9 @@ hindsight document list <bank_id>
 
 # Get document details
 hindsight document get <bank_id> <document_id>
+
+# Update document metadata
+hindsight document update <bank_id> <document_id> --context "updated context"
 
 # Delete document and its memories
 hindsight document delete <bank_id> <document_id>
@@ -151,6 +253,70 @@ hindsight entity list <bank_id>
 
 # Get entity details
 hindsight entity get <bank_id> <entity_id>
+```
+
+## Operation Management
+
+Track and manage async operations (retain-files, consolidation, etc.):
+
+```bash
+# List operations
+hindsight operation list <bank_id>
+
+# Get operation status
+hindsight operation get <bank_id> <operation_id>
+
+# Cancel a pending operation
+hindsight operation cancel <bank_id> <operation_id>
+
+# Retry a failed operation
+hindsight operation retry <bank_id> <operation_id>
+```
+
+## Webhook Management
+
+Configure event delivery hooks for bank activity:
+
+```bash
+# List webhooks
+hindsight webhook list <bank_id>
+
+# Create a webhook (defaults to consolidation.completed events)
+hindsight webhook create <bank_id> https://example.com/hook
+
+# Create with specific events and signing secret
+hindsight webhook create <bank_id> https://example.com/hook \
+  --event-types retain.completed,consolidation.completed \
+  --secret my-hmac-secret
+
+# Update a webhook
+hindsight webhook update <bank_id> <webhook_id> --url https://new-url.com
+
+# Delete a webhook
+hindsight webhook delete <bank_id> <webhook_id>
+
+# View delivery history
+hindsight webhook deliveries <bank_id> <webhook_id>
+```
+
+## Audit Logs
+
+Inspect the audit trail for a bank:
+
+```bash
+# List audit entries
+hindsight audit list <bank_id>
+
+# Filter by action and transport
+hindsight audit list <bank_id> --action recall --transport mcp
+
+# Filter by date range
+hindsight audit list <bank_id> \
+  --start-date "2026-04-01T00:00:00Z" \
+  --end-date "2026-04-10T00:00:00Z"
+
+# Pagination
+hindsight audit list <bank_id> --limit 50 --offset 100
 ```
 
 ## Output Formats

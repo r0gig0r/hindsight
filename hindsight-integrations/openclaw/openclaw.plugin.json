@@ -36,15 +36,7 @@
       "llmProvider": {
         "type": "string",
         "description": "LLM provider for Hindsight memory (e.g. 'openai', 'anthropic', 'gemini', 'groq', 'ollama', 'openai-codex', 'claude-code').",
-        "enum": [
-          "openai",
-          "anthropic",
-          "gemini",
-          "groq",
-          "ollama",
-          "openai-codex",
-          "claude-code"
-        ]
+        "enum": ["openai", "anthropic", "gemini", "groq", "ollama", "openai-codex", "claude-code"]
       },
       "llmModel": {
         "type": "string",
@@ -117,19 +109,10 @@
         "type": "array",
         "items": {
           "type": "string",
-          "enum": [
-            "agent",
-            "channel",
-            "user",
-            "provider"
-          ]
+          "enum": ["agent", "channel", "user", "provider"]
         },
         "description": "Fields used to derive bank ID. Controls memory isolation granularity. Default: ['agent', 'channel', 'user'].",
-        "default": [
-          "agent",
-          "channel",
-          "user"
-        ]
+        "default": ["agent", "channel", "user"]
       },
       "autoRetain": {
         "type": "boolean",
@@ -140,18 +123,21 @@
         "type": "array",
         "items": {
           "type": "string",
-          "enum": [
-            "user",
-            "assistant",
-            "system",
-            "tool"
-          ]
+          "enum": ["user", "assistant", "system", "tool"]
         },
         "description": "Message roles to include in retained transcript. Default: ['user', 'assistant'].",
-        "default": [
-          "user",
-          "assistant"
-        ]
+        "default": ["user", "assistant"]
+      },
+      "retainFormat": {
+        "type": "string",
+        "description": "Serialization format for retained conversation content. 'json' (default) emits a structured array of {role, content} messages, matching the Claude Code integration. 'text' emits the legacy '[role: x] ... [x:end]' markers.",
+        "enum": ["json", "text"],
+        "default": "json"
+      },
+      "retainToolCalls": {
+        "type": "boolean",
+        "description": "When true (default) and retainFormat is 'json', each message's content is an Anthropic-shaped array of typed blocks including tool_use (agent tool calls) and tool_result (truncated at 2000 chars). Operational MCP tools — Hindsight's own recall/retain/search — are filtered out to avoid feedback loops. Set to false to retain text-only content, one string per message.",
+        "default": true
       },
       "retainEveryNTurns": {
         "type": "integer",
@@ -367,6 +353,14 @@
     "retainRoles": {
       "label": "Retain Roles",
       "placeholder": "e.g. ['user', 'assistant']"
+    },
+    "retainFormat": {
+      "label": "Retain Format",
+      "placeholder": "json (default) or text (legacy markers)"
+    },
+    "retainToolCalls": {
+      "label": "Retain Tool Calls",
+      "placeholder": "true (default) — include tool_use / tool_result blocks in retained JSON"
     },
     "retainEveryNTurns": {
       "label": "Retain Every N Turns",

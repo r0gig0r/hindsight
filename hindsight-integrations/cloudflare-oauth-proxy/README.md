@@ -79,16 +79,29 @@ On first connection, you'll be redirected to a login page. Enter the `SESSION_SE
 
 ## Secrets reference
 
-| Secret | Purpose |
-|--------|---------|
-| `SESSION_SECRET` | Password shown on the login page to authorize a session |
-| `PROXY_SECRET` | Value sent as `X-Proxy-Secret` header to the origin (for WAF validation) |
-| `HINDSIGHT_API_TOKEN` | Bearer token for authenticating with the Hindsight API |
-| `ALLOWED_EMAIL` | Your email address, used as the OAuth user identity |
+| Secret                | Purpose                                                                  |
+| --------------------- | ------------------------------------------------------------------------ |
+| `SESSION_SECRET`      | Password shown on the login page to authorize a session                  |
+| `PROXY_SECRET`        | Value sent as `X-Proxy-Secret` header to the origin (for WAF validation) |
+| `HINDSIGHT_API_TOKEN` | Bearer token for authenticating with the Hindsight API                   |
+| `ALLOWED_EMAIL`       | Your email address, used as the OAuth user identity                      |
 
 ## Security notes
 
-- CORS is restricted to `claude.ai` origins by default. To support additional clients (e.g., ChatGPT), add their origins to the `ALLOWED_ORIGINS` set in `src/index.ts`.
-- PKCE is enforced with S256 only (plain PKCE is not advertised).
-- OAuth state is stored in Cloudflare KV with a 5-minute TTL.
-- The proxy strips the client's `Authorization` header and replaces it with the configured `HINDSIGHT_API_TOKEN` before forwarding to the origin.
+- **Single-user design.** Anyone who knows `SESSION_SECRET` will be authorized as `ALLOWED_EMAIL`. Use a high-entropy secret and keep it private.
+- CORS is restricted to `claude.ai` origins by default. To support additional clients (e.g., ChatGPT), add their origins to the `ALLOWED_ORIGINS` set in `src/cors.ts`.
+- The OAuth authorization-server metadata is rewritten to advertise `code_challenge_methods_supported = ["S256"]`. Actual enforcement of S256 at the token endpoint is delegated to `@cloudflare/workers-oauth-provider`.
+- The login-page password check uses a constant-time (SHA-256 based) comparison to resist timing attacks.
+- OAuth state is stored in Cloudflare KV with a 5-minute TTL and is deleted on consumption.
+- The proxy strips the client's `Authorization` header (and any attempted `X-Proxy-Secret`) and replaces them with the server's configured values before forwarding to the origin.
+- Upstream response headers are filtered to a whitelist (`content-type`, `cache-control`, `mcp-session-id`, etc.) so the origin can't leak cookies or its own CORS headers through the proxy.
+
+## Development
+
+```bash
+npm install
+npm run typecheck
+npm test
+```
+
+Tests use [vitest](https://vitest.dev/) and run in a plain Node environment — the Workers-specific modules are isolated in `src/index.ts` so the testable units can be imported without the Cloudflare Workers runtime.

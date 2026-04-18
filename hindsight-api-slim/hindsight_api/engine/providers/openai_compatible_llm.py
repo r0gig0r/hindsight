@@ -33,6 +33,7 @@ from hindsight_api.config import DEFAULT_LLM_TIMEOUT, ENV_LLM_TIMEOUT
 from hindsight_api.engine.llm_interface import LLMInterface, OutputTooLongError
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
 from hindsight_api.metrics import get_metrics_collector
+from hindsight_api.worker.stage import set_stage
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,32 @@ def _strip_code_fences(content: str) -> str:
         return content.split("```")[1].split("```")[0].strip()
     except (IndexError, ValueError):
         return content
+
+
+def _summarize_status_error(e: APIStatusError, body_max: int = 400) -> str:
+    """Render an APIStatusError with status code + truncated response body.
+
+    Without this, retry loops only log "API error after N attempts" with the
+    bare exception message — losing the provider's actual error payload, which
+    is the only thing that explains *why* a request failed (rate limit reason,
+    invalid tool schema, model overloaded, etc.).
+    """
+    body: Any = getattr(e, "body", None)
+    if body is None:
+        try:
+            body = e.response.text
+        except Exception:
+            body = None
+    if isinstance(body, (dict, list)):
+        try:
+            body_str = json.dumps(body, default=str)
+        except Exception:
+            body_str = str(body)
+    else:
+        body_str = str(body or "").strip()
+    if len(body_str) > body_max:
+        body_str = body_str[:body_max] + "...TRUNCATED"
+    return f"HTTP {e.status_code}: {body_str or '<no body>'}"
 
 
 class OpenAICompatibleLLM(LLMInterface):
@@ -196,15 +223,28 @@ class OpenAICompatibleLLM(LLMInterface):
     def _max_tokens_param_name(self) -> str:
         """Return the correct parameter name for limiting response tokens.
 
-        Native OpenAI and Groq accept 'max_completion_tokens'. Mistral and other
-        OpenAI-compatible endpoints that haven't adopted the newer parameter name
-        require 'max_tokens'. Using a custom base_url with the openai provider
-        signals a third-party compatible API, so fall back to 'max_tokens'.
+        Native OpenAI, Azure OpenAI, Groq, and llamacpp accept 'max_completion_tokens'.
+        Mistral and other OpenAI-compatible endpoints that haven't adopted the newer
+        parameter name require 'max_tokens', so when the openai provider is configured
+        with a non-Azure custom base_url we fall back to the widely-supported
+        'max_tokens'.
+
+        Reasoning models (GPT-5, o1, o3) only accept 'max_completion_tokens' and reject
+        'max_tokens' outright, so they always use the new parameter name regardless of
+        base_url.
         """
+        # Reasoning models (GPT-5, o1, o3, ...) only accept max_completion_tokens.
+        # Azure OpenAI + GPT-5 is the canonical example: issue #978.
+        if self._supports_reasoning_model():
+            return "max_completion_tokens"
         # Native OpenAI (no custom base URL), Groq, and llamacpp use max_completion_tokens
         if self.provider in ("groq", "llamacpp"):
             return "max_completion_tokens"
         if self.provider == "openai" and not self.base_url:
+            return "max_completion_tokens"
+        # Azure OpenAI is fully OpenAI-API-compatible — detect it by hostname so users
+        # can keep provider=openai + an Azure base_url (the documented setup).
+        if self.provider == "openai" and self.base_url and ".openai.azure.com" in self.base_url:
             return "max_completion_tokens"
         # openai with custom base_url, ollama, lmstudio, minimax, volcano —
         # use the widely-supported max_tokens
@@ -349,6 +389,11 @@ class OpenAICompatibleLLM(LLMInterface):
         last_exception = None
 
         for attempt in range(max_retries + 1):
+            # Surface attempt count in worker stage so JSON-schema retry loops
+            # are visible from logs (small models on strict structured output
+            # often loop here). Cheap no-op outside worker context.
+            if attempt > 0:
+                set_stage(f"llm.{self.provider}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
             try:
                 if response_format is not None:
                     response = await self._client.chat.completions.create(**call_params)
@@ -531,12 +576,19 @@ class OpenAICompatibleLLM(LLMInterface):
 
                 last_exception = e
                 if attempt < max_retries:
+                    logger.warning(
+                        f"APIStatusError ({self.provider}/{self.model}, scope={scope}, "
+                        f"attempt {attempt + 1}/{max_retries + 1}): {_summarize_status_error(e)}"
+                    )
                     backoff = min(initial_backoff * (2**attempt), max_backoff)
                     jitter = backoff * 0.2 * (2 * (time.time() % 1) - 1)
                     sleep_time = backoff + jitter
                     await asyncio.sleep(sleep_time)
                 else:
-                    logger.error(f"API error after {max_retries + 1} attempts: {str(e)}")
+                    logger.error(
+                        f"API error after {max_retries + 1} attempts ({self.provider}/{self.model}, "
+                        f"scope={scope}): {_summarize_status_error(e)}"
+                    )
                     raise
 
             except Exception:
@@ -616,6 +668,8 @@ class OpenAICompatibleLLM(LLMInterface):
         last_exception = None
 
         for attempt in range(max_retries + 1):
+            if attempt > 0:
+                set_stage(f"llm.{self.provider}.tools.attempt={attempt + 1}/{max_retries + 1}")
             try:
                 response = await self._client.chat.completions.create(**call_params)
 
@@ -685,18 +739,41 @@ class OpenAICompatibleLLM(LLMInterface):
 
             except APIConnectionError as e:
                 last_exception = e
+                status_code = getattr(e, "status_code", None) or getattr(
+                    getattr(e, "response", None), "status_code", None
+                )
                 if attempt < max_retries:
+                    logger.warning(
+                        f"APIConnectionError in tool call ({self.provider}/{self.model}, scope={scope}, "
+                        f"attempt {attempt + 1}/{max_retries + 1}, HTTP {status_code}): {str(e)[:200]}"
+                    )
                     await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
                     continue
+                logger.error(
+                    f"Connection error in tool call after {max_retries + 1} attempts "
+                    f"({self.provider}/{self.model}, scope={scope}): {str(e)}"
+                )
                 raise
 
             except APIStatusError as e:
                 if e.status_code in (401, 403):
+                    logger.error(
+                        f"Auth error in tool call (HTTP {e.status_code}, {self.provider}/{self.model}), "
+                        f"not retrying: {_summarize_status_error(e)}"
+                    )
                     raise
                 last_exception = e
                 if attempt < max_retries:
+                    logger.warning(
+                        f"APIStatusError in tool call ({self.provider}/{self.model}, scope={scope}, "
+                        f"attempt {attempt + 1}/{max_retries + 1}): {_summarize_status_error(e)}"
+                    )
                     await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
                     continue
+                logger.error(
+                    f"API error in tool call after {max_retries + 1} attempts "
+                    f"({self.provider}/{self.model}, scope={scope}): {_summarize_status_error(e)}"
+                )
                 raise
 
             except Exception:
@@ -744,6 +821,7 @@ class OpenAICompatibleLLM(LLMInterface):
             "model": self.model,
             "messages": messages,
             "stream": False,
+            "think": False,  # Disable thinking for reasoning models (qwen3.5, etc.)
         }
 
         # Add schema as format parameter for structured output
@@ -765,6 +843,8 @@ class OpenAICompatibleLLM(LLMInterface):
 
         async with httpx.AsyncClient(timeout=300.0) as client:
             for attempt in range(max_retries + 1):
+                if attempt > 0:
+                    set_stage(f"llm.ollama_native.{scope}.attempt={attempt + 1}/{max_retries + 1}")
                 try:
                     response = await client.post(native_url, json=payload)
                     response.raise_for_status()

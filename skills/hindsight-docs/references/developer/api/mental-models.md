@@ -96,7 +96,7 @@ hindsight mental-model create "$BANK_ID" \
 | `name` | string | Yes | Human-readable name for the mental model |
 | `source_query` | string | Yes | The query to run to generate content |
 | `id` | string | No | Custom ID for the mental model (alphanumeric lowercase with hyphens). Auto-generated if omitted. |
-| `tags` | list | No | Tags for filtering during retrieval |
+| `tags` | list | No | Tags that scope the model during reflect **and** filter source memories during refresh. Defaults to `all_strict` matching, so only memories carrying every listed tag are read. See [Tags and Visibility](#tags-and-visibility). |
 | `max_tokens` | int | No | Maximum tokens for the mental model content |
 | `trigger` | object | No | Trigger settings (see [Automatic Refresh](#automatic-refresh)) |
 
@@ -162,9 +162,31 @@ Mental models can be configured to **automatically refresh** when observations a
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
+| `mode` | `"full"` \| `"delta"` | `"full"` | Refresh strategy. See [Refresh Mode](#refresh-mode) below. |
 | `refresh_after_consolidation` | bool | false | Automatically refresh after observations consolidation |
 
 When `refresh_after_consolidation` is enabled, the mental model will be re-generated every time the bank's observations are consolidated — ensuring it always reflects the latest synthesized knowledge.
+
+### Refresh Mode
+
+Two strategies are available for how a refresh produces the new content:
+
+- **`full`** *(default)* — every refresh regenerates the entire content from scratch. Simple and predictable: the LLM synthesises a fresh document from the retrieved memories. Best when the document is short, when you want every refresh to potentially restructure the output, or when you're not yet sure what the final shape should be.
+
+- **`delta`** — refresh emits a list of typed *operations* (add a section, append a bullet, replace a block, remove a stale paragraph) against the document's existing structure, then renders the result. Sections that aren't targeted by any operation are copied through **byte-identical** — no paraphrasing, no whitespace drift, no list-style normalisation. Best for long-lived "playbook"–style mental models where you want stability across refreshes and only the genuinely changed parts to move.
+
+Delta mode falls back to a full regeneration automatically in two cases:
+1. The mental model has no existing content yet (nothing to anchor edits on).
+2. The `source_query` has changed since the last refresh (the topic has shifted; the existing structure may no longer apply).
+
+If the LLM call fails or returns an empty answer, the existing content is preserved — refreshes never overwrite a populated document with an empty one.
+
+| Use Case | Recommended Mode | Why |
+|----------|-----------------|-----|
+| Skill / playbook docs | `delta` | Sections live for many refreshes; only specific rules change |
+| Onboarding summaries | `delta` | Adding new team members shouldn't restructure the doc |
+| Real-time dashboards | `full` | Each refresh is a fresh snapshot |
+| Short FAQ summaries | `full` | Whole-document regeneration is cheap and unambiguous |
 
 ### Python
 
@@ -449,6 +471,8 @@ Mental models support the same tag system as memories. When you assign tags to a
 
 ### How tags affect mental model refresh
 
+:::warning
+Adding tags to a mental model narrows the pool of source memories its refresh can read from. If no memories carry those tags yet, refresh will return empty content (e.g. `"I cannot find any information…"`) even though direct `reflect` on the same query works. Backfill tags on the relevant memories first, or override the default via `trigger.tags_match` / `trigger.tag_groups`.
 When a mental model is refreshed (manually or automatically), it runs an internal reflect call to regenerate its content. If the mental model has tags, that reflect call uses `all_strict` tag matching — meaning it will only read memories that carry **all** of the mental model's tags. Untagged memories are excluded.
 
 ```
