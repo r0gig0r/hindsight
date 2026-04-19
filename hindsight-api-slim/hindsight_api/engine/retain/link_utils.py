@@ -4,7 +4,9 @@ Link creation utilities for temporal, semantic, and entity links.
 
 import logging
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID
 
 from ..memory_engine import fq_table
@@ -51,6 +53,54 @@ def _cap_links_per_unit(links: list[tuple], max_per_unit: int = MAX_TEMPORAL_LIN
     return result
 
 
+def _is_valid_uuid(value: Any) -> bool:
+    """[FORK] Return True if value parses as a UUID (or is None).
+
+    asyncpg accepts both uuid.UUID instances and 32-36 char UUID strings for
+    ::uuid columns. Anything else (short ints, plain strings, etc.) causes
+    "invalid UUID 'X'" errors. This helper lets us drop bad links at the
+    choke point rather than losing the whole batch.
+    """
+    if value is None:
+        return True
+    if isinstance(value, uuid.UUID):
+        return True
+    if isinstance(value, str):
+        try:
+            uuid.UUID(value)
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+def _sanitize_link_uuids(links: list[tuple]) -> tuple[list[tuple], int]:
+    """[FORK] Drop links whose from/to/entity IDs are not valid UUIDs.
+
+    Returns (kept_links, dropped_count). Samples the first few bad values
+    into the logger so a downstream caller can be traced.
+    """
+    kept: list[tuple] = []
+    bad_samples: list[str] = []
+    for lnk in links:
+        from_id, to_id = lnk[0], lnk[1]
+        entity_id = lnk[4] if len(lnk) > 4 else None
+        if _is_valid_uuid(from_id) and _is_valid_uuid(to_id) and _is_valid_uuid(entity_id):
+            kept.append(lnk)
+            continue
+        if len(bad_samples) < 5:
+            bad_samples.append(
+                f"(from={from_id!r}, to={to_id!r}, type={lnk[2]!r}, entity={entity_id!r})"
+            )
+    dropped = len(links) - len(kept)
+    if dropped and bad_samples:
+        logger.error(
+            f"[_bulk_insert_links] Invalid UUID(s) in {dropped}/{len(links)} links — "
+            f"first {len(bad_samples)}: {'; '.join(bad_samples)}"
+        )
+    return kept, dropped
+
+
 async def _bulk_insert_links(
     conn,
     links: list[tuple],
@@ -80,9 +130,26 @@ async def _bulk_insert_links(
     if not links:
         return
 
+    # [FORK] Validate UUID shape at the choke point: asyncpg's uuid[] encoder
+    # raises a generic "invalid UUID '110'" when any array element isn't a
+    # 32-36 char UUID string, losing the caller/context. We filter+log bad
+    # entries so one malformed link doesn't kill a whole retain batch, and
+    # the log identifies the source callsite for root-cause diagnosis.
+    sanitized, dropped = _sanitize_link_uuids(links)
+    if dropped:
+        import traceback as _tb
+
+        logger.error(
+            f"[_bulk_insert_links] Dropped {dropped} link(s) with invalid UUID(s); "
+            f"{len(sanitized)}/{len(links)} kept. Caller stack (to diagnose source):\n"
+            + "".join(_tb.format_stack(limit=8))
+        )
+    if not sanitized:
+        return
+
     # Sort by (from_unit_id, to_unit_id) to guarantee consistent lock ordering
     # across concurrent transactions — prevents deadlocks.
-    sorted_links = sorted(links, key=lambda lnk: (str(lnk[0]), str(lnk[1])))
+    sorted_links = sorted(sanitized, key=lambda lnk: (str(lnk[0]), str(lnk[1])))
 
     from_ids = [lnk[0] for lnk in sorted_links]
     to_ids = [lnk[1] for lnk in sorted_links]

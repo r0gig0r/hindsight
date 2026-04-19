@@ -66,6 +66,12 @@ class CodexLLM(LLMInterface):
         if self.model.startswith("openai/"):
             self.model = self.model[len("openai/") :]
 
+        # [FORK] Resolve auto-* magic values against the Codex models cache,
+        # so deployments don't break when OpenAI removes an older slug.
+        from .codex_model_resolver import resolve_codex_model
+
+        self.model = resolve_codex_model(self.model)
+
         # Map reasoning effort to Codex reasoning summary format
         # Codex supports: "auto", "concise", "detailed"
         self.reasoning_summary = self._map_reasoning_effort(reasoning_effort)

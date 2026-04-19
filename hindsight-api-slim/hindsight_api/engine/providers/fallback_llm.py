@@ -54,6 +54,23 @@ def _sanitize_env_for_claude_sdk() -> None:
 # manual intervention, so we immediately open the circuit.
 _AUTH_ERROR_MARKERS = frozenset({"auth", "login", "credential", "unauthorized", "forbidden", "401", "403"})
 
+# [FORK] Error substrings indicating the primary is permanently misconfigured
+# (e.g., configured model was removed/deprecated). These will NEVER recover
+# without operator action, so probing every 5 min wastes calls and latency.
+# On match we permanently disable the primary until daemon restart.
+_PERMANENT_ERROR_MARKERS = frozenset(
+    {
+        "model is not supported",
+        "model not supported",
+        "model_not_found",
+        "model not found",
+        "does not exist",
+        "invalid model",
+        "model_deprecated",
+        "deprecated model",
+    }
+)
+
 # Max seconds to wait for a primary call before treating it as failed.
 # Successful calls average ~21s (retain) and ~17s (consolidation), but can
 # spike to 40s+ under load.  30s caused ~50% false-positive timeouts;
@@ -79,6 +96,9 @@ class CircuitBreaker:
     state: str = field(default="closed", init=False)
     failure_count: int = field(default=0, init=False)
     last_failure_time: float = field(default=0.0, init=False)
+    # [FORK] Permanently disabled until daemon restart (e.g., model was removed)
+    permanently_disabled: bool = field(default=False, init=False)
+    permanent_reason: str = field(default="", init=False)
 
     def record_failure(self) -> None:
         """Record a primary provider failure."""
@@ -102,6 +122,24 @@ class CircuitBreaker:
             self.cooldown_seconds = self._original_cooldown
             del self._original_cooldown
 
+    def force_permanent_disable(self, reason: str) -> None:
+        """[FORK] Permanently disable the primary provider until daemon restart.
+
+        Use for errors that will never recover on their own — e.g., the
+        configured model was removed from the upstream service. Probing
+        under these conditions is a guaranteed wasted call every cooldown.
+        """
+        self.state = "open"
+        self.failure_count = self.failure_threshold
+        self.last_failure_time = time.monotonic()
+        self.permanently_disabled = True
+        self.permanent_reason = reason
+        logger.error(
+            f"Circuit breaker PERMANENTLY DISABLED: {reason}. "
+            f"Primary LLM will not be retried until daemon restart. "
+            f"Check HINDSIGHT_API_PRIMARY_LLM_MODEL in gateway plist."
+        )
+
     def force_open(self, reason: str = "", cooldown_override: float | None = None) -> None:
         """Immediately open the circuit (e.g., on auth or rate limit errors).
 
@@ -123,6 +161,9 @@ class CircuitBreaker:
 
     def should_try_primary(self) -> bool:
         """Return True if we should attempt the primary provider."""
+        # [FORK] Permanent disable short-circuits all probing
+        if self.permanently_disabled:
+            return False
         if self.state == "closed":
             return True
         if self.state == "open":
@@ -140,6 +181,16 @@ def _is_auth_error(exc: BaseException) -> bool:
     """Check if an exception looks like an authentication/authorization error."""
     error_str = str(exc).lower()
     return any(marker in error_str for marker in _AUTH_ERROR_MARKERS)
+
+
+def _is_permanent_error(exc: BaseException) -> bool:
+    """[FORK] Check if an exception indicates the primary is permanently misconfigured.
+
+    Permanent errors (e.g., "model is not supported") will never recover
+    without operator action. Repeated probing wastes calls and latency.
+    """
+    error_str = str(exc).lower()
+    return any(marker in error_str for marker in _PERMANENT_ERROR_MARKERS)
 
 
 def _is_rate_limit_error(exc: BaseException) -> float | None:
@@ -219,6 +270,26 @@ class FallbackLLMProvider:
         """True when calls will definitely use the fallback provider (circuit open, not yet cooled down)."""
         return self._circuit_breaker.state == "open"
 
+    def _build_permanent_reason(self, exc: BaseException) -> str:
+        """[FORK] Compose the permanent-disable reason, including a
+        replacement suggestion when we can determine one.
+        """
+        base = f"Primary {self._primary.provider}/{self._primary.model}: {exc}"
+        if self._primary.provider.lower() != "openai-codex":
+            return base
+        try:
+            from .codex_model_resolver import suggest_replacement
+
+            replacement = suggest_replacement(self._primary.model)
+        except Exception:  # resolver must never break the error path
+            replacement = None
+        if replacement and replacement != self._primary.model:
+            return (
+                f"{base}. Suggested replacement from ~/.codex/models_cache.json: "
+                f"{replacement!r} (or set HINDSIGHT_API_PRIMARY_LLM_MODEL=auto-latest-mini)"
+            )
+        return base
+
     def with_config(self, config: Any) -> Any:
         """Return a ConfiguredLLMProvider wrapping this fallback provider."""
         from ..llm_wrapper import ConfiguredLLMProvider
@@ -269,7 +340,11 @@ class FallbackLLMProvider:
                     f"— falling back to {self._fallback.provider}/{self._fallback.model}"
                 )
             except Exception as e:
-                if _is_auth_error(e):
+                if _is_permanent_error(e):
+                    self._circuit_breaker.force_permanent_disable(
+                        self._build_permanent_reason(e),
+                    )
+                elif _is_auth_error(e):
                     self._circuit_breaker.force_open(f"Auth error: {e}")
                 else:
                     reset_seconds = _is_rate_limit_error(e)
@@ -337,7 +412,11 @@ class FallbackLLMProvider:
                     f"— falling back to {self._fallback.provider}/{self._fallback.model}"
                 )
             except Exception as e:
-                if _is_auth_error(e):
+                if _is_permanent_error(e):
+                    self._circuit_breaker.force_permanent_disable(
+                        self._build_permanent_reason(e),
+                    )
+                elif _is_auth_error(e):
                     self._circuit_breaker.force_open(f"Auth error: {e}")
                 else:
                     reset_seconds = _is_rate_limit_error(e)
