@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from hindsight_api.engine.retain import embedding_utils
-from hindsight_api.engine.retain.orchestrator import _map_results_to_contents
+from hindsight_api.engine.retain.orchestrator import _map_results_to_contents, _remap_phase1_results
 from hindsight_api.engine.retain.types import ProcessedFact, RetainContent
 
 
@@ -115,3 +115,82 @@ class TestEmbeddingsBatchLengthGuarantee:
         result = asyncio.run(embedding_utils.generate_embeddings_batch(backend, ["a", "b"]))
 
         assert result == [[0.1], [0.2]]
+
+
+class TestRemapPhase1Results:
+    """Regression coverage for orphaned-placeholder → `invalid UUID '4'` crash.
+
+    Reproduces the prod crash seen 2026-04-20 → 2026-04-22: the fork's
+    Phase 1.5 dedup step removes facts from the processed list AFTER Phase 1
+    has resolved entities for all original facts. Phase 2's `insert_facts_batch`
+    then returns fewer UUIDs than there were placeholders. The previous
+    `.get(id, id)` fallback let the raw placeholder strings (e.g. '4') leak
+    into `uuid[]` bind arguments, breaking every retain since the cutover.
+    """
+
+    _uuid_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    _uuid_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    _uuid_c = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+
+    def test_drops_orphaned_placeholders_after_dedup(self):
+        # Phase 1 resolved entities for 5 facts ('0'..'4') and linked each to
+        # some entities. After dedup, only facts at original indices 0, 2, 3
+        # survive (corresponding to actual UUIDs a, b, c).
+        resolved_entity_ids = ["e1", "e2", "e3", "e4", "e5"]
+        # entity_to_unit: (placeholder_unit_id, local_idx, fact_date)
+        entity_to_unit = [
+            ("0", 0, None),  # survives → a
+            ("1", 1, None),  # DEDUPED (placeholder '1' has no mapping) → drop
+            ("2", 2, None),  # survives → b
+            ("3", 3, None),  # survives → c
+            ("4", 4, None),  # DEDUPED → drop
+        ]
+        unit_to_entity_ids = {"0": ["e1"], "1": ["e2"], "2": ["e3"], "3": ["e4"], "4": ["e5"]}
+        semantic_ann_links = [
+            ("0", "target-1", 0.9, None, None),
+            ("4", "target-2", 0.8, None, None),  # DEDUPED from
+        ]
+        # insert_facts_batch returned only 3 UUIDs (deduped indices 1 and 4 dropped)
+        actual_unit_ids = [self._uuid_a, self._uuid_b, self._uuid_c]
+
+        remapped_e2u, remapped_u2e, remapped_semantic = _remap_phase1_results(
+            resolved_entity_ids, entity_to_unit, unit_to_entity_ids, semantic_ann_links, actual_unit_ids
+        )
+
+        # Only the 3 surviving facts should appear, all with real UUIDs
+        assert len(remapped_e2u) == 3
+        assert {t[0] for t in remapped_e2u} == {self._uuid_a, self._uuid_b, self._uuid_c}
+        # No raw placeholder strings anywhere — this is the critical invariant
+        all_unit_ids = {t[0] for t in remapped_e2u}
+        assert not any(uid.isdigit() for uid in all_unit_ids), (
+            f"Raw placeholder leaked into unit_id list: {all_unit_ids}"
+        )
+
+        # unit_to_entity_ids keys should be real UUIDs only
+        assert set(remapped_u2e.keys()) == {self._uuid_a, self._uuid_b, self._uuid_c}
+        assert not any(k.isdigit() for k in remapped_u2e.keys())
+
+        # Semantic link with orphaned placeholder should be dropped
+        assert len(remapped_semantic) == 1
+        assert remapped_semantic[0][0] == self._uuid_a
+
+    def test_no_dedup_keeps_all_entries(self):
+        # Happy path: no dedup, N placeholders map to N actual UUIDs → nothing dropped
+        entity_to_unit = [("0", 0, None), ("1", 1, None)]
+        unit_to_entity_ids = {"0": ["e1"], "1": ["e2"]}
+        semantic_ann_links = [("0", "t", 0.9, None, None), ("1", "t2", 0.8, None, None)]
+        actual_unit_ids = [self._uuid_a, self._uuid_b]
+
+        remapped_e2u, remapped_u2e, remapped_semantic = _remap_phase1_results(
+            [], entity_to_unit, unit_to_entity_ids, semantic_ann_links, actual_unit_ids
+        )
+
+        assert len(remapped_e2u) == 2
+        assert len(remapped_u2e) == 2
+        assert len(remapped_semantic) == 2
+
+    def test_empty_phase1_noop(self):
+        remapped_e2u, remapped_u2e, remapped_semantic = _remap_phase1_results([], [], {}, [], [])
+        assert remapped_e2u == []
+        assert remapped_u2e == {}
+        assert remapped_semantic == []
