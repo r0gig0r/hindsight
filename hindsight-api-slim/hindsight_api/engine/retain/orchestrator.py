@@ -190,26 +190,57 @@ def _remap_phase1_results(
     During Phase 1 we use str(fact_index) as placeholder unit IDs.
     After insert_facts_batch creates real UUIDs, this function replaces the
     placeholders so that all rows reference the correct memory_units.
+
+    Entries whose placeholder has no mapping are **dropped**. This is the
+    expected path when the [FORK] dedup step (Phase 1.5) removes facts
+    between Phase 1 (entity resolution) and Phase 2 (write txn): the deduped
+    facts never get actual UUIDs, so their Phase 1 entity/semantic entries
+    must be discarded before Phase 2 passes them to asyncpg.
+
+    Previously this function used `.get(key, key)` which fell back to the
+    raw placeholder string (e.g. '4') and let it leak into `uuid[]` bind
+    arguments, producing `invalid UUID '4'` errors at the DB boundary
+    (hindsight issue: dedup-orphaned-placeholders).
     """
     # Build placeholder -> actual mapping
     placeholder_to_actual = {str(i): actual_id for i, actual_id in enumerate(actual_unit_ids)}
 
-    # Remap entity_to_unit tuples
-    remapped_entity_to_unit = [
-        (placeholder_to_actual.get(unit_id, unit_id), local_idx, fact_date)
-        for unit_id, local_idx, fact_date in entity_to_unit
-    ]
+    # Remap entity_to_unit tuples — drop entries whose placeholder was deduped
+    remapped_entity_to_unit: list[tuple] = []
+    dropped_entity_to_unit = 0
+    for unit_id, local_idx, fact_date in entity_to_unit:
+        actual = placeholder_to_actual.get(unit_id)
+        if actual is None:
+            dropped_entity_to_unit += 1
+            continue
+        remapped_entity_to_unit.append((actual, local_idx, fact_date))
 
-    # Remap unit_to_entity_ids keys
+    # Remap unit_to_entity_ids keys — drop orphaned placeholders
     remapped_unit_to_entity_ids: dict[str, list[str]] = {}
+    dropped_unit_keys = 0
     for placeholder_id, entity_ids in unit_to_entity_ids.items():
-        actual_id = placeholder_to_actual.get(placeholder_id, placeholder_id)
+        actual_id = placeholder_to_actual.get(placeholder_id)
+        if actual_id is None:
+            dropped_unit_keys += 1
+            continue
         remapped_unit_to_entity_ids[actual_id] = entity_ids
 
-    # Remap semantic ANN links (from_id uses placeholder)
-    remapped_semantic = [
-        (placeholder_to_actual.get(lnk[0], lnk[0]), lnk[1], lnk[2], lnk[3], lnk[4]) for lnk in semantic_ann_links
-    ]
+    # Remap semantic ANN links (from_id uses placeholder) — drop orphans
+    remapped_semantic: list[tuple] = []
+    dropped_semantic = 0
+    for lnk in semantic_ann_links:
+        actual = placeholder_to_actual.get(lnk[0])
+        if actual is None:
+            dropped_semantic += 1
+            continue
+        remapped_semantic.append((actual, lnk[1], lnk[2], lnk[3], lnk[4]))
+
+    if dropped_entity_to_unit or dropped_unit_keys or dropped_semantic:
+        logger.info(
+            "[remap_phase1] Dropped orphaned placeholders "
+            f"(dedup collateral): entity_to_unit={dropped_entity_to_unit}, "
+            f"unit_to_entity_keys={dropped_unit_keys}, semantic_ann={dropped_semantic}"
+        )
 
     return remapped_entity_to_unit, remapped_unit_to_entity_ids, remapped_semantic
 
