@@ -89,9 +89,7 @@ def _sanitize_link_uuids(links: list[tuple]) -> tuple[list[tuple], int]:
             kept.append(lnk)
             continue
         if len(bad_samples) < 5:
-            bad_samples.append(
-                f"(from={from_id!r}, to={to_id!r}, type={lnk[2]!r}, entity={entity_id!r})"
-            )
+            bad_samples.append(f"(from={from_id!r}, to={to_id!r}, type={lnk[2]!r}, entity={entity_id!r})")
     dropped = len(links) - len(kept)
     if dropped and bad_samples:
         logger.error(
