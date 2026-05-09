@@ -7,6 +7,7 @@ Handles insertion of facts into the database.
 import json
 import logging
 import uuid
+from datetime import datetime
 
 from ...config import get_config
 from ..memory_engine import fq_table
@@ -35,7 +36,7 @@ async def get_document_content(
 
 
 async def insert_facts_batch(
-    conn, bank_id: str, facts: list[ProcessedFact], document_id: str | None = None
+    conn, bank_id: str, facts: list[ProcessedFact], document_id: str | None = None, ops=None
 ) -> list[str]:
     """
     Insert facts into the database in batch.
@@ -106,77 +107,16 @@ async def insert_facts_batch(
                 pass
         text_signals_list.append(" ".join(signal_parts) if signal_parts else None)
 
-    # Batch insert all facts
-    # Note: tags are passed as JSON strings and converted back to varchar[] via jsonb_array_elements_text + array_agg
-    # Query varies based on text search backend
+    # Batch insert all facts — delegates to DataAccessOps which handles
+    # unnest (PG) vs row-by-row (Oracle) transparently.
     config = get_config()
-    if config.text_search_extension == "vchord":
-        # VectorChord: manually tokenize and insert search_vector
-        # text_signals (entity names etc.) are included in the tokenize input for enriched BM25
-        query = f"""
-            WITH input_data AS (
-                SELECT * FROM unnest(
-                    $2::text[], $3::vector[], $4::timestamptz[], $5::timestamptz[], $6::timestamptz[], $7::timestamptz[],
-                    $8::text[], $9::text[], $10::jsonb[], $11::text[], $12::text[], $13::jsonb[], $14::jsonb[], $15::text[]
-                ) AS t(text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
-                       context, fact_type, metadata, chunk_id, document_id, tags_json,
-                       observation_scopes_json, text_signals)
-            )
-            INSERT INTO {fq_table("memory_units")} (bank_id, text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
-                                     context, fact_type, metadata, chunk_id, document_id, tags,
-                                     observation_scopes, text_signals, search_vector)
-            SELECT
-                $1,
-                text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
-                context, fact_type, metadata, chunk_id, document_id,
-                COALESCE(
-                    (SELECT array_agg(elem) FROM jsonb_array_elements_text(tags_json) AS elem),
-                    '{{}}'::varchar[]
-                ),
-                observation_scopes_json,
-                text_signals,
-                tokenize(
-                    COALESCE(text, '') || ' ' || COALESCE(context, '') || ' ' || COALESCE(text_signals, ''),
-                    'llmlingua2'
-                )::bm25_catalog.bm25vector
-            FROM input_data
-            RETURNING id
-        """
-    else:  # native or pg_textsearch
-        # Native PostgreSQL: search_vector is GENERATED ALWAYS (expression includes text_signals), don't include it
-        # pg_textsearch: indexes operate on base columns directly, don't populate search_vector
-        query = f"""
-            WITH input_data AS (
-                SELECT * FROM unnest(
-                    $2::text[], $3::vector[], $4::timestamptz[], $5::timestamptz[], $6::timestamptz[], $7::timestamptz[],
-                    $8::text[], $9::text[], $10::jsonb[], $11::text[], $12::text[], $13::jsonb[], $14::jsonb[], $15::text[]
-                ) AS t(text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
-                       context, fact_type, metadata, chunk_id, document_id, tags_json,
-                       observation_scopes_json, text_signals)
-            )
-            INSERT INTO {fq_table("memory_units")} (bank_id, text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
-                                     context, fact_type, metadata, chunk_id, document_id, tags,
-                                     observation_scopes, text_signals)
-            SELECT
-                $1,
-                text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
-                context, fact_type, metadata, chunk_id, document_id,
-                COALESCE(
-                    (SELECT array_agg(elem) FROM jsonb_array_elements_text(tags_json) AS elem),
-                    '{{}}'::varchar[]
-                ),
-                observation_scopes_json,
-                text_signals
-            FROM input_data
-            RETURNING id
-        """
 
-    results = await conn.fetch(
-        query,
+    return await ops.insert_facts_batch(
+        conn,
         bank_id,
         fact_texts,
         embeddings,
-        event_dates,  # event_date: occurred_start if available, else mentioned_at
+        event_dates,
         occurred_starts,
         occurred_ends,
         mentioned_ats,
@@ -188,13 +128,11 @@ async def insert_facts_batch(
         tags_list,
         observation_scopes_list,
         text_signals_list,
+        text_search_extension=config.text_search_extension,
     )
 
-    unit_ids = [str(row["id"]) for row in results]
-    return unit_ids
 
-
-async def ensure_bank_exists(conn, bank_id: str) -> None:
+async def ensure_bank_exists(conn, bank_id: str, ops=None) -> None:
     """
     Ensure bank exists in the database.
 
@@ -221,13 +159,14 @@ async def ensure_bank_exists(conn, bank_id: str) -> None:
     )
     if inserted:
         # Fresh insert — create per-bank vector indexes
-        await create_bank_vector_indexes(conn, bank_id, str(internal_id))
+        await create_bank_vector_indexes(conn, bank_id, str(internal_id), ops=ops)
 
 
 async def delete_stale_observations_for_memories(
     conn,
     bank_id: str,
     fact_ids: "list[str | uuid.UUID]",
+    ops=None,
 ) -> int:
     """Delete observations whose source memories are about to be removed.
 
@@ -254,17 +193,36 @@ async def delete_stale_observations_for_memories(
 
     fact_uuids = [uuid.UUID(str(fid)) if not isinstance(fid, uuid.UUID) else fid for fid in fact_ids]
 
-    affected_obs = await conn.fetch(
-        f"""
-        SELECT id, source_memory_ids
-        FROM {fq_table("memory_units")}
-        WHERE bank_id = $1
-          AND fact_type = 'observation'
-          AND source_memory_ids && $2::uuid[]
-        """,
-        bank_id,
-        fact_uuids,
-    )
+    if ops is not None and not ops.uses_observation_sources_table:
+        # PG: use native array overlap operator
+        affected_obs = await conn.fetch(
+            f"""
+            SELECT id, source_memory_ids
+            FROM {fq_table("memory_units")}
+            WHERE bank_id = $1
+              AND fact_type = 'observation'
+              AND source_memory_ids && $2::uuid[]
+            """,
+            bank_id,
+            fact_uuids,
+        )
+    else:
+        # Oracle / default: use observation_sources junction table
+        affected_obs = await conn.fetch(
+            f"""
+            SELECT mu.id, mu.source_memory_ids
+            FROM {fq_table("memory_units")} mu
+            WHERE mu.bank_id = $1
+              AND mu.fact_type = 'observation'
+              AND EXISTS (
+                  SELECT 1 FROM {fq_table("observation_sources")} os
+                  WHERE os.observation_id = mu.id
+                    AND os.source_id = ANY($2::uuid[])
+              )
+            """,
+            bank_id,
+            fact_uuids,
+        )
 
     if not affected_obs:
         return 0
@@ -311,6 +269,7 @@ async def handle_document_tracking(
     is_first_batch: bool,
     retain_params: dict | None = None,
     document_tags: list[str] | None = None,
+    ops=None,
 ) -> None:
     """
     Handle document tracking in the database (full-replace mode).
@@ -326,6 +285,11 @@ async def handle_document_tracking(
         is_first_batch: Whether this is the first batch (for chunked operations)
         retain_params: Optional parameters passed during retain (context, event_date, etc.)
         document_tags: Optional list of tags to associate with the document
+        ops: Backend-specific DataAccessOps. Required by the inner
+            ``delete_stale_observations_for_memories`` call to choose the PG
+            (native array) vs Oracle (junction table) read path. Defaults to
+            None so older callers don't break, but the PG branch is only
+            taken when ops is non-None — pass ``pool.ops`` from the caller.
     """
     import hashlib
 
@@ -340,6 +304,7 @@ async def handle_document_tracking(
     # source memory_units but leaves observation rows pointing at IDs that
     # no longer exist (consolidated_at on co-source memories also stays
     # frozen). Same cleanup the explicit ``delete_document`` API performs.
+    preserved_created_at = None
     if is_first_batch:
         existing_unit_rows = await conn.fetch(
             f"""
@@ -350,20 +315,40 @@ async def handle_document_tracking(
         )
         existing_unit_ids = [row["id"] for row in existing_unit_rows]
         if existing_unit_ids:
-            invalidated = await delete_stale_observations_for_memories(conn, bank_id, existing_unit_ids)
+            invalidated = await delete_stale_observations_for_memories(conn, bank_id, existing_unit_ids, ops=ops)
             if invalidated:
                 logger.info(
                     f"[RETAIN] Document {document_id} re-ingested: invalidated "
                     f"{invalidated} observation(s) derived from {len(existing_unit_ids)} outgoing memory_units"
                 )
-        await conn.fetchval(
-            f"DELETE FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2 RETURNING id",
+        # Explicitly delete memory_units by document_id BEFORE deleting the
+        # document row. The CASCADE from documents→chunks→memory_units only
+        # catches units that have a non-NULL chunk_id FK. Units with chunk_id=NULL
+        # (e.g. from partial writes or edge cases) would survive the cascade.
+        # This explicit delete ensures complete cleanup.
+        await conn.execute(
+            f"DELETE FROM {fq_table('memory_units')} WHERE document_id = $1 AND bank_id = $2",
+            document_id,
+            bank_id,
+        )
+        # Capture created_at before deletion so re-ingestion preserves it.
+        preserved_created_at = await conn.fetchval(
+            f"DELETE FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2 RETURNING created_at",
             document_id,
             bank_id,
         )
 
     # Insert document (or update if exists from concurrent operations)
-    await _upsert_document_row(conn, bank_id, document_id, combined_content, content_hash, retain_params, document_tags)
+    await _upsert_document_row(
+        conn,
+        bank_id,
+        document_id,
+        combined_content,
+        content_hash,
+        retain_params,
+        document_tags,
+        preserved_created_at=preserved_created_at,
+    )
 
 
 async def upsert_document_metadata(
@@ -396,12 +381,19 @@ async def _upsert_document_row(
     content_hash: str,
     retain_params: dict | None = None,
     document_tags: list[str] | None = None,
+    preserved_created_at: datetime | None = None,
 ) -> None:
-    """Insert or update a document row."""
+    """Insert or update a document row.
+
+    When ``preserved_created_at`` is provided, it is used for ``created_at`` on
+    INSERT so that re-ingesting a document (which deletes + inserts the row)
+    keeps the original creation timestamp. ``updated_at`` is always set to
+    ``NOW()`` on both INSERT and the ON CONFLICT UPDATE branch.
+    """
     await conn.execute(
         f"""
-        INSERT INTO {fq_table("documents")} (id, bank_id, original_text, content_hash, retain_params, tags)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO {fq_table("documents")} (id, bank_id, original_text, content_hash, retain_params, tags, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW()), NOW())
         ON CONFLICT (id, bank_id) DO UPDATE
         SET original_text = EXCLUDED.original_text,
             content_hash = EXCLUDED.content_hash,
@@ -415,6 +407,7 @@ async def _upsert_document_row(
         content_hash,
         json.dumps(retain_params) if retain_params else None,
         document_tags or [],
+        preserved_created_at,
     )
 
 

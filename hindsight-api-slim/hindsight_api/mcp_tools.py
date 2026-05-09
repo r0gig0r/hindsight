@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from fastmcp import FastMCP
+from pydantic import TypeAdapter
 
 from hindsight_api import MemoryEngine
 from hindsight_api.config import (
@@ -21,8 +22,11 @@ from hindsight_api.config import (
 from hindsight_api.engine.audit import AuditEntry, AuditLogger
 from hindsight_api.engine.memory_engine import Budget
 from hindsight_api.engine.response_models import VALID_RECALL_FACT_TYPES
+from hindsight_api.engine.search.tags import TagGroup
 from hindsight_api.extensions import OperationValidationError
 from hindsight_api.models import RequestContext
+
+_TAG_GROUP_LIST_ADAPTER = TypeAdapter(list[TagGroup])
 
 # All tools available in the system (explicit list — no wildcards).
 # Defined here (shared module) to avoid circular imports with api/mcp.py.
@@ -45,7 +49,6 @@ _ALL_TOOLS: frozenset[str] = frozenset(
         "delete_directive",
         "list_memories",
         "get_memory",
-        "delete_memory",
         "list_documents",
         "get_document",
         "delete_document",
@@ -223,7 +226,6 @@ def register_mcp_tools(
         "delete_directive",
         "list_memories",
         "get_memory",
-        "delete_memory",
         "list_documents",
         "get_document",
         "delete_document",
@@ -291,9 +293,6 @@ def register_mcp_tools(
 
     if "get_memory" in tools_to_register:
         _register_get_memory(mcp, memory, config)
-
-    if "delete_memory" in tools_to_register:
-        _register_delete_memory(mcp, memory, config)
 
     # Document tools
     if "list_documents" in tools_to_register:
@@ -441,7 +440,6 @@ _AUDITABLE_MCP_TOOLS: frozenset[str] = frozenset(
         "refresh_mental_model",
         "create_directive",
         "delete_directive",
-        "delete_memory",
         "delete_document",
         "cancel_operation",
     }
@@ -779,6 +777,7 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
             types: list[str] | None = None,
             tags: list[str] | None = None,
             tags_match: str = "any",
+            tag_groups: list[dict] | None = None,
             query_timestamp: str | None = None,
             bank_id: str | None = None,
         ) -> str | dict:
@@ -788,8 +787,12 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                 max_tokens: Maximum tokens to return in results (default: 4096)
                 budget: Search budget - 'low', 'mid', or 'high' (default: 'high'). Higher budgets search more thoroughly.
                 types: Fact types to include (e.g., ['world', 'experience']). Default: all types.
-                tags: Optional tags to filter results by (e.g., ['project:alpha'])
+                tags: Optional tags to filter results by (e.g., ['project:alpha']). Mutually exclusive with tag_groups.
                 tags_match: How to match tags - 'any' (match any tag) or 'all' (match all tags). Default: 'any'
+                tag_groups: Compound tag filter using boolean groups (AND-ed together). Each group is a leaf
+                    {"tags": [...], "match": "any_strict"} or compound {"and": [...]}, {"or": [...]}, {"not": {...}}.
+                    Example: [{"not": {"tags": ["closeout"], "match": "any_strict"}}] excludes memories tagged closeout.
+                    Mutually exclusive with tags.
                 query_timestamp: Temporal context for the query (ISO format, e.g., '2024-01-15T10:30:00Z'). Helps retrieve time-relevant memories.
                 bank_id: Optional bank to search in (defaults to session bank). Use for cross-bank operations.
             """
@@ -797,6 +800,11 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                 target_bank = bank_id or config.bank_id_resolver()
                 if target_bank is None:
                     return "Error: No bank_id configured"
+
+                if tags is not None and tag_groups is not None:
+                    raise ValueError(
+                        "'tags' and 'tag_groups' are mutually exclusive. Use 'tag_groups' for compound filtering."
+                    )
 
                 budget_map = {"low": Budget.LOW, "mid": Budget.MID, "high": Budget.HIGH}
                 budget_enum = budget_map.get(budget.lower(), Budget.HIGH)
@@ -813,6 +821,8 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                 if tags is not None:
                     recall_kwargs["tags"] = tags
                     recall_kwargs["tags_match"] = tags_match
+                if tag_groups is not None:
+                    recall_kwargs["tag_groups"] = _TAG_GROUP_LIST_ADAPTER.validate_python(tag_groups)
                 if query_timestamp is not None:
                     recall_kwargs["question_date"] = parse_timestamp(query_timestamp)
 
@@ -838,6 +848,7 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
             types: list[str] | None = None,
             tags: list[str] | None = None,
             tags_match: str = "any",
+            tag_groups: list[dict] | None = None,
             query_timestamp: str | None = None,
         ) -> dict:
             """
@@ -846,14 +857,23 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                 max_tokens: Maximum tokens to return in results (default: 4096)
                 budget: Search budget - 'low', 'mid', or 'high' (default: 'high'). Higher budgets search more thoroughly.
                 types: Fact types to include (e.g., ['world', 'experience']). Default: all types.
-                tags: Optional tags to filter results by (e.g., ['project:alpha'])
+                tags: Optional tags to filter results by (e.g., ['project:alpha']). Mutually exclusive with tag_groups.
                 tags_match: How to match tags - 'any' (match any tag) or 'all' (match all tags). Default: 'any'
+                tag_groups: Compound tag filter using boolean groups (AND-ed together). Each group is a leaf
+                    {"tags": [...], "match": "any_strict"} or compound {"and": [...]}, {"or": [...]}, {"not": {...}}.
+                    Example: [{"not": {"tags": ["closeout"], "match": "any_strict"}}] excludes memories tagged closeout.
+                    Mutually exclusive with tags.
                 query_timestamp: Temporal context for the query (ISO format, e.g., '2024-01-15T10:30:00Z'). Helps retrieve time-relevant memories.
             """
             try:
                 target_bank = config.bank_id_resolver()
                 if target_bank is None:
                     return {"error": "No bank_id configured", "results": []}
+
+                if tags is not None and tag_groups is not None:
+                    raise ValueError(
+                        "'tags' and 'tag_groups' are mutually exclusive. Use 'tag_groups' for compound filtering."
+                    )
 
                 budget_map = {"low": Budget.LOW, "mid": Budget.MID, "high": Budget.HIGH}
                 budget_enum = budget_map.get(budget.lower(), Budget.HIGH)
@@ -870,6 +890,8 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                 if tags is not None:
                     recall_kwargs["tags"] = tags
                     recall_kwargs["tags_match"] = tags_match
+                if tag_groups is not None:
+                    recall_kwargs["tag_groups"] = _TAG_GROUP_LIST_ADAPTER.validate_python(tag_groups)
                 if query_timestamp is not None:
                     recall_kwargs["question_date"] = parse_timestamp(query_timestamp)
 
@@ -2163,74 +2185,6 @@ def _register_get_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCon
                 return {"error": str(e)}
 
 
-def _register_delete_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
-    """Register the delete_memory tool."""
-
-    if config.include_bank_id_param:
-
-        @mcp.tool()
-        async def delete_memory(
-            memory_id: str,
-            bank_id: str | None = None,
-        ) -> str:
-            """
-            Delete a specific memory by ID.
-
-            Permanently removes a memory unit and its associated data.
-
-            Args:
-                memory_id: The ID of the memory to delete
-                bank_id: Optional bank (accepted for consistency, not used in deletion).
-            """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await memory.delete_memory_unit(
-                    unit_id=memory_id,
-                    request_context=_get_request_context(config),
-                )
-                return json.dumps({"status": "deleted", "memory_id": memory_id, **result}, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error deleting memory: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
-
-    else:
-
-        @mcp.tool()
-        async def delete_memory(
-            memory_id: str,
-        ) -> dict:
-            """
-            Delete a specific memory by ID.
-
-            Permanently removes a memory unit and its associated data.
-
-            Args:
-                memory_id: The ID of the memory to delete
-            """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                result = await memory.delete_memory_unit(
-                    unit_id=memory_id,
-                    request_context=_get_request_context(config),
-                )
-                return {"status": "deleted", "memory_id": memory_id, **result}
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error deleting memory: {e}", exc_info=True)
-                return {"error": str(e)}
-
-
 # =========================================================================
 # DOCUMENT TOOLS
 # =========================================================================
@@ -2854,6 +2808,44 @@ def _register_get_bank_stats(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
             return f'{{"error": "{e}"}}'
 
 
+async def _do_update_bank(
+    memory: MemoryEngine,
+    target_bank: str,
+    request_context: RequestContext,
+    *,
+    name: str | None = None,
+    mission: str | None = None,
+    config_updates: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Shared implementation for update_bank MCP tool variants.
+
+    Args:
+        name: Display name (stored in banks table).
+        mission: Deprecated alias for reflect_mission — mapped into config_updates.
+        config_updates: Arbitrary config overrides passed to config_resolver.update_bank_config().
+            Supports all configurable fields (retain_mission, disposition_*, etc.).
+            The config resolver validates keys and rejects non-configurable/credential fields.
+    """
+    # Update display name via engine (stored in DB banks table)
+    if name is not None:
+        await memory.update_bank(
+            target_bank,
+            name=name,
+            request_context=request_context,
+        )
+
+    # Merge deprecated mission alias into config_updates as reflect_mission
+    effective_config: dict[str, Any] = dict(config_updates) if config_updates else {}
+    if mission is not None and "reflect_mission" not in effective_config:
+        effective_config["reflect_mission"] = mission
+
+    if effective_config:
+        await memory._config_resolver.update_bank_config(target_bank, effective_config, request_context)
+
+    # Return updated profile
+    return await memory.get_bank_profile(target_bank, request_context=request_context)
+
+
 def _register_update_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the update_bank tool."""
 
@@ -2863,16 +2855,37 @@ def _register_update_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
         async def update_bank(
             name: str | None = None,
             mission: str | None = None,
+            config_updates: dict[str, Any] | None = None,
             bank_id: str | None = None,
         ) -> str:
             """
-            Update a memory bank's metadata.
+            Update a memory bank's configuration.
 
-            Changes the name or mission of an existing bank.
+            Updates the bank's name and/or any bank-level configuration fields.
+            Only provided fields will be updated; omitted fields remain unchanged.
 
             Args:
-                name: New human-friendly name for the bank
-                mission: New mission describing who the agent is and what they're trying to accomplish
+                name: Human-friendly display name for the bank.
+                mission: Deprecated alias for config_updates.reflect_mission.
+                config_updates: Dictionary of configuration fields to update. Supports all
+                    bank-configurable fields including:
+                    - reflect_mission: Mission/context for Reflect operations.
+                    - retain_mission: Steers what gets extracted during retain().
+                    - retain_extraction_mode: 'concise' (default), 'verbose', or 'custom'.
+                    - retain_custom_instructions: Custom extraction prompt (active when mode is 'custom').
+                    - retain_chunk_size: Maximum token size for each content chunk.
+                    - retain_chunk_batch_size: Number of chunks to process in parallel.
+                    - enable_observations: Toggle observation consolidation after retain().
+                    - observations_mission: Controls observation synthesis rules.
+                    - disposition_skepticism: Critical evaluation level (1-5).
+                    - disposition_literalism: Literal vs. abstract interpretation (1-5).
+                    - disposition_empathy: Emotional context consideration (1-5).
+                    - entity_labels: Controlled vocabulary for entity classification.
+                    - entities_allow_free_form: Allow labels outside entity_labels.
+                    - recall_include_chunks: Include raw chunks in recall results.
+                    - recall_max_tokens: Max tokens for recall results.
+                    - mcp_enabled_tools: Tool allowlist for this bank.
+                    Any configurable field name is accepted (use Python field names).
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
             try:
@@ -2880,14 +2893,16 @@ def _register_update_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
                 if target_bank is None:
                     return '{"error": "No bank_id configured"}'
 
-                result = await memory.update_bank(
+                result = await _do_update_bank(
+                    memory,
                     target_bank,
+                    _get_request_context(config),
                     name=name,
                     mission=mission,
-                    request_context=_get_request_context(config),
+                    config_updates=config_updates,
                 )
                 return json.dumps(result, indent=2, default=str)
-            except OperationValidationError as e:
+            except (OperationValidationError, ValueError) as e:
                 logger.warning(f"Operation rejected: {e}")
                 return json.dumps({"error": str(e)})
             except Exception as e:
@@ -2900,29 +2915,52 @@ def _register_update_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
         async def update_bank(
             name: str | None = None,
             mission: str | None = None,
+            config_updates: dict[str, Any] | None = None,
         ) -> dict:
             """
-            Update this memory bank's metadata.
+            Update this memory bank's configuration.
 
-            Changes the name or mission of the bank.
+            Updates the bank's name and/or any bank-level configuration fields.
+            Only provided fields will be updated; omitted fields remain unchanged.
 
             Args:
-                name: New human-friendly name for the bank
-                mission: New mission describing who the agent is and what they're trying to accomplish
+                name: Human-friendly display name for the bank.
+                mission: Deprecated alias for config_updates.reflect_mission.
+                config_updates: Dictionary of configuration fields to update. Supports all
+                    bank-configurable fields including:
+                    - reflect_mission: Mission/context for Reflect operations.
+                    - retain_mission: Steers what gets extracted during retain().
+                    - retain_extraction_mode: 'concise' (default), 'verbose', or 'custom'.
+                    - retain_custom_instructions: Custom extraction prompt (active when mode is 'custom').
+                    - retain_chunk_size: Maximum token size for each content chunk.
+                    - retain_chunk_batch_size: Number of chunks to process in parallel.
+                    - enable_observations: Toggle observation consolidation after retain().
+                    - observations_mission: Controls observation synthesis rules.
+                    - disposition_skepticism: Critical evaluation level (1-5).
+                    - disposition_literalism: Literal vs. abstract interpretation (1-5).
+                    - disposition_empathy: Emotional context consideration (1-5).
+                    - entity_labels: Controlled vocabulary for entity classification.
+                    - entities_allow_free_form: Allow labels outside entity_labels.
+                    - recall_include_chunks: Include raw chunks in recall results.
+                    - recall_max_tokens: Max tokens for recall results.
+                    - mcp_enabled_tools: Tool allowlist for this bank.
+                    Any configurable field name is accepted (use Python field names).
             """
             try:
                 target_bank = config.bank_id_resolver()
                 if target_bank is None:
                     return {"error": "No bank_id configured"}
 
-                result = await memory.update_bank(
+                result = await _do_update_bank(
+                    memory,
                     target_bank,
+                    _get_request_context(config),
                     name=name,
                     mission=mission,
-                    request_context=_get_request_context(config),
+                    config_updates=config_updates,
                 )
                 return result
-            except OperationValidationError as e:
+            except (OperationValidationError, ValueError) as e:
                 logger.warning(f"Operation rejected: {e}")
                 return {"error": str(e)}
             except Exception as e:

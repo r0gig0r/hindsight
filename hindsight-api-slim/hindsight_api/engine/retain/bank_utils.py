@@ -10,6 +10,7 @@ from typing import TypedDict
 
 from pydantic import BaseModel, Field
 
+from ..._vector_index import index_using_clause, uses_per_bank_vector_indexes
 from ...config import get_config
 from ..db_utils import acquire_with_retry
 from ..memory_engine import fq_table, get_current_schema
@@ -35,49 +36,58 @@ def _bank_index_name(ft: str, internal_id: str) -> str:
     return f"idx_mu_emb_{_BANK_INDEX_FACT_TYPES[ft]}_{uid}"
 
 
-def _vector_index_clause() -> str:
-    """Return the USING clause for vector index creation based on the configured extension."""
+def _vector_index_clause() -> str | None:
+    """Return the USING clause for per-bank vector indexes, if this backend uses them."""
     ext = get_config().vector_extension
-    if ext == "pgvectorscale":
-        return "USING diskann (embedding vector_cosine_ops) WITH (num_neighbors = 50)"
-    elif ext == "vchord":
-        return "USING vchordrq (embedding vector_l2_ops)"
-    else:  # pgvector (default)
-        return "USING hnsw (embedding vector_cosine_ops)"
+    if not uses_per_bank_vector_indexes(ext):
+        return None
+    return index_using_clause(ext)
 
 
-async def create_bank_vector_indexes(conn, bank_id: str, internal_id: str) -> None:
+async def create_bank_vector_indexes(conn, bank_id: str, internal_id: str, ops=None) -> None:
     """Create per-(bank, fact_type) partial vector indexes for a newly created bank.
 
     Respects the HINDSIGHT_API_VECTOR_EXTENSION config to use the appropriate
     index type (HNSW for pgvector, DiskANN for pgvectorscale, vchordrq for vchord).
 
-    Called immediately after the bank row is first inserted. Safe on empty banks
-    (index build is instant). Idempotent via CREATE INDEX IF NOT EXISTS.
+    AlloyDB ScaNN uses global vector indexes with filtered vector search; it
+    cannot safely create per-bank indexes at bank-creation time because new
+    banks have no embedding rows.
     bank_id is escaped for SQL literal safety (apostrophes doubled).
+
+    On Oracle 23ai, this is a no-op — Oracle uses a single global vector index
+    created during migrations. Partial indexes (WHERE clause) are not supported
+    for Oracle vector indexes.
     """
-    table = fq_table("memory_units")
-    escaped = bank_id.replace("'", "''")
-    using_clause = _vector_index_clause()
-    for ft in _BANK_INDEX_FACT_TYPES:
-        idx = _bank_index_name(ft, internal_id)
-        await conn.execute(
-            f"CREATE INDEX IF NOT EXISTS {idx} "
-            f"ON {table} {using_clause} "
-            f"WHERE fact_type = '{ft}' AND bank_id = '{escaped}'"
-        )
+    index_clause = _vector_index_clause()
+    if index_clause is None:
+        logger.debug("Skipping per-bank vector indexes for configured backend")
+        return
+
+    await ops.create_bank_vector_indexes(
+        conn,
+        fq_table("memory_units"),
+        bank_id,
+        internal_id,
+        index_clause,
+        _BANK_INDEX_FACT_TYPES,
+    )
 
 
-async def drop_bank_vector_indexes(conn, internal_id: str) -> None:
+async def drop_bank_vector_indexes(conn, internal_id: str, ops=None) -> None:
     """Drop per-(bank, fact_type) partial vector indexes for a bank being deleted.
 
     Called before the bank row is deleted so internal_id is still known.
     Idempotent via DROP INDEX IF EXISTS.
+
+    On Oracle, this is a no-op (uses single global vector index).
     """
-    schema = get_current_schema()
-    for ft in _BANK_INDEX_FACT_TYPES:
-        idx = _bank_index_name(ft, internal_id)
-        await conn.execute(f"DROP INDEX IF EXISTS {schema}.{idx}")
+    await ops.drop_bank_vector_indexes(
+        conn,
+        get_current_schema(),
+        internal_id,
+        _BANK_INDEX_FACT_TYPES,
+    )
 
 
 DEFAULT_DISPOSITION = {
@@ -115,6 +125,41 @@ async def get_bank_profile(pool, bank_id: str) -> BankProfile:
     """
     profile, _ = await get_or_create_bank_profile(pool, bank_id)
     return profile
+
+
+async def get_bank_profile_if_exists(pool, bank_id: str) -> BankProfile | None:
+    """
+    Get bank profile (name, disposition + mission) without auto-creating.
+
+    Returns None if the bank does not exist. This is the read-only variant
+    of get_bank_profile, intended for read endpoints where a bank that
+    doesn't exist should surface as 404 rather than be silently created.
+
+    Args:
+        pool: Database connection pool
+        bank_id: bank IDentifier
+
+    Returns:
+        BankProfile if the bank exists, otherwise None.
+    """
+    async with acquire_with_retry(pool) as conn:
+        row = await conn.fetchrow(
+            f"""
+            SELECT name, disposition, mission
+            FROM {fq_table("banks")} WHERE bank_id = $1
+            """,
+            bank_id,
+        )
+        if not row:
+            return None
+        disposition_data = row["disposition"]
+        if isinstance(disposition_data, str):
+            disposition_data = json.loads(disposition_data)
+        return BankProfile(
+            name=row["name"],
+            disposition=DispositionTraits(**disposition_data),
+            mission=row["mission"] or "",
+        )
 
 
 async def get_or_create_bank_profile(pool, bank_id: str) -> tuple[BankProfile, bool]:
@@ -175,7 +220,7 @@ async def get_or_create_bank_profile(pool, bank_id: str) -> tuple[BankProfile, b
         created = inserted is not None
         if created:
             # Fresh insert — create per-bank vector indexes (instant on empty bank)
-            await create_bank_vector_indexes(conn, bank_id, str(internal_id))
+            await create_bank_vector_indexes(conn, bank_id, str(internal_id), ops=pool.ops)
 
         return (
             BankProfile(name=bank_id, disposition=DispositionTraits(**DEFAULT_DISPOSITION), mission=""),
@@ -327,29 +372,48 @@ Merged mission:"""
 
 async def list_banks(pool) -> list:
     """
-    List all banks in the system.
+    List all banks in the system with summary stats.
 
     Args:
         pool: Database connection pool
 
     Returns:
-        List of dicts with bank_id, name, disposition, mission, created_at, updated_at
+        List of dicts with bank info and stats (document_count, fact_count, last_event_at)
     """
+    banks_table = fq_table("banks")
+    docs_table = fq_table("documents")
+    mu_table = fq_table("memory_units")
+
     async with acquire_with_retry(pool) as conn:
         rows = await conn.fetch(
             f"""
-            SELECT bank_id, name, disposition, mission, created_at, updated_at
-            FROM {fq_table("banks")}
-            ORDER BY updated_at DESC
+            SELECT
+                b.bank_id, b.name, b.disposition, b.mission,
+                b.created_at, b.updated_at,
+                COALESCE(m.fact_count, 0) AS fact_count,
+                d.last_document_at
+            FROM {banks_table} b
+            LEFT JOIN (
+                SELECT bank_id, MAX(created_at) AS last_document_at
+                FROM {docs_table}
+                GROUP BY bank_id
+            ) d ON d.bank_id = b.bank_id
+            LEFT JOIN (
+                SELECT bank_id, COUNT(*) AS fact_count
+                FROM {mu_table}
+                GROUP BY bank_id
+            ) m ON m.bank_id = b.bank_id
+            ORDER BY d.last_document_at DESC NULLS LAST, b.updated_at DESC
             """
         )
 
         result = []
         for row in rows:
-            # asyncpg returns JSONB as a string, so parse it
             disposition_data = row["disposition"]
             if isinstance(disposition_data, str):
                 disposition_data = json.loads(disposition_data)
+
+            last_doc = row["last_document_at"]
 
             result.append(
                 {
@@ -359,6 +423,8 @@ async def list_banks(pool) -> list:
                     "mission": row["mission"] or "",
                     "created_at": row["created_at"].isoformat() if row["created_at"] else None,
                     "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+                    "fact_count": row["fact_count"],
+                    "last_document_at": last_doc.isoformat() if last_doc else None,
                 }
             )
 

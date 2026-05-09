@@ -5,7 +5,8 @@
     "hindsight-clients/typescript",
     "hindsight-control-plane",
     "hindsight-docs",
-    "hindsight-all-npm"
+    "hindsight-all-npm",
+    "hindsight-tools/hindsight-agent-sdk"
   ],
   "scripts": {
     "prepare": "./scripts/setup-hooks.sh"

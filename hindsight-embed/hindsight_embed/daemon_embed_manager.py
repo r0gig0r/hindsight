@@ -10,9 +10,10 @@ import os
 import platform
 import re
 import subprocess
+import sysconfig
 import time
 from pathlib import Path
-from typing import Optional
+from typing import IO, Optional
 
 import httpx
 from rich.console import Console
@@ -30,8 +31,44 @@ console = Console(stderr=True)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Constants
-DAEMON_STARTUP_TIMEOUT = 180  # seconds
-DEFAULT_DAEMON_IDLE_TIMEOUT = 300  # 5 minutes
+# Allow CI/Windows to extend the startup budget — pg0-embedded's Windows wheel
+# unpacks and runs initdb on first boot, which takes noticeably longer on cold
+# runners than POSIX.
+DAEMON_STARTUP_TIMEOUT = int(os.getenv("HINDSIGHT_EMBED_DAEMON_STARTUP_TIMEOUT", "180"))
+DEFAULT_DAEMON_IDLE_TIMEOUT = 0  # 0 = disabled (no auto-exit)
+
+
+def _detach_popen_kwargs(log_handle: IO[bytes]) -> dict:
+    """Cross-platform kwargs to spawn a subprocess detached from the caller.
+
+    On POSIX, `start_new_session=True` calls setsid(2) so the child
+    survives the parent's terminal. On Windows there is no setsid: we use
+    `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`, which also means the
+    child has no console, so stdin/stdout/stderr MUST be redirected or any
+    write from the child crashes with "handle is invalid".
+
+    `log_handle` receives the child's stdout/stderr on both platforms so
+    output never leaks into the parent's terminal (which would corrupt a
+    TUI parent communicating over stdio).
+    """
+    if platform.system() == "Windows":
+        # Windows-only constants; use getattr so type checkers (e.g. ty) running
+        # on Linux don't flag the attribute access. They're guaranteed present
+        # at runtime because of the platform.system() guard above.
+        detached_process = getattr(subprocess, "DETACHED_PROCESS", 0)
+        create_new_process_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        return {
+            "creationflags": detached_process | create_new_process_group,
+            "stdin": subprocess.DEVNULL,
+            "stdout": log_handle,
+            "stderr": subprocess.STDOUT,
+            "close_fds": True,
+        }
+    return {
+        "start_new_session": True,
+        "stdout": log_handle,
+        "stderr": log_handle,
+    }
 
 
 class DaemonEmbedManager(EmbedManager):
@@ -94,7 +131,29 @@ class DaemonEmbedManager(EmbedManager):
         # Check if we're in development mode
         dev_api_path = Path(__file__).parent.parent.parent / "hindsight-api-slim"
         if dev_api_path.exists() and (dev_api_path / "pyproject.toml").exists():
-            return ["uv", "run", "--project", str(dev_api_path), "hindsight-api"]
+            return ["uv", "run", "--project", str(dev_api_path), "--extra", "all", "hindsight-api"]
+
+        # Prefer a hindsight-api entry point installed alongside hindsight-embed.
+        # Try two strategies:
+        #
+        # 1. sysconfig: resolves <venv>/bin or <venv>/Scripts for standard
+        #    pip/venv installs (issue #1401).
+        # 2. __file__-relative: resolves <target>/bin or <target>/Scripts for
+        #    `pip install --target` layouts where sysconfig still points at the
+        #    system/venv scripts dir (issue #1240).
+        binary_name = "hindsight-api.exe" if platform.system() == "Windows" else "hindsight-api"
+
+        scripts_dir = Path(sysconfig.get_path("scripts"))
+        candidate = scripts_dir / binary_name
+        if candidate.exists():
+            return [str(candidate)]
+
+        # --target installs place binaries alongside site-packages contents
+        package_root = Path(__file__).parent.parent
+        for bin_dir in ("bin", "Scripts"):
+            candidate = package_root / bin_dir / binary_name
+            if candidate.exists():
+                return [str(candidate)]
 
         # Fall back to uvx for installed version
         from . import __version__
@@ -312,14 +371,9 @@ class DaemonEmbedManager(EmbedManager):
         if "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT" not in env:
             env["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] = str(DEFAULT_DAEMON_IDLE_TIMEOUT)
 
-        # On macOS, force CPU for local embeddings/reranker to avoid MPS/XPC
-        # hangs during sentence-transformers init in daemon mode (issue #962).
-        # Users can opt back into MPS by explicitly setting these to "0".
-        if platform.system() == "Darwin":
-            if "HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU" not in env:
-                env["HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU"] = "1"
-            if "HINDSIGHT_API_RERANKER_LOCAL_FORCE_CPU" not in env:
-                env["HINDSIGHT_API_RERANKER_LOCAL_FORCE_CPU"] = "1"
+        # Tell the daemon child it was already launched in a detached session
+        # (via our Popen below) so daemonize() skips the redundant re-exec.
+        env["_HINDSIGHT_DAEMON_CHILD"] = "1"
 
         # Get idle timeout from env
         idle_timeout = int(env.get("HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT", str(DEFAULT_DAEMON_IDLE_TIMEOUT)))
@@ -340,12 +394,15 @@ class DaemonEmbedManager(EmbedManager):
             cmd.extend(extra_args)
 
         try:
-            # Start daemon
-            subprocess.Popen(
-                cmd,
-                env=env,
-                start_new_session=True,
-            )
+            # Start daemon. Redirect stdout/stderr to the daemon log so that
+            # any output from the subprocess (e.g. uvx download progress,
+            # Python library init messages) does not leak into the parent
+            # process terminal. Python's own logging (via
+            # HINDSIGHT_API_DAEMON_LOG) will append to the same path.
+            # Popen dups the fd into the child during spawn, so the parent
+            # can close its handle as soon as Popen returns.
+            with open(daemon_log, "ab") as daemon_log_handle:
+                subprocess.Popen(cmd, env=env, **_detach_popen_kwargs(daemon_log_handle))
 
             # Wait for daemon to be ready with rich UI
             start_time = time.time()
@@ -499,7 +556,10 @@ class DaemonEmbedManager(EmbedManager):
         from . import __version__
 
         cp_version = os.getenv("HINDSIGHT_EMBED_CP_VERSION", __version__)
-        return ["npx", f"@vectorize-io/hindsight-control-plane@{cp_version}"]
+        # `npx` prompts before installing missing packages on first run unless `-y` is set.
+        # The UI starts in the background with stdout/stderr redirected to a log file, so an
+        # interactive prompt would be invisible to users and the health-check loop would time out.
+        return ["npx", "-y", f"@vectorize-io/hindsight-control-plane@{cp_version}"]
 
     def get_ui_url(self, profile: str, ui_port: int | None = None, hostname: str | None = None) -> str:
         """Get the URL for the UI serving this profile."""
@@ -563,14 +623,8 @@ class DaemonEmbedManager(EmbedManager):
         ]
 
         try:
-            log_file = open(ui_log, "w")
-            subprocess.Popen(
-                cmd,
-                env=env,
-                start_new_session=True,
-                stdout=log_file,
-                stderr=log_file,
-            )
+            with open(ui_log, "wb") as log_file:
+                subprocess.Popen(cmd, env=env, **_detach_popen_kwargs(log_file))
 
             # Wait for UI to be ready
             start_time = time.time()

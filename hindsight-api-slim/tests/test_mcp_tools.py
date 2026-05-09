@@ -159,7 +159,6 @@ def mock_memory():
     # Memory browsing methods
     memory.list_memory_units = AsyncMock(return_value={"items": [{"id": "mem-1", "content": "Test"}], "total": 1})
     memory.get_memory_unit = AsyncMock(return_value={"id": "mem-1", "content": "Test memory"})
-    memory.delete_memory_unit = AsyncMock(return_value={"deleted_count": 1})
 
     # Document methods
     memory.list_documents = AsyncMock(return_value={"items": [{"id": "doc-1", "name": "Test Doc"}], "total": 1})
@@ -177,6 +176,10 @@ def mock_memory():
     memory.get_bank_stats = AsyncMock(return_value={"nodes": 100, "links": 50})
     memory.update_bank = AsyncMock(return_value={"id": "test-bank", "name": "Updated"})
     memory.delete_bank = AsyncMock(return_value={"deleted_memories": 10, "deleted_entities": 5})
+
+    # Config resolver (used by update_bank MCP tool for config fields)
+    memory._config_resolver = MagicMock()
+    memory._config_resolver.update_bank_config = AsyncMock()
     memory.list_banks = AsyncMock(return_value=[])
 
     return memory
@@ -309,7 +312,6 @@ class TestMentalModelToolRegistration:
         memory.delete_directive = AsyncMock()
         memory.list_memory_units = AsyncMock(return_value={})
         memory.get_memory_unit = AsyncMock()
-        memory.delete_memory_unit = AsyncMock()
         memory.list_documents = AsyncMock(return_value={})
         memory.get_document = AsyncMock()
         memory.delete_document = AsyncMock()
@@ -343,7 +345,7 @@ class TestMentalModelToolRegistration:
         assert "delete_bank" in tools
         assert "clear_memories" in tools
         assert "sync_retain" in tools
-        assert len(tools) == 30
+        assert len(tools) == 29
 
 
 @pytest.fixture
@@ -947,6 +949,51 @@ class TestRecallNewParams:
         call_kwargs = mock_memory.recall_async.call_args.kwargs
         assert call_kwargs["question_date"] == datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
+    async def test_recall_with_tag_groups_negative_filter(self, mock_memory):
+        """tag_groups with NOT should pass through to engine after Pydantic validation."""
+        from hindsight_api.engine.search.tags import TagGroupNot
+
+        mcp = _make_mcp_server(mock_memory, {"recall"})
+        await _tools(mcp)["recall"].fn(
+            query="test",
+            tag_groups=[{"not": {"tags": ["closeout"], "match": "any_strict"}}],
+        )
+        call_kwargs = mock_memory.recall_async.call_args.kwargs
+        assert "tag_groups" in call_kwargs
+        assert len(call_kwargs["tag_groups"]) == 1
+        group = call_kwargs["tag_groups"][0]
+        assert isinstance(group, TagGroupNot)
+        assert group.filter.tags == ["closeout"]
+
+    async def test_recall_without_tag_groups_no_kwarg(self, mock_memory):
+        """tag_groups omitted should not appear in engine kwargs."""
+        mcp = _make_mcp_server(mock_memory, {"recall"})
+        await _tools(mcp)["recall"].fn(query="test")
+        call_kwargs = mock_memory.recall_async.call_args.kwargs
+        assert "tag_groups" not in call_kwargs
+
+    async def test_recall_tags_and_tag_groups_mutually_exclusive(self, mock_memory):
+        """Passing both tags and tag_groups returns an error and does not call engine."""
+        mcp = _make_mcp_server(mock_memory, {"recall"})
+        result = await _tools(mcp)["recall"].fn(
+            query="test",
+            tags=["project:x"],
+            tag_groups=[{"tags": ["closeout"], "match": "any_strict"}],
+        )
+        assert "mutually exclusive" in result
+        mock_memory.recall_async.assert_not_called()
+
+    async def test_recall_tag_groups_single_bank(self, mock_memory):
+        """tag_groups should also work in single-bank mode."""
+        mcp = _make_mcp_server(mock_memory, {"recall"}, include_bank_id=False)
+        await _tools(mcp)["recall"].fn(
+            query="test",
+            tag_groups=[{"tags": ["scope:work"], "match": "all_strict"}],
+        )
+        call_kwargs = mock_memory.recall_async.call_args.kwargs
+        assert "tag_groups" in call_kwargs
+        assert len(call_kwargs["tag_groups"]) == 1
+
 
 @pytest.mark.asyncio
 class TestReflectNewParams:
@@ -1102,12 +1149,6 @@ class TestMemoryBrowsingTools:
         result = await _tools(mcp)["get_memory"].fn(memory_id="missing")
         assert "not found" in result
 
-    async def test_delete_memory(self, mock_memory):
-        mcp = _make_mcp_server(mock_memory, {"delete_memory"}, include_bank_id=True)
-        result = await _tools(mcp)["delete_memory"].fn(memory_id="mem-1")
-        assert '"deleted"' in result
-        assert mock_memory.delete_memory_unit.call_args.kwargs["unit_id"] == "mem-1"
-
     async def test_get_memory_invalid_uuid(self, mock_memory):
         mock_memory.get_memory_unit.side_effect = ValueError("Invalid memory_id: 'nonexistent' is not a valid UUID")
         mcp = _make_mcp_server(mock_memory, {"get_memory"}, include_bank_id=True)
@@ -1119,12 +1160,6 @@ class TestMemoryBrowsingTools:
         mcp = _make_mcp_server(mock_memory, {"get_memory"}, include_bank_id=False)
         result = await _tools(mcp)["get_memory"].fn(memory_id="bad")
         assert "not a valid UUID" in result["error"]
-
-    async def test_delete_memory_invalid_uuid(self, mock_memory):
-        mock_memory.delete_memory_unit.side_effect = ValueError("Invalid unit_id: 'bad' is not a valid UUID")
-        mcp = _make_mcp_server(mock_memory, {"delete_memory"}, include_bank_id=True)
-        result = await _tools(mcp)["delete_memory"].fn(memory_id="bad")
-        assert "not a valid UUID" in result
 
     async def test_list_memories_single_bank(self, mock_memory):
         mcp = _make_mcp_server(mock_memory, {"list_memories"}, include_bank_id=False)
@@ -1265,9 +1300,14 @@ class TestTagsAndBankTools:
     async def test_update_bank(self, mock_memory):
         mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
         result = await _tools(mcp)["update_bank"].fn(name="New Name", mission="New Mission")
+        # name is updated via engine
         call_kwargs = mock_memory.update_bank.call_args.kwargs
         assert call_kwargs["name"] == "New Name"
-        assert call_kwargs["mission"] == "New Mission"
+        # mission is routed to config resolver as reflect_mission
+        config_call = mock_memory._config_resolver.update_bank_config.call_args
+        assert config_call.args[1] == {"reflect_mission": "New Mission"}
+        # bank_id is the first positional arg
+        assert config_call.args[0] == "test-bank"
 
     async def test_delete_bank(self, mock_memory):
         mcp = _make_mcp_server(mock_memory, {"delete_bank"}, include_bank_id=True)
@@ -1352,19 +1392,6 @@ class TestOperationErrorHandling:
 class TestDeleteErrorHandling:
     """Error handling tests for delete operations."""
 
-    async def test_delete_memory_engine_error(self, mock_memory):
-        mock_memory.delete_memory_unit.side_effect = RuntimeError("DB error")
-        mcp = _make_mcp_server(mock_memory, {"delete_memory"}, include_bank_id=True)
-        result = await _tools(mcp)["delete_memory"].fn(memory_id="mem-1")
-        assert "error" in result
-        assert "DB error" in result
-
-    async def test_delete_memory_single_bank(self, mock_memory):
-        mcp = _make_mcp_server(mock_memory, {"delete_memory"}, include_bank_id=False)
-        result = await _tools(mcp)["delete_memory"].fn(memory_id="mem-1")
-        assert isinstance(result, dict)
-        assert result["status"] == "deleted"
-
     async def test_delete_document_engine_error(self, mock_memory):
         mock_memory.delete_document.side_effect = RuntimeError("DB error")
         mcp = _make_mcp_server(mock_memory, {"delete_document"}, include_bank_id=True)
@@ -1395,6 +1422,120 @@ class TestUpdateBankVariants:
         mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
         result = await _tools(mcp)["update_bank"].fn(name="X")
         assert "error" in result
+
+    async def test_update_bank_config_updates_dict(self, mock_memory):
+        """config_updates dict is passed directly to config resolver."""
+        mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
+        await _tools(mcp)["update_bank"].fn(config_updates={"reflect_mission": "Guide reflect output"})
+        config_call = mock_memory._config_resolver.update_bank_config.call_args
+        assert config_call.args[1] == {"reflect_mission": "Guide reflect output"}
+        # name should NOT be updated when not provided
+        mock_memory.update_bank.assert_not_called()
+
+    async def test_update_bank_mission_maps_to_reflect_mission(self, mock_memory):
+        """Deprecated mission param is mapped to reflect_mission in config."""
+        mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
+        await _tools(mcp)["update_bank"].fn(mission="My mission")
+        config_call = mock_memory._config_resolver.update_bank_config.call_args
+        assert config_call.args[1] == {"reflect_mission": "My mission"}
+
+    async def test_update_bank_config_reflect_mission_takes_precedence_over_mission(self, mock_memory):
+        """When both mission and config_updates.reflect_mission are provided, config wins."""
+        mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
+        await _tools(mcp)["update_bank"].fn(
+            mission="old", config_updates={"reflect_mission": "new"}
+        )
+        config_call = mock_memory._config_resolver.update_bank_config.call_args
+        assert config_call.args[1]["reflect_mission"] == "new"
+
+    async def test_update_bank_multiple_config_fields(self, mock_memory):
+        """Multiple config fields can be set in a single config_updates dict."""
+        mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
+        await _tools(mcp)["update_bank"].fn(config_updates={
+            "retain_mission": "Extract technical decisions",
+            "disposition_skepticism": 5,
+            "disposition_literalism": 1,
+            "disposition_empathy": 4,
+            "enable_observations": True,
+            "observations_mission": "Focus on preferences",
+            "retain_extraction_mode": "custom",
+            "retain_custom_instructions": "Extract only action items",
+            "retain_chunk_size": 2000,
+        })
+        config_call = mock_memory._config_resolver.update_bank_config.call_args
+        updates = config_call.args[1]
+        assert updates["retain_mission"] == "Extract technical decisions"
+        assert updates["disposition_skepticism"] == 5
+        assert updates["disposition_literalism"] == 1
+        assert updates["disposition_empathy"] == 4
+        assert updates["enable_observations"] is True
+        assert updates["observations_mission"] == "Focus on preferences"
+        assert updates["retain_extraction_mode"] == "custom"
+        assert updates["retain_custom_instructions"] == "Extract only action items"
+        assert updates["retain_chunk_size"] == 2000
+
+    async def test_update_bank_name_and_config_together(self, mock_memory):
+        """name goes to engine, config_updates goes to config resolver."""
+        mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
+        await _tools(mcp)["update_bank"].fn(
+            name="My Bank",
+            config_updates={"reflect_mission": "Reflect guide", "retain_mission": "Retain guide"},
+        )
+        assert mock_memory.update_bank.call_args.kwargs["name"] == "My Bank"
+        updates = mock_memory._config_resolver.update_bank_config.call_args.args[1]
+        assert updates["reflect_mission"] == "Reflect guide"
+        assert updates["retain_mission"] == "Retain guide"
+
+    async def test_update_bank_no_config_call_when_only_name(self, mock_memory):
+        """When only name is provided, config resolver should not be called."""
+        mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
+        await _tools(mcp)["update_bank"].fn(name="Just Name")
+        mock_memory.update_bank.assert_called_once()
+        mock_memory._config_resolver.update_bank_config.assert_not_called()
+
+    async def test_update_bank_config_updates_single_bank(self, mock_memory):
+        """config_updates works in single-bank mode too."""
+        mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=False)
+        result = await _tools(mcp)["update_bank"].fn(
+            config_updates={"retain_mission": "Extract everything", "disposition_empathy": 5}
+        )
+        assert isinstance(result, dict)
+        config_call = mock_memory._config_resolver.update_bank_config.call_args
+        updates = config_call.args[1]
+        assert updates["retain_mission"] == "Extract everything"
+        assert updates["disposition_empathy"] == 5
+
+    async def test_update_bank_with_bank_id_override(self, mock_memory):
+        """bank_id override routes config update to the correct bank."""
+        mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
+        await _tools(mcp)["update_bank"].fn(
+            config_updates={"reflect_mission": "Test"}, bank_id="other-bank"
+        )
+        config_call = mock_memory._config_resolver.update_bank_config.call_args
+        assert config_call.args[0] == "other-bank"
+
+    async def test_update_bank_config_resolver_validation_error(self, mock_memory):
+        """ValueError from config resolver (e.g. invalid field) is returned as error."""
+        mock_memory._config_resolver.update_bank_config.side_effect = ValueError(
+            "Cannot override static (server-level) fields: ['database_url']"
+        )
+        mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
+        result = await _tools(mcp)["update_bank"].fn(config_updates={"database_url": "bad"})
+        assert "error" in result
+        assert "static" in result
+
+    async def test_update_bank_any_configurable_field(self, mock_memory):
+        """Any field in _CONFIGURABLE_FIELDS is accepted (future-proof)."""
+        mcp = _make_mcp_server(mock_memory, {"update_bank"}, include_bank_id=True)
+        await _tools(mcp)["update_bank"].fn(config_updates={
+            "recall_budget_fixed_low": 100,
+            "consolidation_llm_batch_size": 8,
+            "entity_labels": ["PERSON", "ORG"],
+        })
+        updates = mock_memory._config_resolver.update_bank_config.call_args.args[1]
+        assert updates["recall_budget_fixed_low"] == 100
+        assert updates["consolidation_llm_batch_size"] == 8
+        assert updates["entity_labels"] == ["PERSON", "ORG"]
 
     async def test_get_bank_stats_engine_error(self, mock_memory):
         mock_memory.get_bank_stats.side_effect = RuntimeError("DB error")

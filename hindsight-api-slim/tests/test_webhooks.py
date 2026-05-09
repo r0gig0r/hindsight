@@ -74,7 +74,7 @@ class TestHmacSigning:
     def _make_manager(self) -> WebhookManager:
         """Create a WebhookManager with a dummy pool (not used for signing)."""
         pool = MagicMock()
-        return WebhookManager(pool=pool, global_webhooks=[])
+        return WebhookManager(backend=pool, global_webhooks=[])
 
     def test_hmac_signing_format(self):
         """_sign_payload should return a string starting with 'sha256='."""
@@ -132,7 +132,7 @@ class TestRetryConstants:
 @pytest_asyncio.fixture
 async def webhook_manager(memory: MemoryEngine) -> WebhookManager:
     """Return a WebhookManager backed by the test pool with no global webhooks."""
-    return WebhookManager(pool=memory._pool, global_webhooks=[])
+    return WebhookManager(backend=memory._backend, global_webhooks=[])
 
 
 async def _ensure_bank(pool, bank_id: str) -> None:
@@ -214,7 +214,7 @@ class TestFireEvent:
             event_types=["consolidation.completed"],
             enabled=True,
         )
-        manager = WebhookManager(pool=memory._pool, global_webhooks=[global_webhook])
+        manager = WebhookManager(backend=memory._backend, global_webhooks=[global_webhook])
 
         event = _make_event(bank_id)
         await manager.fire_event(event)
@@ -285,6 +285,115 @@ class TestFireEvent:
             assert count == 0
         finally:
             async with memory._pool.acquire() as conn:
+                await conn.execute("DELETE FROM webhooks WHERE id = $1", webhook_id)
+
+
+class TestFireEventWithConn:
+    """Integration tests for WebhookManager.fire_event_with_conn()."""
+
+    @pytest.mark.asyncio
+    async def test_fire_event_with_conn_queues_delivery(
+        self, memory: MemoryEngine, webhook_manager: WebhookManager
+    ):
+        """fire_event_with_conn() inserts a delivery task using the provided connection."""
+        bank_id = f"wh-conn-{uuid.uuid4().hex[:8]}"
+        webhook_id = uuid.uuid4()
+
+        await _ensure_bank(memory._pool, bank_id)
+        async with memory._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO webhooks (id, bank_id, url, secret, event_types, enabled, created_at, updated_at)
+                VALUES ($1, $2, $3, NULL, $4, true, NOW(), NOW())
+                """,
+                webhook_id,
+                bank_id,
+                "https://example.com/conn-hook",
+                ["consolidation.completed"],
+            )
+
+        try:
+            event = _make_event(bank_id)
+            # Use fire_event_with_conn inside a transaction
+            async with memory._backend.acquire() as conn:
+                async with conn.transaction():
+                    await webhook_manager.fire_event_with_conn(event, conn)
+
+            async with memory._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT status, task_payload
+                    FROM async_operations
+                    WHERE operation_type = 'webhook_delivery'
+                      AND bank_id = $1
+                      AND task_payload->>'webhook_id' = $2
+                    """,
+                    bank_id,
+                    str(webhook_id),
+                )
+
+            assert len(rows) == 1
+            assert rows[0]["status"] == "pending"
+        finally:
+            async with memory._pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM async_operations WHERE operation_type = 'webhook_delivery' AND bank_id = $1",
+                    bank_id,
+                )
+                await conn.execute("DELETE FROM webhooks WHERE id = $1", webhook_id)
+
+    @pytest.mark.asyncio
+    async def test_fire_event_with_conn_rolls_back_on_transaction_abort(
+        self, memory: MemoryEngine, webhook_manager: WebhookManager
+    ):
+        """When the enclosing transaction rolls back, the delivery row is also rolled back.
+
+        This is the key property of fire_event_with_conn vs fire_event: using the
+        caller's connection means the delivery insert is atomic with the caller's work.
+        """
+        bank_id = f"wh-rollback-{uuid.uuid4().hex[:8]}"
+        webhook_id = uuid.uuid4()
+
+        await _ensure_bank(memory._pool, bank_id)
+        async with memory._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO webhooks (id, bank_id, url, secret, event_types, enabled, created_at, updated_at)
+                VALUES ($1, $2, $3, NULL, $4, true, NOW(), NOW())
+                """,
+                webhook_id,
+                bank_id,
+                "https://example.com/rollback-hook",
+                ["consolidation.completed"],
+            )
+
+        try:
+            event = _make_event(bank_id)
+
+            # Fire inside a transaction that we explicitly roll back.
+            # Use the raw asyncpg pool to get manual transaction control.
+            async with memory._pool.acquire() as raw_conn:
+                tx = raw_conn.transaction()
+                await tx.start()
+                await webhook_manager.fire_event_with_conn(event, raw_conn)
+                await tx.rollback()
+
+            # The delivery row should NOT exist because the transaction was rolled back
+            async with memory._pool.acquire() as conn:
+                count = await conn.fetchval(
+                    """
+                    SELECT COUNT(*) FROM async_operations
+                    WHERE operation_type = 'webhook_delivery' AND bank_id = $1
+                    """,
+                    bank_id,
+                )
+            assert count == 0, f"Expected 0 delivery rows after rollback, got {count}"
+        finally:
+            async with memory._pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM async_operations WHERE operation_type = 'webhook_delivery' AND bank_id = $1",
+                    bank_id,
+                )
                 await conn.execute("DELETE FROM webhooks WHERE id = $1", webhook_id)
 
 
@@ -792,3 +901,429 @@ class TestRetainCompletedWebhook:
                     bank_id,
                 )
                 await conn.execute("DELETE FROM webhooks WHERE id = $1", webhook_id)
+
+
+# ---------------------------------------------------------------------------
+# Schema-isolation tests
+#
+# These tests verify that webhook CRUD endpoints honour the per-request schema
+# context set by the tenant extension, rather than always operating on the
+# default (public) schema. This is the regression test for the bug where the
+# HTTP handlers built ``fq_table("webhooks")`` before ``_authenticate_tenant``
+# had set the schema context, causing webhook rows to land in the wrong schema
+# under multi-target-schema deployments. The fire path correctly resolves the
+# bank's schema and would never see those rows, producing silent failures.
+# ---------------------------------------------------------------------------
+
+
+class _NonDefaultSchemaTenantExtension:
+    """Minimal tenant extension that always returns a fixed non-default schema.
+
+    Doesn't subclass ``TenantExtension`` because we only need ``authenticate``
+    for these tests; ``_authenticate_tenant`` calls just that method.
+    """
+
+    def __init__(self, schema_name: str):
+        self._schema_name = schema_name
+
+    async def authenticate(self, context):
+        from hindsight_api.extensions import TenantContext
+
+        return TenantContext(schema_name=self._schema_name)
+
+    async def list_tenants(self):
+        from hindsight_api.extensions.tenant import Tenant
+
+        return [Tenant(schema=self._schema_name)]
+
+
+@pytest_asyncio.fixture
+async def isolated_schema(memory: MemoryEngine, pg0_db_url):
+    """Provision a fresh non-default schema with the full migration tree, then
+    swap the memory engine's tenant extension so all subsequent operations
+    resolve to it. Drops the schema on teardown.
+    """
+    import asyncpg
+
+    from hindsight_api.migrations import run_migrations
+
+    schema_name = f"tenant_wh_iso_{uuid.uuid4().hex[:8]}"
+
+    # Run migrations to provision the schema with all tables (webhooks, banks,
+    # async_operations, ...). This is the same path a real multi-tenant
+    # extension would take to provision a new tenant schema.
+    run_migrations(pg0_db_url, schema=schema_name)
+
+    original_ext = memory._tenant_extension
+    memory._tenant_extension = _NonDefaultSchemaTenantExtension(schema_name)
+
+    try:
+        yield schema_name
+    finally:
+        memory._tenant_extension = original_ext
+        # Drop the test schema. Use a dedicated connection so we don't depend
+        # on the pool's state.
+        conn = await asyncpg.connect(pg0_db_url)
+        try:
+            await conn.execute(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
+        finally:
+            await conn.close()
+
+
+class TestWebhookSchemaIsolation:
+    """Verify the webhook HTTP endpoints write to and read from the schema set
+    by the tenant extension, not the default (public) schema.
+    """
+
+    @pytest.mark.asyncio
+    async def test_create_webhook_lands_in_resolved_schema(
+        self, memory: MemoryEngine, api_client: httpx.AsyncClient, isolated_schema: str
+    ):
+        """POST /webhooks should insert into the resolved schema, not public."""
+        bank_id = f"http-wh-iso-{uuid.uuid4().hex[:8]}"
+
+        create_resp = await api_client.post(
+            f"/v1/default/banks/{bank_id}/webhooks",
+            json={"url": "https://example.com/iso", "event_types": ["consolidation.completed"]},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        webhook_id = create_resp.json()["id"]
+
+        # Row should exist in the resolved schema...
+        async with memory._pool.acquire() as conn:
+            row_in_target = await conn.fetchrow(
+                f'SELECT id, bank_id, url FROM "{isolated_schema}".webhooks WHERE id = $1',
+                uuid.UUID(webhook_id),
+            )
+            # ...and must NOT exist in public.
+            row_in_public = await conn.fetchrow(
+                "SELECT id FROM public.webhooks WHERE id = $1",
+                uuid.UUID(webhook_id),
+            )
+
+        assert row_in_target is not None, (
+            "Webhook row should be inserted into the resolved schema"
+        )
+        assert row_in_target["bank_id"] == bank_id
+        assert row_in_target["url"] == "https://example.com/iso"
+        assert row_in_public is None, (
+            "Webhook row must NOT be written to public when a non-default "
+            "schema is resolved by the tenant extension"
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_webhooks_reads_from_resolved_schema(
+        self, memory: MemoryEngine, api_client: httpx.AsyncClient, isolated_schema: str
+    ):
+        """GET /webhooks should only return rows from the resolved schema.
+
+        We seed an unrelated row directly into public.webhooks for the same
+        bank_id and assert it does NOT appear in the list response.
+        """
+        bank_id = f"http-wh-iso-{uuid.uuid4().hex[:8]}"
+
+        # Create one webhook through the HTTP API (lands in the isolated schema)
+        create_resp = await api_client.post(
+            f"/v1/default/banks/{bank_id}/webhooks",
+            json={"url": "https://example.com/in-target", "event_types": ["consolidation.completed"]},
+        )
+        assert create_resp.status_code == 201
+        target_webhook_id = create_resp.json()["id"]
+
+        # Seed an unrelated webhook row directly into public.webhooks for the
+        # same bank — represents data that belongs to "another tenant".
+        public_webhook_id = uuid.uuid4()
+        async with memory._pool.acquire() as conn:
+            # public.banks may not have this bank; ensure the FK does not blow up.
+            await conn.execute(
+                "INSERT INTO public.banks (bank_id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                bank_id,
+                bank_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO public.webhooks
+                  (id, bank_id, url, secret, event_types, enabled, created_at, updated_at)
+                VALUES ($1, $2, 'https://example.com/in-public', NULL, $3, true, NOW(), NOW())
+                """,
+                public_webhook_id,
+                bank_id,
+                ["consolidation.completed"],
+            )
+
+        try:
+            list_resp = await api_client.get(f"/v1/default/banks/{bank_id}/webhooks")
+            assert list_resp.status_code == 200
+            ids = {item["id"] for item in list_resp.json()["items"]}
+
+            assert target_webhook_id in ids, (
+                "list_webhooks should return rows from the resolved schema"
+            )
+            assert str(public_webhook_id) not in ids, (
+                "list_webhooks must NOT leak rows from public when a non-default "
+                "schema is resolved"
+            )
+        finally:
+            async with memory._pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM public.webhooks WHERE id = $1", public_webhook_id
+                )
+
+    @pytest.mark.asyncio
+    async def test_update_webhook_targets_resolved_schema(
+        self, memory: MemoryEngine, api_client: httpx.AsyncClient, isolated_schema: str
+    ):
+        """PATCH /webhooks/{id} should update the row in the resolved schema only."""
+        bank_id = f"http-wh-iso-{uuid.uuid4().hex[:8]}"
+
+        create_resp = await api_client.post(
+            f"/v1/default/banks/{bank_id}/webhooks",
+            json={"url": "https://example.com/before", "event_types": ["consolidation.completed"]},
+        )
+        assert create_resp.status_code == 201
+        webhook_id = create_resp.json()["id"]
+
+        # Seed a row with the SAME id in public (impossible in practice, but
+        # demonstrates that PATCH does not silently target public).
+        async with memory._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO public.banks (bank_id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                bank_id,
+                bank_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO public.webhooks
+                  (id, bank_id, url, secret, event_types, enabled, created_at, updated_at)
+                VALUES ($1, $2, 'https://example.com/public-stale', NULL, $3, true, NOW(), NOW())
+                """,
+                uuid.UUID(webhook_id),
+                bank_id,
+                ["consolidation.completed"],
+            )
+
+        try:
+            patch_resp = await api_client.patch(
+                f"/v1/default/banks/{bank_id}/webhooks/{webhook_id}",
+                json={"url": "https://example.com/after"},
+            )
+            assert patch_resp.status_code == 200
+            assert patch_resp.json()["url"] == "https://example.com/after"
+
+            async with memory._pool.acquire() as conn:
+                target_url = await conn.fetchval(
+                    f'SELECT url FROM "{isolated_schema}".webhooks WHERE id = $1',
+                    uuid.UUID(webhook_id),
+                )
+                public_url = await conn.fetchval(
+                    "SELECT url FROM public.webhooks WHERE id = $1",
+                    uuid.UUID(webhook_id),
+                )
+
+            assert target_url == "https://example.com/after"
+            # The public row must remain untouched - the update targeted the
+            # resolved schema, not public.
+            assert public_url == "https://example.com/public-stale"
+        finally:
+            async with memory._pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM public.webhooks WHERE id = $1", uuid.UUID(webhook_id)
+                )
+
+    @pytest.mark.asyncio
+    async def test_delete_webhook_targets_resolved_schema(
+        self, memory: MemoryEngine, api_client: httpx.AsyncClient, isolated_schema: str
+    ):
+        """DELETE /webhooks/{id} should remove the row from the resolved schema only."""
+        bank_id = f"http-wh-iso-{uuid.uuid4().hex[:8]}"
+
+        create_resp = await api_client.post(
+            f"/v1/default/banks/{bank_id}/webhooks",
+            json={"url": "https://example.com/del", "event_types": ["consolidation.completed"]},
+        )
+        assert create_resp.status_code == 201
+        webhook_id = create_resp.json()["id"]
+
+        # Seed a row with the same id into public to ensure DELETE doesn't
+        # accidentally target it.
+        async with memory._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO public.banks (bank_id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                bank_id,
+                bank_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO public.webhooks
+                  (id, bank_id, url, secret, event_types, enabled, created_at, updated_at)
+                VALUES ($1, $2, 'https://example.com/public-survivor', NULL, $3, true, NOW(), NOW())
+                """,
+                uuid.UUID(webhook_id),
+                bank_id,
+                ["consolidation.completed"],
+            )
+
+        try:
+            del_resp = await api_client.delete(
+                f"/v1/default/banks/{bank_id}/webhooks/{webhook_id}"
+            )
+            assert del_resp.status_code == 200
+            assert del_resp.json()["success"] is True
+
+            async with memory._pool.acquire() as conn:
+                target_row = await conn.fetchrow(
+                    f'SELECT id FROM "{isolated_schema}".webhooks WHERE id = $1',
+                    uuid.UUID(webhook_id),
+                )
+                public_row = await conn.fetchrow(
+                    "SELECT id FROM public.webhooks WHERE id = $1",
+                    uuid.UUID(webhook_id),
+                )
+
+            assert target_row is None, "row in resolved schema should have been deleted"
+            assert public_row is not None, (
+                "row in public must NOT be deleted when delete targets a non-default schema"
+            )
+        finally:
+            async with memory._pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM public.webhooks WHERE id = $1", uuid.UUID(webhook_id)
+                )
+
+    @pytest.mark.asyncio
+    async def test_list_deliveries_targets_resolved_schema(
+        self, memory: MemoryEngine, api_client: httpx.AsyncClient, isolated_schema: str
+    ):
+        """GET /webhooks/{id}/deliveries should only see deliveries in the resolved schema.
+
+        Specifically, if a webhook exists in public with the same id but NOT in
+        the resolved schema, the endpoint must return 404 — it must look up the
+        webhook in the resolved schema, not public.
+        """
+        bank_id = f"http-wh-iso-{uuid.uuid4().hex[:8]}"
+        orphan_webhook_id = uuid.uuid4()
+
+        # Seed a webhook ONLY in public (not in the resolved schema)
+        async with memory._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO public.banks (bank_id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                bank_id,
+                bank_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO public.webhooks
+                  (id, bank_id, url, secret, event_types, enabled, created_at, updated_at)
+                VALUES ($1, $2, 'https://example.com/orphan', NULL, $3, true, NOW(), NOW())
+                """,
+                orphan_webhook_id,
+                bank_id,
+                ["consolidation.completed"],
+            )
+
+        try:
+            resp = await api_client.get(
+                f"/v1/default/banks/{bank_id}/webhooks/{orphan_webhook_id}/deliveries"
+            )
+            # The webhook does not exist in the resolved schema, so this must 404
+            # — not silently fall through to public.
+            assert resp.status_code == 404, resp.text
+        finally:
+            async with memory._pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM public.webhooks WHERE id = $1", orphan_webhook_id
+                )
+
+    @pytest.mark.asyncio
+    async def test_list_deliveries_returns_rows_from_resolved_schema(
+        self, memory: MemoryEngine, api_client: httpx.AsyncClient, isolated_schema: str
+    ):
+        """GET /webhooks/{id}/deliveries should read async_operations from the resolved schema."""
+        bank_id = f"http-wh-iso-{uuid.uuid4().hex[:8]}"
+
+        create_resp = await api_client.post(
+            f"/v1/default/banks/{bank_id}/webhooks",
+            json={"url": "https://example.com/del-iso", "event_types": ["consolidation.completed"]},
+        )
+        assert create_resp.status_code == 201
+        webhook_id = create_resp.json()["id"]
+
+        # Seed a delivery row in the RESOLVED schema's async_operations table.
+        target_delivery_id = uuid.uuid4()
+        target_payload = json.dumps(
+            {
+                "type": "webhook_delivery",
+                "bank_id": bank_id,
+                "url": "https://example.com/del-iso",
+                "secret": None,
+                "event_type": "consolidation.completed",
+                "payload": '{"event":"consolidation.completed"}',
+                "webhook_id": webhook_id,
+            }
+        )
+        # Seed a confounding delivery row with the same payload->webhook_id in
+        # public.async_operations to make sure it is NOT returned.
+        public_delivery_id = uuid.uuid4()
+        public_payload = json.dumps(
+            {
+                "type": "webhook_delivery",
+                "bank_id": bank_id,
+                "url": "https://example.com/del-iso-public",
+                "secret": None,
+                "event_type": "consolidation.completed",
+                "payload": '{"event":"consolidation.completed"}',
+                "webhook_id": webhook_id,
+            }
+        )
+        now = datetime.now(timezone.utc)
+        async with memory._pool.acquire() as conn:
+            await conn.execute(
+                f"""
+                INSERT INTO "{isolated_schema}".async_operations
+                  (operation_id, bank_id, operation_type, status, retry_count,
+                   task_payload, result_metadata, created_at, updated_at)
+                VALUES ($1, $2, 'webhook_delivery', 'completed', 0,
+                        $3::jsonb, '{{}}'::jsonb, $4, $4)
+                """,
+                target_delivery_id,
+                bank_id,
+                target_payload,
+                now,
+            )
+            await conn.execute(
+                "INSERT INTO public.banks (bank_id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                bank_id,
+                bank_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO public.async_operations
+                  (operation_id, bank_id, operation_type, status, retry_count,
+                   task_payload, result_metadata, created_at, updated_at)
+                VALUES ($1, $2, 'webhook_delivery', 'completed', 0,
+                        $3::jsonb, '{}'::jsonb, $4, $4)
+                """,
+                public_delivery_id,
+                bank_id,
+                public_payload,
+                now,
+            )
+
+        try:
+            resp = await api_client.get(
+                f"/v1/default/banks/{bank_id}/webhooks/{webhook_id}/deliveries"
+            )
+            assert resp.status_code == 200
+            ids = {item["id"] for item in resp.json()["items"]}
+            assert str(target_delivery_id) in ids, (
+                "deliveries from the resolved schema should be returned"
+            )
+            assert str(public_delivery_id) not in ids, (
+                "deliveries from public must NOT leak when a non-default schema is resolved"
+            )
+        finally:
+            async with memory._pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM public.async_operations WHERE operation_id = $1",
+                    public_delivery_id,
+                )

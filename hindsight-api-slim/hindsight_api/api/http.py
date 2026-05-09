@@ -1017,7 +1017,7 @@ class BackgroundResponse(BaseModel):
 
 
 class BankListItem(BaseModel):
-    """Bank list item with profile summary."""
+    """Bank list item with profile summary and stats."""
 
     bank_id: str
     name: str | None = None
@@ -1025,6 +1025,8 @@ class BankListItem(BaseModel):
     mission: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
+    fact_count: int = 0
+    last_document_at: str | None = None
 
 
 class BankListResponse(BaseModel):
@@ -1041,6 +1043,8 @@ class BankListResponse(BaseModel):
                         "mission": "I am a software engineer helping my team ship quality code",
                         "created_at": "2024-01-15T10:30:00Z",
                         "updated_at": "2024-01-16T14:20:00Z",
+                        "fact_count": 156,
+                        "last_document_at": "2024-01-16T14:20:00Z",
                     }
                 ]
             }
@@ -1379,6 +1383,9 @@ class DocumentResponse(BaseModel):
     created_at: str
     updated_at: str
     memory_unit_count: int
+    nodes_by_fact_type: dict[str, int] | None = Field(
+        default=None, description="Memory count per fact type (world, experience, observation)"
+    )
     tags: list[str] = FieldWithDefault(list, description="Tags associated with this document")
     document_metadata: dict[str, Any] | None = Field(default=None, description="Document metadata")
     retain_params: dict[str, Any] | None = Field(default=None, description="Parameters used during retain")
@@ -1452,6 +1459,23 @@ class ChunkResponse(BaseModel):
     created_at: str
 
 
+class ListChunksResponse(BaseModel):
+    """Response model for listing chunks of a document."""
+
+    items: list[ChunkResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+class ReprocessDocumentResponse(BaseModel):
+    """Response model for reprocess document endpoint."""
+
+    success: bool
+    operation_id: str
+    items_count: int
+
+
 class DeleteResponse(BaseModel):
     """Response model for delete operations."""
 
@@ -1516,7 +1540,7 @@ class BankStatsResponse(BaseModel):
     failed_operations: int
     operations_by_status: dict[str, int] = Field(
         default_factory=dict,
-        description="Async operations grouped by status (pending, in_progress, completed, failed, cancelled).",
+        description="Async operations grouped by status (pending, processing, completed, failed, cancelled).",
     )
     # Consolidation stats
     last_consolidated_at: str | None = Field(default=None, description="When consolidation last ran (ISO format)")
@@ -1543,6 +1567,14 @@ class MemoriesTimeseriesResponse(BaseModel):
     bank_id: str
     period: str = Field(description="One of: 1h, 12h, 1d, 7d, 30d, 90d.")
     trunc: str = Field(description="Bucket granularity: minute, hour, day.")
+    time_field: str = Field(
+        default="created_at",
+        description=(
+            "Timestamp column used to assign each row to a bucket. "
+            "`created_at` shows ingest time; `mentioned_at` / `occurred_start` "
+            "show event time (falls back to `created_at` per row when null)."
+        ),
+    )
     buckets: list[MemoryTimeseriesBucket] = Field(
         default_factory=list,
         description="Per-bucket counts, always returned fully padded for the requested period.",
@@ -2181,6 +2213,8 @@ class OperationResponse(BaseModel):
                 "created_at": "2024-01-15T10:30:00Z",
                 "status": "pending",
                 "error_message": None,
+                "retry_count": 0,
+                "next_retry_at": None,
             }
         }
     )
@@ -2192,6 +2226,20 @@ class OperationResponse(BaseModel):
     created_at: str
     status: str
     error_message: str | None
+    retry_count: int | None = Field(
+        default=None,
+        description="Number of times this operation has been retried after failure.",
+    )
+    next_retry_at: str | None = Field(
+        default=None,
+        description=(
+            "When the worker will next attempt this operation. For a pending "
+            "operation, a value in the future indicates the task is waiting "
+            "rather than available for immediate pickup — for example, an "
+            "extension may have raised DeferOperation to park the task until "
+            "some backpressure window opens. Always null for completed tasks."
+        ),
+    )
 
 
 class ConsolidationResponse(BaseModel):
@@ -2295,12 +2343,25 @@ class OperationStatusResponse(BaseModel):
     )
 
     operation_id: str
-    status: Literal["pending", "completed", "failed", "not_found"]
+    status: Literal["pending", "processing", "completed", "failed", "cancelled", "not_found"]
     operation_type: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
     completed_at: str | None = None
     error_message: str | None = None
+    retry_count: int | None = Field(
+        default=None,
+        description="Number of times this operation has been retried after failure.",
+    )
+    next_retry_at: str | None = Field(
+        default=None,
+        description=(
+            "When the worker will next attempt this operation. For a pending "
+            "operation, a value in the future indicates the task is parked "
+            "(e.g. by an extension raising DeferOperation) rather than awaiting "
+            "immediate pickup."
+        ),
+    )
     result_metadata: dict[str, Any] | None = Field(
         default=None,
         description="Internal metadata for debugging. Structure may change without notice. Not for production use.",
@@ -2633,25 +2694,31 @@ def create_app(
                 metrics_collector.set_db_pool(memory._pool)
                 logging.info("DB pool metrics configured")
 
-        # Start worker poller if enabled (standalone mode)
-        if config.worker_enabled and memory._pool is not None:
+        # Start worker poller if the backend supports it.
+        # All current backends (PostgreSQL, Oracle) support async worker/poller.
+        if config.worker_enabled and memory._backend.supports_worker_poller:
             from ..config import DEFAULT_DATABASE_SCHEMA
 
             worker_id = config.worker_id or socket.gethostname()
             # Convert default schema to None for SQL compatibility (no schema prefix)
             schema = None if config.database_schema == DEFAULT_DATABASE_SCHEMA else config.database_schema
             poller = WorkerPoller(
-                pool=memory._pool,
+                backend=memory._backend,
                 worker_id=worker_id,
                 executor=memory.execute_task,
                 poll_interval_ms=config.worker_poll_interval_ms,
                 schema=schema,
                 tenant_extension=memory._tenant_extension,
                 max_slots=config.worker_max_slots,
-                consolidation_max_slots=config.worker_consolidation_max_slots,
+                slot_reservations=config.worker_slot_reservations,
             )
             poller_task = asyncio.create_task(poller.run())
             logging.info(f"Worker poller started (worker_id={worker_id})")
+        elif config.worker_enabled and not memory._backend.supports_worker_poller:
+            logging.warning(
+                "Worker poller disabled — backend does not support async operations. "
+                "Tasks (mental model refresh, consolidation) will run synchronously."
+            )
 
         # Call tenant extension startup hook (e.g. JWKS fetch for Supabase)
         tenant_extension = memory.tenant_extension
@@ -2783,6 +2850,13 @@ def create_app(
                                         ann = param.annotation
                                         if isinstance(ann, type) and issubclass(ann, BaseModel):
                                             known_fields = set(ann.model_fields.keys())
+                                            for field in ann.model_fields.values():
+                                                # Pydantic models can expose public JSON names via aliases
+                                                # (for example RetainRequest.async_ is sent as "async").
+                                                # Treat aliases as known fields so valid client payloads are
+                                                # not reported as ignored parameters.
+                                                if isinstance(field.alias, str):
+                                                    known_fields.add(field.alias)
                                             for key in body_json:
                                                 if key not in known_fields:
                                                     body_ignored.append(key)
@@ -2964,12 +3038,22 @@ def _register_routes(app: FastAPI):
         q: str | None = None,
         tags: list[str] | None = Query(None),
         tags_match: str = "all_strict",
+        document_id: str | None = None,
+        chunk_id: str | None = None,
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Get graph data from database, filtered by bank_id and optionally by type."""
         try:
             data = await app.state.memory.get_graph_data(
-                bank_id, type, limit=limit, q=q, tags=tags, tags_match=tags_match, request_context=request_context
+                bank_id,
+                type,
+                limit=limit,
+                q=q,
+                tags=tags,
+                tags_match=tags_match,
+                document_id=document_id,
+                chunk_id=chunk_id,
+                request_context=request_context,
             )
             return data
         except OperationValidationError as e:
@@ -3743,11 +3827,20 @@ def _register_routes(app: FastAPI):
     async def api_memories_timeseries(
         bank_id: str,
         period: str = "7d",
+        time_field: str = Query(
+            default="created_at",
+            description=(
+                "Timestamp column to bucket on. `created_at` (default) = ingest time; "
+                "`mentioned_at` / `occurred_start` = event time, useful for migrated "
+                "corpora where ingest time is a single point and doesn't reflect the "
+                "underlying knowledge timeline. Unknown values fall back to `created_at`."
+            ),
+        ),
         request_context: RequestContext = Depends(get_request_context),
     ):
         try:
             data = await app.state.memory.get_memories_timeseries(
-                bank_id, period=period, request_context=request_context
+                bank_id, period=period, time_field=time_field, request_context=request_context
             )
             return MemoriesTimeseriesResponse(**data)
         except OperationValidationError as e:
@@ -4428,6 +4521,99 @@ def _register_routes(app: FastAPI):
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get(
+        "/v1/default/banks/{bank_id}/documents/{document_id:path}/chunks",
+        response_model=ListChunksResponse,
+        summary="List document chunks",
+        description="List all chunks for a given document, ordered by chunk index.",
+        operation_id="list_document_chunks",
+        tags=["Documents"],
+    )
+    async def api_list_document_chunks(
+        bank_id: str,
+        document_id: str,
+        limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of chunks to return"),
+        offset: int = Query(default=0, ge=0, description="Offset for pagination"),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """
+        List all chunks for a document, ordered by chunk_index.
+
+        Args:
+            bank_id: Memory Bank ID (from path)
+            document_id: Document ID (from path)
+            limit: Maximum number of chunks to return (default: 100)
+            offset: Offset for pagination (default: 0)
+        """
+        try:
+            result = await app.state.memory.list_document_chunks(
+                bank_id=bank_id,
+                document_id=document_id,
+                limit=limit,
+                offset=offset,
+                request_context=request_context,
+            )
+            if result is None:
+                raise HTTPException(status_code=404, detail="Document not found")
+            return result
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in /v1/default/banks/{bank_id}/documents/{document_id}/chunks: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/documents/{document_id:path}/reprocess",
+        response_model=ReprocessDocumentResponse,
+        summary="Reprocess document",
+        description="Re-run the retain pipeline on an existing document without changing its content. "
+        "This deletes the existing memory units and re-extracts facts using the current engine configuration. "
+        "Useful when the LLM model, chunking strategy, or extraction settings have changed.",
+        operation_id="reprocess_document",
+        tags=["Documents"],
+    )
+    @audited("reprocess_document")
+    async def api_reprocess_document(
+        bank_id: str,
+        document_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """
+        Reprocess a document by re-running retain with its existing content and parameters.
+
+        Args:
+            bank_id: Memory Bank ID (from path)
+            document_id: Document ID (from path)
+        """
+        try:
+            result = await app.state.memory.reprocess_document(
+                bank_id=bank_id,
+                document_id=document_id,
+                request_context=request_context,
+            )
+            if result is None:
+                raise HTTPException(status_code=404, detail="Document not found")
+            return ReprocessDocumentResponse(
+                success=True,
+                operation_id=result["operation_id"],
+                items_count=result["items_count"],
+            )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in /v1/default/banks/{bank_id}/documents/{document_id}/reprocess: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get(
         "/v1/default/banks/{bank_id}/documents/{document_id:path}",
         response_model=DocumentResponse,
         summary="Get document details",
@@ -4466,7 +4652,8 @@ def _register_routes(app: FastAPI):
         response_model=ListTagsResponse,
         summary="List tags",
         description="List all unique tags in a memory bank with usage counts. "
-        "Supports wildcard search using '*' (e.g., 'user:*', '*-fred', 'tag*-2'). Case-insensitive.",
+        "Supports wildcard search using '*' (e.g., 'user:*', '*-fred', 'tag*-2'). Case-insensitive. "
+        "Use `source=mental_models` to list tags used on mental models instead of memories.",
         operation_id="list_tags",
         tags=["Memory"],
     )
@@ -4476,6 +4663,10 @@ def _register_routes(app: FastAPI):
             default=None,
             description="Wildcard pattern to filter tags (e.g., 'user:*' for user:alice, '*-admin' for role-admin). "
             "Use '*' as wildcard. Case-insensitive.",
+        ),
+        source: Literal["memories", "mental_models"] = Query(
+            default="memories",
+            description="Where to read tags from: 'memories' (memory_units, default) or 'mental_models'.",
         ),
         limit: int = Query(default=100, description="Maximum number of tags to return"),
         offset: int = Query(default=0, description="Offset for pagination"),
@@ -4493,17 +4684,27 @@ def _register_routes(app: FastAPI):
         Args:
             bank_id: Memory Bank ID (from path)
             q: Wildcard pattern to filter tags (use '*' as wildcard)
+            source: Tag source — 'memories' (memory_units, default) or 'mental_models'
             limit: Maximum number of tags to return (default: 100)
             offset: Offset for pagination (default: 0)
         """
         try:
-            data = await app.state.memory.list_tags(
-                bank_id=bank_id,
-                pattern=q,
-                limit=limit,
-                offset=offset,
-                request_context=request_context,
-            )
+            if source == "mental_models":
+                data = await app.state.memory.list_mental_model_tags(
+                    bank_id=bank_id,
+                    pattern=q,
+                    limit=limit,
+                    offset=offset,
+                    request_context=request_context,
+                )
+            else:
+                data = await app.state.memory.list_tags(
+                    bank_id=bank_id,
+                    pattern=q,
+                    limit=limit,
+                    offset=offset,
+                    request_context=request_context,
+                )
             return data
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
@@ -4654,19 +4855,28 @@ def _register_routes(app: FastAPI):
     )
     async def api_list_operations(
         bank_id: str,
-        status: str | None = Query(default=None, description="Filter by status: pending, completed, or failed"),
+        status: str | None = Query(
+            default=None, description="Filter by status: pending, processing, completed, failed, or cancelled"
+        ),
         type: str | None = Query(
             default=None,
             description="Filter by operation type: retain, consolidation, refresh_mental_model, file_convert_retain, webhook_delivery",
         ),
         limit: int = Query(default=20, ge=1, le=100, description="Maximum number of operations to return"),
         offset: int = Query(default=0, ge=0, description="Number of operations to skip"),
+        exclude_parents: bool = Query(default=False, description="Exclude parent batch operations from results"),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """List async operations for a memory bank with optional filtering and pagination."""
         try:
             result = await app.state.memory.list_operations(
-                bank_id, status=status, task_type=type, limit=limit, offset=offset, request_context=request_context
+                bank_id,
+                status=status,
+                task_type=type,
+                limit=limit,
+                offset=offset,
+                exclude_parents=exclude_parents,
+                request_context=request_context,
             )
             return OperationsListResponse(
                 bank_id=bank_id,
@@ -4800,7 +5010,7 @@ def _register_routes(app: FastAPI):
         "/v1/default/banks/{bank_id}/profile",
         response_model=BankProfileResponse,
         summary="Get memory bank profile",
-        description="Get disposition traits and mission for a memory bank. Auto-creates agent with defaults if not exists.",
+        description="Get disposition traits and mission for a memory bank. Returns 404 if the bank does not exist.",
         operation_id="get_bank_profile",
         tags=["Banks"],
         deprecated=True,
@@ -4808,7 +5018,15 @@ def _register_routes(app: FastAPI):
     async def api_get_bank_profile(bank_id: str, request_context: RequestContext = Depends(get_request_context)):
         """Get memory bank profile (disposition + mission)."""
         try:
-            profile = await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
+            # Read endpoints must not have create-as-side-effect: a client
+            # holding onto a stale bank_id (e.g., a UI polling after the user
+            # changed context) would otherwise silently re-create the bank in
+            # an unrelated tenant. Surface a missing bank as 404.
+            profile = await app.state.memory.get_bank_profile(
+                bank_id, request_context=request_context, create_if_missing=False
+            )
+            if profile is None:
+                raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
             # Convert DispositionTraits object to dict for Pydantic
             disposition_dict = (
                 profile["disposition"].model_dump()
@@ -5144,8 +5362,10 @@ def _register_routes(app: FastAPI):
     ):
         """Export a bank's config and mental models as a template manifest."""
         try:
-            # Authenticate and ensure bank exists
-            profile = await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
+            # Read endpoint: do not auto-create on missing bank.
+            profile = await app.state.memory.get_bank_profile(
+                bank_id, request_context=request_context, create_if_missing=False
+            )
             if profile is None:
                 raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
 
@@ -5511,45 +5731,41 @@ def _register_routes(app: FastAPI):
     ):
         """Register a webhook for a bank."""
         try:
-            pool = await app.state.memory._get_pool()
-            from hindsight_api.engine.memory_engine import fq_table
-            from hindsight_api.engine.retain import bank_utils
-
-            # Ensure the bank row exists before inserting into webhooks (FK constraint).
-            _, created = await bank_utils.get_or_create_bank_profile(pool, bank_id)
-            if created:
-                await app.state.memory._apply_default_bank_template(bank_id, request_context)
-
             webhook_id = uuid.uuid4()
-            now = datetime.now(timezone.utc).isoformat()
-            row = await pool.fetchrow(
-                f"""
-                INSERT INTO {fq_table("webhooks")}
-                (id, bank_id, url, secret, event_types, enabled, http_config, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NOW(), NOW())
-                RETURNING id, bank_id, url, secret, event_types, enabled,
-                          http_config::text, created_at::text, updated_at::text
-                """,
-                webhook_id,
+            row = await app.state.memory.create_webhook(
                 bank_id,
-                request.url,
-                request.secret,
-                request.event_types,
-                request.enabled,
-                request.http_config.model_dump_json(),
+                webhook_id=webhook_id,
+                url=request.url,
+                secret=request.secret,
+                event_types=request.event_types,
+                enabled=request.enabled,
+                http_config_json=request.http_config.model_dump_json(),
+                request_context=request_context,
             )
+
+            event_types_val = row["event_types"] if row else []
+            if isinstance(event_types_val, str):
+                event_types_val = json.loads(event_types_val)
+            http_config_val = row["http_config"] if row else None
+            if isinstance(http_config_val, dict):
+                http_config_val = json.dumps(http_config_val)
+
             return WebhookResponse(
                 id=str(row["id"]),
                 bank_id=row["bank_id"],
                 url=row["url"],
                 secret=None,  # Never return secret in responses
-                event_types=list(row["event_types"]) if row["event_types"] else [],
-                enabled=row["enabled"],
-                http_config=WebhookHttpConfig.model_validate_json(row["http_config"])
-                if row["http_config"]
+                event_types=list(event_types_val) if event_types_val else [],
+                enabled=bool(row["enabled"]),
+                http_config=WebhookHttpConfig.model_validate_json(http_config_val)
+                if http_config_val
                 else WebhookHttpConfig(),
-                created_at=row["created_at"],
-                updated_at=row["updated_at"],
+                created_at=row["created_at"].isoformat()
+                if hasattr(row["created_at"], "isoformat")
+                else str(row["created_at"]),
+                updated_at=row["updated_at"].isoformat()
+                if hasattr(row["updated_at"], "isoformat")
+                else str(row["updated_at"]),
             )
         except (AuthenticationError, HTTPException):
             raise
@@ -5574,37 +5790,37 @@ def _register_routes(app: FastAPI):
     ):
         """List webhooks for a bank."""
         try:
-            pool = await app.state.memory._get_pool()
-            from hindsight_api.engine.memory_engine import fq_table
-
-            rows = await pool.fetch(
-                f"""
-                SELECT id, bank_id, url, secret, event_types, enabled,
-                       http_config::text, created_at::text, updated_at::text
-                FROM {fq_table("webhooks")}
-                WHERE bank_id = $1
-                ORDER BY created_at
-                """,
+            rows = await app.state.memory.list_webhooks(
                 bank_id,
+                request_context=request_context,
             )
-            return WebhookListResponse(
-                items=[
-                    WebhookResponse(
-                        id=str(row["id"]),
-                        bank_id=row["bank_id"],
-                        url=row["url"],
-                        secret=None,  # Never return secret in responses
-                        event_types=list(row["event_types"]) if row["event_types"] else [],
-                        enabled=row["enabled"],
-                        http_config=WebhookHttpConfig.model_validate_json(row["http_config"])
-                        if row["http_config"]
-                        else WebhookHttpConfig(),
-                        created_at=row["created_at"],
-                        updated_at=row["updated_at"],
-                    )
-                    for row in rows
-                ]
-            )
+
+            def _parse_webhook_row(row):
+                event_types_val = row["event_types"]
+                if isinstance(event_types_val, str):
+                    event_types_val = json.loads(event_types_val)
+                http_config_val = row["http_config"]
+                if isinstance(http_config_val, dict):
+                    http_config_val = json.dumps(http_config_val)
+                return WebhookResponse(
+                    id=str(row["id"]),
+                    bank_id=row["bank_id"],
+                    url=row["url"],
+                    secret=None,
+                    event_types=list(event_types_val) if event_types_val else [],
+                    enabled=bool(row["enabled"]),
+                    http_config=WebhookHttpConfig.model_validate_json(http_config_val)
+                    if http_config_val
+                    else WebhookHttpConfig(),
+                    created_at=row["created_at"].isoformat()
+                    if hasattr(row["created_at"], "isoformat")
+                    else str(row["created_at"]),
+                    updated_at=row["updated_at"].isoformat()
+                    if hasattr(row["updated_at"], "isoformat")
+                    else str(row["updated_at"]),
+                )
+
+            return WebhookListResponse(items=[_parse_webhook_row(row) for row in rows])
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -5630,16 +5846,12 @@ def _register_routes(app: FastAPI):
     ):
         """Delete a webhook."""
         try:
-            pool = await app.state.memory._get_pool()
-            from hindsight_api.engine.memory_engine import fq_table
-
-            result = await pool.execute(
-                f"DELETE FROM {fq_table('webhooks')} WHERE id = $1 AND bank_id = $2",
-                uuid.UUID(webhook_id),
+            deleted = await app.state.memory.delete_webhook(
                 bank_id,
+                uuid.UUID(webhook_id),
+                request_context=request_context,
             )
-            deleted = int(result.split()[-1]) if result else 0
-            if deleted == 0:
+            if not deleted:
                 raise HTTPException(status_code=404, detail="Webhook not found")
             return DeleteResponse(success=True)
         except (AuthenticationError, HTTPException):
@@ -5668,9 +5880,6 @@ def _register_routes(app: FastAPI):
     ):
         """Update a webhook's fields (PATCH semantics — only sent fields are updated)."""
         try:
-            pool = await app.state.memory._get_pool()
-            from hindsight_api.engine.memory_engine import fq_table
-
             set_clauses: list[str] = []
             params: list = [uuid.UUID(webhook_id), bank_id]
 
@@ -5694,31 +5903,39 @@ def _register_routes(app: FastAPI):
             if not set_clauses:
                 raise HTTPException(status_code=422, detail="No fields provided to update")
 
-            set_clauses.append("updated_at = NOW()")
-            row = await pool.fetchrow(
-                f"""
-                UPDATE {fq_table("webhooks")}
-                SET {", ".join(set_clauses)}
-                WHERE id = $1 AND bank_id = $2
-                RETURNING id, bank_id, url, secret, event_types, enabled,
-                          http_config::text, created_at::text, updated_at::text
-                """,
-                *params,
+            row = await app.state.memory.update_webhook(
+                bank_id,
+                uuid.UUID(webhook_id),
+                set_clauses=set_clauses,
+                params=params,
+                request_context=request_context,
             )
             if not row:
                 raise HTTPException(status_code=404, detail="Webhook not found")
+
+            event_types_val = row["event_types"]
+            if isinstance(event_types_val, str):
+                event_types_val = json.loads(event_types_val)
+            http_config_val = row["http_config"]
+            if isinstance(http_config_val, dict):
+                http_config_val = json.dumps(http_config_val)
+
             return WebhookResponse(
                 id=str(row["id"]),
                 bank_id=row["bank_id"],
                 url=row["url"],
                 secret=None,
-                event_types=list(row["event_types"]) if row["event_types"] else [],
-                enabled=row["enabled"],
-                http_config=WebhookHttpConfig.model_validate_json(row["http_config"])
-                if row["http_config"]
+                event_types=list(event_types_val) if event_types_val else [],
+                enabled=bool(row["enabled"]),
+                http_config=WebhookHttpConfig.model_validate_json(http_config_val)
+                if http_config_val
                 else WebhookHttpConfig(),
-                created_at=row["created_at"],
-                updated_at=row["updated_at"],
+                created_at=row["created_at"].isoformat()
+                if hasattr(row["created_at"], "isoformat")
+                else str(row["created_at"]),
+                updated_at=row["updated_at"].isoformat()
+                if hasattr(row["updated_at"], "isoformat")
+                else str(row["updated_at"]),
             )
         except (AuthenticationError, HTTPException):
             raise
@@ -5746,54 +5963,16 @@ def _register_routes(app: FastAPI):
     ):
         """List deliveries for a specific webhook, newest first. Use next_cursor for pagination."""
         try:
-            pool = await app.state.memory._get_pool()
-            from hindsight_api.engine.memory_engine import fq_table
-
-            # Verify webhook belongs to this bank
-            webhook_row = await pool.fetchrow(
-                f"SELECT id FROM {fq_table('webhooks')} WHERE id = $1 AND bank_id = $2",
-                uuid.UUID(webhook_id),
-                bank_id,
-            )
-            if not webhook_row:
+            try:
+                rows = await app.state.memory.list_webhook_deliveries(
+                    bank_id,
+                    uuid.UUID(webhook_id),
+                    limit=limit,
+                    cursor=cursor,
+                    request_context=request_context,
+                )
+            except LookupError:
                 raise HTTPException(status_code=404, detail="Webhook not found")
-
-            # Fetch limit+1 to detect if there's a next page
-            fetch_limit = limit + 1
-            if cursor:
-                rows = await pool.fetch(
-                    f"""
-                    SELECT operation_id, status, retry_count, next_retry_at::text,
-                           error_message, task_payload, result_metadata::text, created_at::text, updated_at::text
-                    FROM {fq_table("async_operations")}
-                    WHERE operation_type = 'webhook_delivery'
-                      AND bank_id = $1
-                      AND task_payload->>'webhook_id' = $2
-                      AND created_at < $3::timestamptz
-                    ORDER BY created_at DESC
-                    LIMIT $4
-                    """,
-                    bank_id,
-                    webhook_id,
-                    cursor,
-                    fetch_limit,
-                )
-            else:
-                rows = await pool.fetch(
-                    f"""
-                    SELECT operation_id, status, retry_count, next_retry_at::text,
-                           error_message, task_payload, result_metadata::text, created_at::text, updated_at::text
-                    FROM {fq_table("async_operations")}
-                    WHERE operation_type = 'webhook_delivery'
-                      AND bank_id = $1
-                      AND task_payload->>'webhook_id' = $2
-                    ORDER BY created_at DESC
-                    LIMIT $3
-                    """,
-                    bank_id,
-                    webhook_id,
-                    fetch_limit,
-                )
 
             has_more = len(rows) > limit
             page = rows[:limit]
@@ -6242,10 +6421,16 @@ def _register_routes(app: FastAPI):
         try:
             from hindsight_api.engine.memory_engine import fq_table
 
-            pool = await app.state.memory._get_pool()
+            pool = await app.state.memory._get_backend()
 
-            # Ensure bank exists
-            await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
+            # Read endpoint: verify bank exists without auto-creating it.
+            if (
+                await app.state.memory.get_bank_profile(
+                    bank_id, request_context=request_context, create_if_missing=False
+                )
+                is None
+            ):
+                raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
 
             from hindsight_api.engine.db_utils import acquire_with_retry
 
@@ -6304,8 +6489,27 @@ def _register_routes(app: FastAPI):
                 items = []
                 for row in rows:
                     duration_ms = None
-                    if row["started_at"] and row["ended_at"]:
-                        duration_ms = int((row["ended_at"] - row["started_at"]).total_seconds() * 1000)
+                    started = row["started_at"]
+                    ended = row["ended_at"]
+                    if started and ended and hasattr(started, "total_seconds"):
+                        duration_ms = int((ended - started).total_seconds() * 1000)
+                    elif started and ended:
+                        try:
+                            duration_ms = int((ended - started).total_seconds() * 1000)
+                        except (TypeError, AttributeError):
+                            pass
+
+                    def _safe_iso(val):
+                        if val is None:
+                            return None
+                        return val.isoformat() if hasattr(val, "isoformat") else str(val)
+
+                    def _safe_json(val):
+                        if val is None:
+                            return None
+                        if isinstance(val, dict):
+                            return val
+                        return json.loads(val) if isinstance(val, str) else val
 
                     items.append(
                         {
@@ -6313,12 +6517,12 @@ def _register_routes(app: FastAPI):
                             "action": row["action"],
                             "transport": row["transport"],
                             "bank_id": row["bank_id"],
-                            "started_at": row["started_at"].isoformat() if row["started_at"] else None,
-                            "ended_at": row["ended_at"].isoformat() if row["ended_at"] else None,
+                            "started_at": _safe_iso(started),
+                            "ended_at": _safe_iso(ended),
                             "duration_ms": duration_ms,
-                            "request": json.loads(row["request"]) if row["request"] else None,
-                            "response": json.loads(row["response"]) if row["response"] else None,
-                            "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+                            "request": _safe_json(row["request"]),
+                            "response": _safe_json(row["response"]),
+                            "metadata": _safe_json(row["metadata"]) or {},
                         }
                     )
 
@@ -6358,8 +6562,15 @@ def _register_routes(app: FastAPI):
             from hindsight_api.engine.db_utils import acquire_with_retry
             from hindsight_api.engine.memory_engine import fq_table
 
-            pool = await app.state.memory._get_pool()
-            await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
+            pool = await app.state.memory._get_backend()
+            # Read endpoint: verify bank exists without auto-creating it.
+            if (
+                await app.state.memory.get_bank_profile(
+                    bank_id, request_context=request_context, create_if_missing=False
+                )
+                is None
+            ):
+                raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
 
             # Determine time range (always per-day buckets)
             from datetime import timedelta as _td

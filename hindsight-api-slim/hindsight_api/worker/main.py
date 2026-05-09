@@ -16,9 +16,10 @@ import signal
 import socket
 import sys
 import warnings
+from collections.abc import Callable
 
 from ..config import get_config
-from ..engine.task_backend import SyncTaskBackend
+from ..engine.task_backend import WorkerTaskBackend
 from .poller import WorkerPoller
 
 # Filter deprecation warnings from third-party libraries
@@ -29,6 +30,26 @@ warnings.filterwarnings("ignore", message="websockets.server.WebSocketServerProt
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logger = logging.getLogger(__name__)
+
+
+def _install_shutdown_signal_handlers(
+    loop: asyncio.AbstractEventLoop,
+    handler: Callable[[], None],
+) -> bool:
+    """Register SIGINT/SIGTERM handlers on the asyncio loop.
+
+    Returns True when handlers were installed via ``loop.add_signal_handler``.
+    Returns False on platforms (Windows ProactorEventLoop) where asyncio
+    does not implement signal handlers; the caller falls back to Python's
+    default SIGINT behavior, which still terminates the process on Ctrl+C
+    but loses the in-loop two-stage graceful shutdown.
+    """
+    try:
+        loop.add_signal_handler(signal.SIGINT, handler)
+        loop.add_signal_handler(signal.SIGTERM, handler)
+    except NotImplementedError:
+        return False
+    return True
 
 
 def create_worker_app(poller: WorkerPoller, memory):
@@ -164,7 +185,11 @@ def main():
     print(f"  Poll interval: {args.poll_interval}ms")
     print(f"  Max retries: {args.max_retries}")
     print(f"  Max slots: {config.worker_max_slots}")
-    print(f"  Consolidation max slots: {config.worker_consolidation_max_slots}")
+    reservations = config.worker_slot_reservations
+    reservations_str = ", ".join(f"{k}={v}" for k, v in reservations.items()) if reservations else "none"
+    shared_pool = max(0, config.worker_max_slots - sum(reservations.values()))
+    print(f"  Slot reservations: {reservations_str}")
+    print(f"  Shared pool: {shared_pool}")
     print(f"  HTTP server: {args.http_host}:{args.http_port}")
     print()
 
@@ -191,11 +216,13 @@ def main():
             logger.info(f"Loaded operation validator: {operation_validator.__class__.__name__}")
 
         # Initialize MemoryEngine
-        # Workers use SyncTaskBackend because they execute tasks directly,
-        # they don't need to store tasks (they poll from DB)
+        # Workers use WorkerTaskBackend: submit_task is a no-op because the
+        # row already exists in async_operations.  Child tasks (e.g. consolidation
+        # triggered by retain) will be picked up by the poller on the next cycle
+        # instead of being executed inline, which avoids blocking the parent task.
         memory = MemoryEngine(
             run_migrations=False,  # Workers don't run migrations
-            task_backend=SyncTaskBackend(),
+            task_backend=WorkerTaskBackend(),
             tenant_extension=tenant_extension,
             operation_validator=operation_validator,
         )
@@ -209,20 +236,26 @@ def main():
         else:
             print(f"No tenant extension configured, using schema: {config.database_schema}")
 
+        # Check if the backend supports the async worker/poller.
+        if not memory._backend.supports_worker_poller:
+            print("ERROR: Standalone worker is not supported on this database backend.")
+            print("Operations run synchronously within the API process.")
+            sys.exit(1)
+
         # Create a single poller that handles all schemas dynamically
         # Convert default schema to None for SQL compatibility (no schema prefix)
         from hindsight_api.config import DEFAULT_DATABASE_SCHEMA
 
         schema = None if config.database_schema == DEFAULT_DATABASE_SCHEMA else config.database_schema
         poller = WorkerPoller(
-            pool=memory._pool,
+            backend=memory._backend,
             worker_id=args.worker_id,
             executor=memory.execute_task,
             poll_interval_ms=args.poll_interval,
             schema=schema,
             tenant_extension=tenant_extension,
             max_slots=config.worker_max_slots,
-            consolidation_max_slots=config.worker_consolidation_max_slots,
+            slot_reservations=config.worker_slot_reservations,
         )
 
         # Create the HTTP app for metrics/health
@@ -231,6 +264,7 @@ def main():
         # Setup signal handlers for graceful shutdown using asyncio
         shutdown_requested = asyncio.Event()
         force_exit = False
+        async_handlers_installed = False
 
         loop = asyncio.get_event_loop()
 
@@ -241,17 +275,26 @@ def main():
                 print("\nReceived second signal, forcing immediate exit...")
                 force_exit = True
                 # Restore default handler so third signal kills process
-                loop.remove_signal_handler(signal.SIGINT)
-                loop.remove_signal_handler(signal.SIGTERM)
+                if async_handlers_installed:
+                    loop.remove_signal_handler(signal.SIGINT)
+                    loop.remove_signal_handler(signal.SIGTERM)
                 sys.exit(1)
             else:
                 print("\nReceived shutdown signal, initiating graceful shutdown...")
                 print("(Press Ctrl+C again to force immediate exit)")
                 shutdown_requested.set()
 
-        # Use asyncio's signal handlers which work properly with the event loop
-        loop.add_signal_handler(signal.SIGINT, signal_handler)
-        loop.add_signal_handler(signal.SIGTERM, signal_handler)
+        async_handlers_installed = _install_shutdown_signal_handlers(loop, signal_handler)
+        if not async_handlers_installed:
+            # Windows ProactorEventLoop: asyncio.add_signal_handler is Unix-only
+            # and raises NotImplementedError. Default Python SIGINT handler still
+            # terminates the worker on Ctrl+C, just without the two-stage path.
+            print(
+                f"WARN: asyncio signal handlers unavailable on this platform "
+                f"({sys.platform}); graceful two-stage shutdown disabled, "
+                f"default Python SIGINT handler remains active.",
+                flush=True,
+            )
 
         # Create uvicorn config and server
         uvicorn_config = uvicorn.Config(

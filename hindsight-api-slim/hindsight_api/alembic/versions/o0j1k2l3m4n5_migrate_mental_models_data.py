@@ -16,6 +16,8 @@ from collections.abc import Sequence
 
 from alembic import context, op
 
+from hindsight_api.alembic._dialect import run_for_dialect
+
 # revision identifiers, used by Alembic.
 revision: str = "o0j1k2l3m4n5"
 down_revision: str | Sequence[str] | None = "n9i0j1k2l3m4"
@@ -29,7 +31,7 @@ def _get_schema_prefix() -> str:
     return f'"{schema}".' if schema else ""
 
 
-def upgrade() -> None:
+def _pg_upgrade() -> None:
     """Migrate data and clean up old mental models."""
     schema = _get_schema_prefix()
 
@@ -80,15 +82,17 @@ def upgrade() -> None:
     # 4. Drop the mental_model_versions table (no longer used)
     op.execute(f"DROP TABLE IF EXISTS {schema}mental_model_versions CASCADE")
 
-    # 5. Drop old constraints and add new one that only allows 'directive'
+    # 5. Drop old constraints and add new one that allows current subtypes.
+    # 'pinned' is still used by the code for user-created mental models;
+    # 'directive' is used for system directives.
     op.execute(f"ALTER TABLE {schema}mental_models DROP CONSTRAINT IF EXISTS ck_mental_models_subtype")
     op.execute(f"""
         ALTER TABLE {schema}mental_models
-        ADD CONSTRAINT ck_mental_models_subtype CHECK (subtype = 'directive')
+        ADD CONSTRAINT ck_mental_models_subtype CHECK (subtype IN ('directive', 'pinned'))
     """)
 
 
-def downgrade() -> None:
+def _pg_downgrade() -> None:
     """Reverse the migration (data migration is one-way, so this just removes constraints)."""
     schema = _get_schema_prefix()
 
@@ -111,3 +115,11 @@ def downgrade() -> None:
     )
 
     # Note: Data migration cannot be reversed - pinned_reflections and learnings data remains
+
+
+def upgrade() -> None:
+    run_for_dialect(pg=_pg_upgrade)
+
+
+def downgrade() -> None:
+    run_for_dialect(pg=_pg_downgrade)

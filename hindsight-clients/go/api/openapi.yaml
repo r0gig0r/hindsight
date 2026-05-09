@@ -7,7 +7,7 @@ info:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0.html
   title: Hindsight HTTP API
-  version: 0.5.3
+  version: 0.6.1
 servers:
 - url: /
 paths:
@@ -109,6 +109,22 @@ paths:
         schema:
           default: all_strict
           title: Tags Match
+          type: string
+        style: form
+      - explode: true
+        in: query
+        name: document_id
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      - explode: true
+        in: query
+        name: chunk_id
+        required: false
+        schema:
+          nullable: true
           type: string
         style: form
       - explode: false
@@ -493,6 +509,23 @@ paths:
         schema:
           default: 7d
           title: Period
+          type: string
+        style: form
+      - description: "Timestamp column to bucket on. `created_at` (default) = ingest\
+          \ time; `mentioned_at` / `occurred_start` = event time, useful for migrated\
+          \ corpora where ingest time is a single point and doesn't reflect the underlying\
+          \ knowledge timeline. Unknown values fall back to `created_at`."
+        explode: true
+        in: query
+        name: time_field
+        required: false
+        schema:
+          default: created_at
+          description: "Timestamp column to bucket on. `created_at` (default) = ingest\
+            \ time; `mentioned_at` / `occurred_start` = event time, useful for migrated\
+            \ corpora where ingest time is a single point and doesn't reflect the\
+            \ underlying knowledge timeline. Unknown values fall back to `created_at`."
+          title: Time Field
           type: string
         style: form
       - explode: false
@@ -1487,6 +1520,124 @@ paths:
       summary: List documents
       tags:
       - Documents
+  /v1/default/banks/{bank_id}/documents/{document_id}/chunks:
+    get:
+      description: "List all chunks for a given document, ordered by chunk index."
+      operationId: list_document_chunks
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: document_id
+        required: true
+        schema:
+          title: Document Id
+          type: string
+        style: simple
+      - description: Maximum number of chunks to return
+        explode: true
+        in: query
+        name: limit
+        required: false
+        schema:
+          default: 100
+          description: Maximum number of chunks to return
+          maximum: 1000
+          minimum: 1
+          title: Limit
+          type: integer
+        style: form
+      - description: Offset for pagination
+        explode: true
+        in: query
+        name: offset
+        required: false
+        schema:
+          default: 0
+          description: Offset for pagination
+          minimum: 0
+          title: Offset
+          type: integer
+        style: form
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListChunksResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: List document chunks
+      tags:
+      - Documents
+  /v1/default/banks/{bank_id}/documents/{document_id}/reprocess:
+    post:
+      description: "Re-run the retain pipeline on an existing document without changing\
+        \ its content. This deletes the existing memory units and re-extracts facts\
+        \ using the current engine configuration. Useful when the LLM model, chunking\
+        \ strategy, or extraction settings have changed."
+      operationId: reprocess_document
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: document_id
+        required: true
+        schema:
+          title: Document Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReprocessDocumentResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Reprocess document
+      tags:
+      - Documents
   /v1/default/banks/{bank_id}/documents/{document_id}:
     delete:
       description: |-
@@ -1642,7 +1793,9 @@ paths:
   /v1/default/banks/{bank_id}/tags:
     get:
       description: "List all unique tags in a memory bank with usage counts. Supports\
-        \ wildcard search using '*' (e.g., 'user:*', '*-fred', 'tag*-2'). Case-insensitive."
+        \ wildcard search using '*' (e.g., 'user:*', '*-fred', 'tag*-2'). Case-insensitive.\
+        \ Use `source=mental_models` to list tags used on mental models instead of\
+        \ memories."
       operationId: list_tags
       parameters:
       - explode: false
@@ -1661,6 +1814,22 @@ paths:
         required: false
         schema:
           nullable: true
+          type: string
+        style: form
+      - description: "Where to read tags from: 'memories' (memory_units, default)\
+          \ or 'mental_models'."
+        explode: true
+        in: query
+        name: source
+        required: false
+        schema:
+          default: memories
+          description: "Where to read tags from: 'memories' (memory_units, default)\
+            \ or 'mental_models'."
+          enum:
+          - memories
+          - mental_models
+          title: Source
           type: string
         style: form
       - description: Maximum number of tags to return
@@ -1761,7 +1930,8 @@ paths:
           title: Bank Id
           type: string
         style: simple
-      - description: "Filter by status: pending, completed, or failed"
+      - description: "Filter by status: pending, processing, completed, failed, or\
+          \ cancelled"
         explode: true
         in: query
         name: status
@@ -1804,6 +1974,17 @@ paths:
           minimum: 0
           title: Offset
           type: integer
+        style: form
+      - description: Exclude parent batch operations from results
+        explode: true
+        in: query
+        name: exclude_parents
+        required: false
+        schema:
+          default: false
+          description: Exclude parent batch operations from results
+          title: Exclude Parents
+          type: boolean
         style: form
       - explode: false
         in: header
@@ -1981,8 +2162,8 @@ paths:
   /v1/default/banks/{bank_id}/profile:
     get:
       deprecated: true
-      description: Get disposition traits and mission for a memory bank. Auto-creates
-        agent with defaults if not exists.
+      description: Get disposition traits and mission for a memory bank. Returns 404
+        if the bank does not exist.
       operationId: get_bank_profile
       parameters:
       - explode: false
@@ -3485,7 +3666,7 @@ components:
       - updates
       title: BankConfigUpdate
     BankListItem:
-      description: Bank list item with profile summary.
+      description: Bank list item with profile summary and stats.
       properties:
         bank_id:
           title: Bank Id
@@ -3504,6 +3685,13 @@ components:
         updated_at:
           nullable: true
           type: string
+        fact_count:
+          default: 0
+          title: Fact Count
+          type: integer
+        last_document_at:
+          nullable: true
+          type: string
       required:
       - bank_id
       - disposition
@@ -3518,6 +3706,8 @@ components:
             empathy: 3
             literalism: 3
             skepticism: 3
+          fact_count: 156
+          last_document_at: 2024-01-16T14:20:00Z
           mission: I am a software engineer helping my team ship quality code
           name: Alice
           updated_at: 2024-01-16T14:20:00Z
@@ -3632,8 +3822,8 @@ components:
         operations_by_status:
           additionalProperties:
             type: integer
-          description: "Async operations grouped by status (pending, in_progress,\
-            \ completed, failed, cancelled)."
+          description: "Async operations grouped by status (pending, processing, completed,\
+            \ failed, cancelled)."
           title: Operations By Status
         last_consolidated_at:
           nullable: true
@@ -4521,6 +4711,10 @@ components:
         memory_unit_count:
           title: Memory Unit Count
           type: integer
+        nodes_by_fact_type:
+          additionalProperties:
+            type: integer
+          nullable: true
         tags:
           default: []
           description: Tags associated with this document
@@ -4886,6 +5080,45 @@ components:
         source_facts:
           $ref: '#/components/schemas/SourceFactsIncludeOptions'
       title: IncludeOptions
+    ListChunksResponse:
+      description: Response model for listing chunks of a document.
+      example:
+        total: 0
+        offset: 1
+        limit: 6
+        items:
+        - bank_id: user123
+          chunk_id: user123_session_1_0
+          chunk_index: 0
+          chunk_text: This is the first chunk of the document...
+          created_at: 2024-01-15T10:30:00Z
+          document_id: session_1
+        - bank_id: user123
+          chunk_id: user123_session_1_0
+          chunk_index: 0
+          chunk_text: This is the first chunk of the document...
+          created_at: 2024-01-15T10:30:00Z
+          document_id: session_1
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ChunkResponse'
+          type: array
+        total:
+          title: Total
+          type: integer
+        limit:
+          title: Limit
+          type: integer
+        offset:
+          title: Offset
+          type: integer
+      required:
+      - items
+      - limit
+      - offset
+      - total
+      title: ListChunksResponse
     ListDocumentsResponse:
       description: Response model for list documents endpoint.
       example:
@@ -4992,6 +5225,7 @@ components:
     MemoriesTimeseriesResponse:
       description: Time-series of memory ingestion bucketed by time and fact type.
       example:
+        time_field: created_at
         period: period
         trunc: trunc
         bank_id: bank_id
@@ -5015,6 +5249,13 @@ components:
         trunc:
           description: "Bucket granularity: minute, hour, day."
           title: Trunc
+          type: string
+        time_field:
+          default: created_at
+          description: Timestamp column used to assign each row to a bucket. `created_at`
+            shows ingest time; `mentioned_at` / `occurred_start` show event time (falls
+            back to `created_at` per row when null).
+          title: Time Field
           type: string
         buckets:
           description: "Per-bucket counts, always returned fully padded for the requested\
@@ -5442,6 +5683,7 @@ components:
         created_at: 2024-01-15T10:30:00Z
         id: 550e8400-e29b-41d4-a716-446655440000
         items_count: 5
+        retry_count: 0
         status: pending
         task_type: retain
       properties:
@@ -5464,6 +5706,12 @@ components:
           title: Status
           type: string
         error_message:
+          nullable: true
+          type: string
+        retry_count:
+          nullable: true
+          type: integer
+        next_retry_at:
           nullable: true
           type: string
       required:
@@ -5490,8 +5738,10 @@ components:
         status:
           enum:
           - pending
+          - processing
           - completed
           - failed
+          - cancelled
           - not_found
           title: Status
           type: string
@@ -5508,6 +5758,12 @@ components:
           nullable: true
           type: string
         error_message:
+          nullable: true
+          type: string
+        retry_count:
+          nullable: true
+          type: integer
+        next_retry_at:
           nullable: true
           type: string
         result_metadata:
@@ -6073,6 +6329,27 @@ components:
             $ref: '#/components/schemas/ReflectLLMCall'
           type: array
       title: ReflectTrace
+    ReprocessDocumentResponse:
+      description: Response model for reprocess document endpoint.
+      example:
+        items_count: 0
+        success: true
+        operation_id: operation_id
+      properties:
+        success:
+          title: Success
+          type: boolean
+        operation_id:
+          title: Operation Id
+          type: string
+        items_count:
+          title: Items Count
+          type: integer
+      required:
+      - items_count
+      - operation_id
+      - success
+      title: ReprocessDocumentResponse
     RetainRequest:
       description: Request model for retain endpoint.
       example:

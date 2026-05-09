@@ -81,6 +81,26 @@
       "icon": "/img/icons/mcp.png"
     },
     {
+      "id": "chatgpt",
+      "name": "ChatGPT",
+      "description": "Add persistent long-term memory to ChatGPT via OAuth-secured MCP connectors. Store insights from conversations and recall relevant context across sessions.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "tool",
+      "link": "/sdks/integrations/chatgpt",
+      "icon": "/img/icons/chatgpt.png"
+    },
+    {
+      "id": "perplexity",
+      "name": "Perplexity",
+      "description": "Add persistent long-term memory to Perplexity via OAuth-secured MCP connectors. Store research findings and recall relevant context across searches.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "tool",
+      "link": "/sdks/integrations/perplexity",
+      "icon": "/img/icons/perplexity.png"
+    },
+    {
       "id": "claude-code",
       "name": "Claude Code",
       "description": "Automatic long-term memory for Claude Code via Hindsight hooks. Captures every conversation, recalls relevant context on every prompt.",
@@ -191,6 +211,16 @@
       "icon": "/img/icons/opencode.svg"
     },
     {
+      "id": "n8n",
+      "name": "n8n",
+      "description": "Persistent memory community node for n8n workflows. Retain, recall, and reflect operations drop into any workflow alongside Slack, Sheets, OpenAI, and 400+ other integrations.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "framework",
+      "link": "/sdks/integrations/n8n",
+      "icon": "/img/icons/n8n.svg"
+    },
+    {
       "id": "openai-agents",
       "name": "OpenAI Agents SDK",
       "description": "Give OpenAI Agents SDK agents persistent long-term memory with Hindsight FunctionTool instances for retain, recall, and reflect.",
@@ -199,6 +229,46 @@
       "category": "framework",
       "link": "/sdks/integrations/openai-agents",
       "icon": "/img/icons/openai-agents.svg"
+    },
+    {
+      "id": "pipecat",
+      "name": "Pipecat",
+      "description": "Persistent memory for Pipecat voice AI pipelines via a FrameProcessor that recalls context before each turn and retains conversation content after.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "tool",
+      "link": "/sdks/integrations/pipecat",
+      "icon": "/img/icons/pipecat.png"
+    },
+    {
+      "id": "agentcore",
+      "name": "Bedrock AgentCore",
+      "description": "Persistent memory for Amazon Bedrock AgentCore Runtime agents. Memory survives ephemeral Runtime sessions so agents remember users, decisions, and context across reprovisioning.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "framework",
+      "link": "/sdks/integrations/agentcore",
+      "icon": "/img/icons/agentcore.png"
+    },
+    {
+      "id": "smolagents",
+      "name": "SmolAgents",
+      "description": "Give HuggingFace SmolAgents persistent long-term memory with Hindsight retain, recall, and reflect tools.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "framework",
+      "link": "/sdks/integrations/smolagents",
+      "icon": "/img/icons/smolagents.png"
+    },
+    {
+      "id": "dify",
+      "name": "Dify",
+      "description": "Persistent memory plugin for Dify workflows. Retain, Recall, and Reflect tools drop into any chatflow or agent app alongside Dify's other LLM and tool nodes.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "framework",
+      "link": "/sdks/integrations/dify",
+      "icon": "/img/icons/dify.png"
     },
     {
       "id": "hindclaw",
@@ -215,7 +285,7 @@
       "name": "ContextForge",
       "description": "Register Hindsight as an MCP backend in ContextForge gateway. Gives every connected AI tool access to long-term memory via a unified MCP hub.",
       "type": "community",
-      "by": "anderapartners",
+      "by": "omarouldali",
       "category": "mcp",
       "link": "/sdks/integrations/context-forge",
       "icon": "/img/icons/mcp.png"

@@ -15,14 +15,41 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ...worker.stage import set_stage
+from ..db.base import DatabaseBackend
 from ..db_utils import acquire_with_retry
-from ..memory_engine import fq_table
+from ..memory_engine import count_tokens, fq_table
 from . import bank_utils
 
 
 def utcnow():
     """Get current UTC time."""
     return datetime.now(UTC)
+
+
+def _merge_processed_content_tokens(a: int | None, b: int | None) -> int | None:
+    """Combine the processed-content-tokens signal across sub-results.
+
+    Semantics (see RetainResult.processed_content_tokens):
+      * None means "this part of the retain did not go through chunk-level
+        dedup" — i.e. the entire submitted payload was processed. If any
+        sub-result is None, the aggregate is None so callers conservatively
+        bill the full content.
+      * Otherwise, accumulate the int values.
+    """
+    if a is None or b is None:
+        return None
+    return a + b
+
+
+def _count_delta_content_tokens(delta_contents: list["RetainContent"]) -> int:
+    """Sum content + context tokens across the chunk items that were
+    actually fed into the extraction pipeline on a partial-delta retain.
+    """
+    total = 0
+    for c in delta_contents:
+        total += count_tokens(c.content or "")
+        total += count_tokens(c.context or "")
+    return total
 
 
 def parse_datetime_flexible(value: Any) -> datetime:
@@ -115,7 +142,7 @@ def _build_retain_params(contents_dicts, document_tags=None, doc_contents=None):
 
 
 async def _pre_resolve_phase1(
-    pool,
+    pool: Any,
     entity_resolver,
     bank_id: str,
     contents: list[RetainContent],
@@ -260,6 +287,7 @@ async def _insert_facts_and_links(
     semantic_ann_links: list[tuple],
     skip_semantic_links: bool = False,
     outbox_callback=None,
+    ops=None,
 ) -> tuple[list[list[str]], Phase3Context]:
     """
     Phase 2 of the retain pipeline: insert facts and retrieval-critical links.
@@ -272,7 +300,7 @@ async def _insert_facts_and_links(
     Entity link building is deferred to Phase 3 (post-transaction, best-effort).
     """
     set_stage("retain.phase2.insert_facts")
-    unit_ids = await fact_storage.insert_facts_batch(conn, bank_id, processed_facts)
+    unit_ids = await fact_storage.insert_facts_batch(conn, bank_id, processed_facts, ops=ops)
     step_start = time.time()
     log_buffer.append(f"  Insert facts: {len(unit_ids)} units in {time.time() - step_start:.3f}s")
 
@@ -288,10 +316,12 @@ async def _insert_facts_and_links(
         )
         # Update semantic_ann_links with remapped IDs for Phase 2
         semantic_ann_links = remapped_semantic
-        # INSERT unit_entities (FK to memory_units, must be in transaction)
+        # INSERT unit_entities (FK to memory_units, must be in transaction).
+        # Pass fact_date alongside so entity_cooccurrences.last_cooccurred
+        # tracks the event timeline, not the ingest moment.
         unit_entity_pairs = [
-            (unit_id, resolved_entity_ids[idx])
-            for idx, (unit_id, _local_idx, _fact_date) in enumerate(remapped_entity_to_unit)
+            (unit_id, resolved_entity_ids[idx], fact_date)
+            for idx, (unit_id, _local_idx, fact_date) in enumerate(remapped_entity_to_unit)
         ]
         await entity_resolver.link_units_to_entities_batch(unit_entity_pairs, conn=conn)
         log_buffer.append(f"  Insert unit_entities: {len(unit_entity_pairs)} pairs in {time.time() - step_start:.3f}s")
@@ -305,7 +335,7 @@ async def _insert_facts_and_links(
 
         # Create temporal links
         step_start = time.time()
-        temporal_link_count = await link_creation.create_temporal_links_batch(conn, bank_id, unit_ids)
+        temporal_link_count = await link_creation.create_temporal_links_batch(conn, bank_id, unit_ids, ops=ops)
         log_buffer.append(f"  Temporal links: {temporal_link_count} links in {time.time() - step_start:.3f}s")
 
         # Create semantic links (within-batch + pre-computed ANN from Phase 1)
@@ -321,6 +351,7 @@ async def _insert_facts_and_links(
                 unit_ids,
                 embeddings_for_links,
                 pre_computed_ann_links=semantic_ann_links,
+                ops=ops,
             )
             log_buffer.append(f"  Semantic links: {semantic_link_count} links in {time.time() - step_start:.3f}s")
 
@@ -330,7 +361,9 @@ async def _insert_facts_and_links(
 
         # Create causal links
         step_start = time.time()
-        causal_link_count = await link_creation.create_causal_links_batch(conn, bank_id, unit_ids, processed_facts)
+        causal_link_count = await link_creation.create_causal_links_batch(
+            conn, bank_id, unit_ids, processed_facts, ops=ops
+        )
         log_buffer.append(f"  Causal links: {causal_link_count} links in {time.time() - step_start:.3f}s")
 
     # Map results back to original content items. Use processed_facts (not
@@ -346,7 +379,7 @@ async def _insert_facts_and_links(
 
 
 async def _build_and_insert_entity_links_phase3(
-    pool,
+    pool: Any,
     entity_resolver,
     bank_id: str,
     phase3_ctx: Phase3Context,
@@ -380,9 +413,10 @@ async def _build_and_insert_entity_links_phase3(
             p3_unit_to_entity_ids,
             log_buffer,
             skip_unit_entities_insert=True,  # Already inserted in Phase 2
+            ops=pool.ops,
         )
         if entity_links:
-            await entity_processing.insert_entity_links_batch(conn, entity_links, bank_id)
+            await entity_processing.insert_entity_links_batch(conn, entity_links, bank_id, ops=pool.ops)
         log_buffer.append(f"  Entity links (viz): {len(entity_links)} links in {time.time() - step_start:.3f}s")
 
 
@@ -395,7 +429,7 @@ async def _extract_and_embed(
     format_date_fn,
     fact_type_override: str | None,
     log_buffer: list[str],
-    pool=None,
+    pool: Any = None,
     operation_id: str | None = None,
     schema: str | None = None,
 ) -> tuple[list, list[ProcessedFact], list[ChunkMetadata], TokenUsage]:
@@ -433,7 +467,7 @@ async def _extract_and_embed(
 
 
 async def retain_batch(
-    pool,
+    pool: Any,
     embeddings_model,
     llm_config,
     entity_resolver,
@@ -450,7 +484,7 @@ async def retain_batch(
     outbox_callback: Callable[["asyncpg.Connection"], Awaitable[None]] | None = None,
     db_semaphore: "asyncio.Semaphore | None" = None,
     duplicate_checker_fn: Callable | None = None,
-) -> tuple[list[list[str]], TokenUsage]:
+) -> tuple[list[list[str]], TokenUsage, int | None]:
     """
     Process a batch of content through the retain pipeline.
 
@@ -460,6 +494,14 @@ async def retain_batch(
 
     (FORK CUSTOMIZATION) duplicate_checker_fn: optional callback for inline dedup.
     Without it, ~10K duplicates/day are created that the nightly cron must clean up.
+
+    Returns a three-tuple of:
+      * per-content-item unit ID lists
+      * aggregate LLM token usage
+      * processed_content_tokens — content+context tokens that actually went
+        through extraction after chunk-level dedup, or ``None`` if this path
+        didn't dedup (caller should treat as "bill full submitted content").
+        See ``RetainResult.processed_content_tokens`` for details.
     """
     start_time = time.time()
     total_chars = sum(len(item.get("content", "")) for item in contents_dicts)
@@ -499,8 +541,9 @@ async def retain_batch(
             # Process each group and merge results back in original order
             result_unit_ids: list[list[str]] = [[] for _ in contents_dicts]
             total_usage = TokenUsage()
+            total_processed_tokens: int | None = 0
             for doc_key, (group_dicts, group_contents) in groups.items():
-                group_ids, group_usage = await retain_batch(
+                group_ids, group_usage, group_processed = await retain_batch(
                     pool=pool,
                     embeddings_model=embeddings_model,
                     llm_config=llm_config,
@@ -523,7 +566,8 @@ async def retain_batch(
                     if group_idx < len(group_ids):
                         result_unit_ids[orig_idx] = group_ids[group_idx]
                 total_usage = total_usage + group_usage
-            return result_unit_ids, total_usage
+                total_processed_tokens = _merge_processed_content_tokens(total_processed_tokens, group_processed)
+            return result_unit_ids, total_usage, total_processed_tokens
 
     # Resolve effective document_id early so both delta and streaming paths
     # can find existing chunks from a prior attempt. On retry, a generated
@@ -611,6 +655,31 @@ async def retain_batch(
                 f"[append] Prepended {len(existing_text):,} chars from existing document {effective_doc_id}"
             )
 
+    # --- Stale-request check (best-effort, before LLM extraction) ---
+    # If the document was already updated by a more recent retain (updated_at > our
+    # start_time), skip this request entirely to avoid overwriting newer content
+    # (e.g. a longer conversation) with older data. This is an optimization — the
+    # real correctness guarantee comes from the FOR UPDATE + content_hash check
+    # inside each batch TXN (see _run_mini_batch_db_work).
+    async with acquire_with_retry(pool) as conn:
+        doc_row = await conn.fetchrow(
+            f"SELECT updated_at FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
+            effective_doc_id,
+            bank_id,
+        )
+    if doc_row and doc_row["updated_at"]:
+        doc_updated = doc_row["updated_at"].timestamp()
+        if doc_updated > start_time:
+            log_buffer.append(
+                f"[stale] Skipping retain: document {effective_doc_id} was updated at "
+                f"{doc_row['updated_at'].isoformat()} (after this request started at "
+                f"{datetime.fromtimestamp(start_time, tz=UTC).isoformat()})"
+            )
+            logger.info("\n" + "\n".join(log_buffer) + "\n")
+            # No new content was processed — report 0 so callers can skip
+            # billing cleanly instead of falling back to full-content billing.
+            return [[] for _ in contents], TokenUsage(), 0
+
     # --- Delta retain: check if we can skip unchanged chunks ---
     if is_first_batch:
         delta_result = await _try_delta_retain(
@@ -649,6 +718,14 @@ async def retain_batch(
         content_chunks = fact_extraction.chunk_text(content.content, chunk_size)
         all_pre_chunks.extend(content_chunks)
         chunk_to_content.extend([content_idx] * len(content_chunks))
+
+    # Memory: after chunking, the original content bodies in RetainContent are
+    # no longer needed (all_pre_chunks holds the working set). Clear them so
+    # Python can reclaim the (potentially multi-MB) strings.
+    # Note: contents_dicts["content"] is still needed briefly for hash computation
+    # inside _streaming_retain_batch, but gets cleared there after use.
+    for content in contents:
+        content.content = ""
 
     total_pre_chunks = len(all_pre_chunks)
     num_batches = (total_pre_chunks + chunk_batch_size - 1) // chunk_batch_size if total_pre_chunks > 0 else 1
@@ -694,7 +771,7 @@ _ANN_PARALLELISM = 4  # Max concurrent ANN chunks to avoid pool saturation
 
 
 async def _run_final_semantic_ann(
-    pool,
+    pool: Any,
     bank_id: str,
     unit_ids: list[str],
     log_buffer: list[str],
@@ -768,7 +845,6 @@ async def _run_final_semantic_ann(
         async with ann_semaphore:
             t0 = time.time()
             async with acquire_with_retry(pool) as conn:
-                await conn.execute("SET statement_timeout = '300s'")
                 ann_links = await compute_semantic_links_ann(
                     conn,
                     bank_id,
@@ -779,9 +855,8 @@ async def _run_final_semantic_ann(
                     log_buffer=log_buffer,
                 )
                 if ann_links:
-                    await _bulk_insert_links(conn, ann_links, bank_id=bank_id)
+                    await _bulk_insert_links(conn, ann_links, bank_id=bank_id, ops=pool.ops)
                 chunk_link_counts[chunk_idx] = len(ann_links)
-                await conn.execute("RESET statement_timeout")
             logger.info(
                 f"[streaming] Final ANN chunk {chunk_idx + 1}/{num_chunks}: "
                 f"{len(ann_links)} links in {time.time() - t0:.3f}s"
@@ -798,7 +873,7 @@ async def _run_final_semantic_ann(
 
 
 async def _streaming_retain_batch(
-    pool,
+    pool: Any,
     embeddings_model,
     llm_config,
     entity_resolver,
@@ -848,25 +923,33 @@ async def _streaming_retain_batch(
     # Default template for metadata (context, event_date, etc.) when content list is empty.
     _default_content = RetainContent(content="")
 
-    # Load existing chunk hashes BEFORE document tracking to detect recovery.
-    # If chunks exist AND the document content hash matches, this is a retry of
-    # the same content — preserve existing data. If content differs, this is an
-    # update — cascade-delete old data and start fresh.
+    # ---------------------------------------------------------------------------
+    # Recovery detection (read-only, before LLM extraction)
+    # ---------------------------------------------------------------------------
+    # Check if this is a retry of the same content (crash recovery). If the
+    # document exists with a matching content_hash and has committed chunks,
+    # the producer can skip already-extracted chunks to avoid duplicate work.
     existing_chunk_hashes: set[str] = set()
     combined_content = "\n".join([c.get("content", "") for c in contents_dicts])
-    new_content_hash = hashlib.sha256(combined_content.encode()).hexdigest()
+    # Memory: contents_dicts content strings are now captured in combined_content.
+    # Clear them from the dicts to release the per-item copies (can be multi-MB each).
+    for d in contents_dicts:
+        d.pop("content", None)
+    # Sanitize before hashing to match what handle_document_tracking stores
+    sanitized_content = fact_extraction._sanitize_text(combined_content) or ""
+    new_content_hash = hashlib.sha256(sanitized_content.encode()).hexdigest()
+    # Memory: sanitized_content is only needed for the hash; free it immediately.
+    sanitized_content = ""
     is_recovery = False
 
     try:
         async with acquire_with_retry(pool) as conn:
-            # Check if document exists with matching content hash
             doc_row = await conn.fetchrow(
                 f"SELECT content_hash FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
                 effective_doc_id,
                 bank_id,
             )
             if doc_row and doc_row["content_hash"] == new_content_hash:
-                # Same content — load chunk hashes for recovery skip
                 existing_rows = await chunk_storage.load_existing_chunks(conn, bank_id, effective_doc_id)
                 existing_chunk_hashes = {c.content_hash for c in existing_rows if c.content_hash}
                 if existing_chunk_hashes:
@@ -878,24 +961,22 @@ async def _streaming_retain_batch(
     except Exception:
         pass  # If we can't load, just process all chunks
 
-    # Create/update the document row.
+    # ---------------------------------------------------------------------------
+    # Document tracking is DEFERRED to the first consumer batch TXN.
+    # ---------------------------------------------------------------------------
+    # Previously, document tracking (cascade-delete old data + insert doc row)
+    # ran in a separate transaction BEFORE LLM extraction. This left a gap
+    # between the cascade-delete and the first chunk write, allowing concurrent
+    # requests to interleave and produce duplicates.
+    #
+    # Now, document tracking runs atomically inside the first batch's write TXN,
+    # using SELECT ... FOR UPDATE on the document row for serialization across
+    # workers. Each batch TXN also verifies document ownership via content_hash
+    # to detect when a concurrent request has taken over the document.
+    # See _run_mini_batch_db_work() for the implementation.
     retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
-    async with acquire_with_retry(pool) as conn:
-        async with conn.transaction():
-            if is_recovery:
-                # Recovery: same content, partially committed — preserve existing data
-                await fact_storage.upsert_document_metadata(
-                    conn, bank_id, effective_doc_id, combined_content, retain_params, merged_tags
-                )
-                log_buffer.append(
-                    f"[streaming] Document {effective_doc_id} updated (recovery, preserving existing chunks)"
-                )
-            else:
-                # Fresh or update: cascade-delete old data if document exists
-                await fact_storage.handle_document_tracking(
-                    conn, bank_id, effective_doc_id, combined_content, is_first_batch, retain_params, merged_tags
-                )
-                log_buffer.append(f"[streaming] Document {effective_doc_id} tracked (full content)")
+    # Track whether document tracking has been done (by the first batch)
+    doc_tracking_done = [False]
 
     # ---------------------------------------------------------------------------
     # Producer-consumer pipeline: LLM extraction runs concurrently with DB writes
@@ -908,6 +989,10 @@ async def _streaming_retain_batch(
 
     # Shared mutable state for the producer to report skipped chunks and usage
     producer_error: list[BaseException] = []
+    # Set to True by _run_mini_batch_db_work when a concurrent request takes
+    # over the document (content_hash mismatch). The consumer checks this and
+    # stops processing further batches.
+    pipeline_aborted: list[bool] = [False]
 
     # ---- LLM Producer ----
     # Fires all chunk extractions as concurrent tasks (bounded by the LLM
@@ -939,12 +1024,17 @@ async def _streaming_retain_batch(
                 schema,
             )
             await chunk_queue.put((global_idx, content, extracted, processed, chunk_meta, usage))
+            # Memory: release the chunk text from the shared list now that it's
+            # been extracted and queued. The queued RetainContent holds its own copy.
+            all_pre_chunks[global_idx] = ""
 
         tasks: list[asyncio.Task] = []
         skipped_total = 0
         for i, chunk_text in enumerate(all_pre_chunks):
             chunk_hash = chunk_storage.compute_chunk_hash(chunk_text)
             if chunk_hash in existing_chunk_hashes:
+                # Memory: skipped chunks aren't needed either.
+                all_pre_chunks[i] = ""
                 skipped_total += 1
                 continue
             tasks.append(asyncio.create_task(_extract_one(i, chunk_text)))
@@ -966,17 +1056,15 @@ async def _streaming_retain_batch(
     # Phase 1 (entity resolution) -> Phase 2 (write txn) -> Phase 3 (ANN fire-and-forget).
     async def _db_consumer() -> None:
         batch: list[tuple] = []
-        global_chunk_offset = 0
         consumer_batch_idx = 0
 
         while True:
             item = await chunk_queue.get()
             if item is None:
                 # Process any remaining items
-                if batch:
+                if batch and not pipeline_aborted[0]:
                     await _process_db_batch(
                         batch,
-                        global_chunk_offset,
                         consumer_batch_idx,
                         is_last=True,
                     )
@@ -985,23 +1073,31 @@ async def _streaming_retain_batch(
             batch.append(item)
 
             if len(batch) >= chunk_batch_size:
+                if pipeline_aborted[0]:
+                    # Another request took over the document — discard this batch
+                    log_buffer.append(
+                        f"[streaming] Consumer: discarding batch of {len(batch)} chunks "
+                        f"(pipeline aborted due to concurrent takeover)"
+                    )
+                    batch = []
+                    continue
                 await _process_db_batch(
                     batch,
-                    global_chunk_offset,
                     consumer_batch_idx,
                     is_last=False,
                 )
-                global_chunk_offset += len(batch)
                 consumer_batch_idx += 1
                 batch = []
 
     async def _process_db_batch(
         batch: list[tuple],
-        global_chunk_offset: int,
         consumer_batch_idx: int,
         is_last: bool,
     ) -> None:
         """Run Phase 1 + Phase 2 + Phase 3 for a batch of pre-extracted chunks."""
+        # Allow clearing combined_content after the no-facts skip path runs
+        # doc tracking — see the assignment further below.
+        nonlocal combined_content
         # Combine results from individual chunk extractions
         batch_contents: list[RetainContent] = []
         batch_extracted: list = []
@@ -1011,15 +1107,17 @@ async def _streaming_retain_batch(
 
         for global_idx, content, extracted, processed, chunk_meta, usage in batch:
             content_idx_in_batch = len(batch_contents)
-            # Adjust chunk indices to global offsets and remap content_index
+            # Adjust chunk indices to use the original global position (global_idx)
+            # so that chunk_id = {bank}_{doc}_{chunk_index} is deterministic regardless
+            # of task completion order. content_index is batch-relative for result grouping.
             for fact in extracted:
                 fact.content_index = content_idx_in_batch
                 if fact.chunk_index is not None:
-                    fact.chunk_index = global_chunk_offset + content_idx_in_batch
+                    fact.chunk_index = global_idx
             for pf in processed:
                 pf.content_index = content_idx_in_batch
             for cm in chunk_meta:
-                cm.chunk_index = global_chunk_offset + content_idx_in_batch
+                cm.chunk_index = global_idx
 
             batch_contents.append(content)
             batch_extracted.extend(extracted)
@@ -1031,6 +1129,51 @@ async def _streaming_retain_batch(
         total_usage = total_usage + batch_usage
 
         if not batch_extracted:
+            # Even with 0 facts, the first batch must still run document tracking
+            # (cascade-delete + insert doc row) to establish ownership and prevent
+            # concurrent requests from interleaving. Later batches can safely skip.
+            if not doc_tracking_done[0]:
+                async with acquire_with_retry(pool) as conn:
+                    async with conn.transaction():
+                        await conn.execute(
+                            f"INSERT INTO {fq_table('documents')} (id, bank_id, original_text, content_hash) "
+                            f"VALUES ($1, $2, '', '__pending__') "
+                            f"ON CONFLICT (id, bank_id) DO NOTHING",
+                            effective_doc_id,
+                            bank_id,
+                        )
+                        await conn.fetchval(
+                            f"SELECT content_hash FROM {fq_table('documents')} "
+                            f"WHERE id = $1 AND bank_id = $2 FOR UPDATE",
+                            effective_doc_id,
+                            bank_id,
+                        )
+                        if is_recovery:
+                            await fact_storage.upsert_document_metadata(
+                                conn,
+                                bank_id,
+                                effective_doc_id,
+                                combined_content,
+                                retain_params,
+                                merged_tags,
+                            )
+                        else:
+                            await fact_storage.handle_document_tracking(
+                                conn,
+                                bank_id,
+                                effective_doc_id,
+                                combined_content,
+                                is_first_batch,
+                                retain_params,
+                                merged_tags,
+                                ops=pool.ops,
+                            )
+                        doc_tracking_done[0] = True
+                        # Memory: combined_content has been persisted; release
+                        # it now so the rest of the consumer loop doesn't pin
+                        # a multi-MB string. Nothing reads it after tracking.
+                        combined_content = ""
+                        log_buffer.append(f"[streaming] Document {effective_doc_id} tracked (0 facts in first batch)")
             log_buffer.append(
                 f"[streaming] Consumer batch {consumer_batch_idx + 1}: "
                 f"0 facts extracted from {len(batch)} chunks, skipping"
@@ -1043,7 +1186,9 @@ async def _streaming_retain_batch(
         )
 
         async def _run_mini_batch_db_work() -> None:
-            nonlocal batch_extracted, batch_processed  # [FORK] dedup may filter these
+            # Allow clearing combined_content after the doc-tracking call so
+            # subsequent batches don't carry the per-document text in memory.
+            nonlocal combined_content, batch_extracted, batch_processed  # [FORK] dedup may filter facts
             entity_resolver.discard_pending_stats()
             mb_start = time.time()
 
@@ -1063,7 +1208,7 @@ async def _streaming_retain_batch(
             logger.info(f"[streaming] Phase 1 (entity resolution): {time.time() - p1_start:.3f}s")
 
             # [FORK] Step 1.5: Deduplication — filter duplicates before write transaction
-            if duplicate_checker_fn and batch_processed:
+            if duplicate_checker_fn and batch_processed and getattr(config, "retain_extraction_mode", None) != "chunks":
                 dedup_start = time.time()
                 async with acquire_with_retry(pool) as dedup_conn:
                     is_dup_flags = await check_duplicates_batch(
@@ -1080,16 +1225,103 @@ async def _streaming_retain_batch(
                     log_buffer.append("  [FORK] All facts were duplicates, skipping write")
                     return
 
-            # Phase 2 — Write transaction (within-batch semantic links only)
+            # Phase 2 — Write transaction
+            # -----------------------------------------------------------------
+            # Concurrent-safety via row-level locking:
+            #
+            # The streaming pipeline splits work across multiple batch TXNs.
+            # Without protection, two concurrent retains for the same document
+            # can interleave: Request A writes batch1, Request B cascade-deletes
+            # A's doc and writes its own batch1, then A's batch2 adds stale data
+            # on top of B's → duplicates.
+            #
+            # To prevent this, every batch TXN:
+            #   1. SELECT ... FOR UPDATE on the document row — serializes all
+            #      writers for this document at the DB level (works across workers).
+            #   2. Check content_hash — if it doesn't match ours, another request
+            #      took over the document → abort remaining batches.
+            #   3. First batch only: run handle_document_tracking (cascade-delete
+            #      old data + insert doc row) atomically with the first chunk write.
+            #      This eliminates the gap between "delete old" and "insert new"
+            #      that previously allowed interleaving.
+            # -----------------------------------------------------------------
+
             p2_start = time.time()
+            batch_result_ids = None
+            phase3_ctx = None
             async with acquire_with_retry(pool) as conn:
                 async with conn.transaction():
+                    # --- Document ownership gate ---
+                    # Lock the document row to serialize all concurrent writers.
+                    # SELECT ... FOR UPDATE doesn't lock non-existent rows, so we
+                    # first ensure the row exists with a lightweight upsert, THEN lock it.
+                    # The content_hash='__pending__' placeholder is immediately overwritten
+                    # by handle_document_tracking or upsert_document_metadata below.
+                    await conn.execute(
+                        f"INSERT INTO {fq_table('documents')} (id, bank_id, original_text, content_hash) "
+                        f"VALUES ($1, $2, '', '__pending__') "
+                        f"ON CONFLICT (id, bank_id) DO NOTHING",
+                        effective_doc_id,
+                        bank_id,
+                    )
+                    existing_hash = await conn.fetchval(
+                        f"SELECT content_hash FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2 FOR UPDATE",
+                        effective_doc_id,
+                        bank_id,
+                    )
+
+                    if not doc_tracking_done[0]:
+                        # --- First batch: document tracking (atomic with chunk write) ---
+                        if is_recovery:
+                            await fact_storage.upsert_document_metadata(
+                                conn,
+                                bank_id,
+                                effective_doc_id,
+                                combined_content,
+                                retain_params,
+                                merged_tags,
+                            )
+                            log_buffer.append(
+                                f"[streaming] Document {effective_doc_id} updated "
+                                f"(recovery, preserving existing chunks)"
+                            )
+                        else:
+                            await fact_storage.handle_document_tracking(
+                                conn,
+                                bank_id,
+                                effective_doc_id,
+                                combined_content,
+                                is_first_batch,
+                                retain_params,
+                                merged_tags,
+                                ops=pool.ops,
+                            )
+                            log_buffer.append(f"[streaming] Document {effective_doc_id} tracked (full content)")
+                        doc_tracking_done[0] = True
+                        # Memory: combined_content is no longer needed after
+                        # this first-batch tracking call. Release it so the
+                        # remaining consumer batches don't pin the string.
+                        combined_content = ""
+                    else:
+                        # --- Later batches: verify we still own the document ---
+                        # If another request took over (cascade-deleted our doc and
+                        # inserted its own), the content_hash won't match ours.
+                        if existing_hash is not None and existing_hash != new_content_hash:
+                            log_buffer.append(
+                                f"[streaming] Document {effective_doc_id} taken over by "
+                                f"concurrent request (hash mismatch) — aborting remaining batches"
+                            )
+                            logger.info("\n" + "\n".join(log_buffer) + "\n")
+                            # Signal the consumer to stop processing further batches
+                            pipeline_aborted[0] = True
+                            return
+
                     # Store chunks with correct global indices
                     step_start = time.time()
                     chunk_id_map = {}
                     if batch_chunk_meta:
                         chunk_id_map = await chunk_storage.store_chunks_batch(
-                            conn, bank_id, effective_doc_id, batch_chunk_meta
+                            conn, bank_id, effective_doc_id, batch_chunk_meta, ops=pool.ops
                         )
                         log_buffer.append(
                             f"  Store chunks: {len(batch_chunk_meta)} chunks in {time.time() - step_start:.3f}s"
@@ -1120,16 +1352,20 @@ async def _streaming_retain_batch(
                         semantic_ann_links=[],
                         skip_semantic_links=True,
                         outbox_callback=outbox_callback if is_last else None,
+                        ops=pool.ops,
                     )
 
                 logger.info(f"[streaming] Phase 2 (write txn): {time.time() - p2_start:.3f}s")
 
                 # Best-effort: entity viz + stats (fast, not semantic ANN)
-                try:
-                    await entity_resolver.flush_pending_stats()
-                    await _build_and_insert_entity_links_phase3(pool, entity_resolver, bank_id, phase3_ctx, log_buffer)
-                except Exception:
-                    logger.warning(f"Phase 3 stats (consumer batch {consumer_batch_idx + 1}) failed", exc_info=True)
+                if phase3_ctx is not None:
+                    try:
+                        await entity_resolver.flush_pending_stats()
+                        await _build_and_insert_entity_links_phase3(
+                            pool, entity_resolver, bank_id, phase3_ctx, log_buffer
+                        )
+                    except Exception:
+                        logger.warning(f"Phase 3 stats (consumer batch {consumer_batch_idx + 1}) failed", exc_info=True)
 
             logger.info(
                 f"[streaming] Consumer batch {consumer_batch_idx + 1} total "
@@ -1137,14 +1373,23 @@ async def _streaming_retain_batch(
             )
 
             # Collect unit_ids from this batch
-            for content_ids in batch_result_ids:
-                all_unit_ids.extend(content_ids)
+            if batch_result_ids:
+                for content_ids in batch_result_ids:
+                    all_unit_ids.extend(content_ids)
 
         if db_semaphore is not None:
             async with db_semaphore:
                 await _run_mini_batch_db_work()
         else:
             await _run_mini_batch_db_work()
+
+        # Memory: after DB write, clear the batch-local lists that hold extracted
+        # facts and embedding vectors. These can be large (384 floats per fact ×
+        # thousands of facts) and are no longer needed after commit.
+        batch_contents.clear()
+        batch_extracted.clear()
+        batch_processed.clear()
+        batch_chunk_meta.clear()
 
     # ---------------------------------------------------------------------------
     # Check if facts are already committed (recovery from previous crash).
@@ -1164,7 +1409,17 @@ async def _streaming_retain_batch(
                         if isinstance(row["result_metadata"], dict)
                         else json.loads(row["result_metadata"])
                     )
-                    if meta.get("facts_committed"):
+                    committed_doc_ids = meta.get("facts_committed_document_ids") or []
+                    document_ids = meta.get("document_ids") or []
+                    # Legacy path: operations created before per-document checkpoint
+                    # tracking only wrote facts_committed=true without document IDs.
+                    # Treat those as committed only for single-doc operations.
+                    legacy_single_doc_checkpoint = (
+                        meta.get("facts_committed")
+                        and not committed_doc_ids
+                        and (len(document_ids) <= 1 or document_ids == [effective_doc_id])
+                    )
+                    if effective_doc_id in committed_doc_ids or legacy_single_doc_checkpoint:
                         facts_already_committed = True
                         log_buffer.append(
                             f"[streaming] Recovery: facts already committed ({meta.get('unit_ids_count', '?')} units), "
@@ -1181,17 +1436,76 @@ async def _streaming_retain_batch(
         if producer_error:
             raise producer_error[0]
 
+        # If no batch was processed (e.g. zero facts extracted from gibberish
+        # content, or all chunks skipped in recovery), the document row was
+        # never created by the first batch TXN. Create it now so the document
+        # is tracked regardless of extraction results.
+        if not doc_tracking_done[0] and not pipeline_aborted[0]:
+            async with acquire_with_retry(pool) as conn:
+                async with conn.transaction():
+                    await conn.execute(
+                        f"INSERT INTO {fq_table('documents')} (id, bank_id, original_text, content_hash) "
+                        f"VALUES ($1, $2, '', '__pending__') "
+                        f"ON CONFLICT (id, bank_id) DO NOTHING",
+                        effective_doc_id,
+                        bank_id,
+                    )
+                    await conn.fetchval(
+                        f"SELECT content_hash FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2 FOR UPDATE",
+                        effective_doc_id,
+                        bank_id,
+                    )
+                    if is_recovery:
+                        await fact_storage.upsert_document_metadata(
+                            conn,
+                            bank_id,
+                            effective_doc_id,
+                            combined_content,
+                            retain_params,
+                            merged_tags,
+                        )
+                    else:
+                        await fact_storage.handle_document_tracking(
+                            conn,
+                            bank_id,
+                            effective_doc_id,
+                            combined_content,
+                            is_first_batch,
+                            retain_params,
+                            merged_tags,
+                            ops=pool.ops,
+                        )
+                    doc_tracking_done[0] = True
+                    # Memory: combined_content has been persisted and won't be
+                    # read again — release the per-document text now.
+                    combined_content = ""
+                    log_buffer.append(f"[streaming] Document {effective_doc_id} tracked (no facts extracted)")
+
         # Mark facts as committed in operation metadata (crash recovery checkpoint)
         if operation_id and all_unit_ids:
             try:
                 async with acquire_with_retry(pool) as conn:
+                    # Append effective_doc_id to the committed document set if not
+                    # already present, so multi-doc batches track each document
+                    # independently for crash recovery.
                     await conn.execute(
                         f"""
                         UPDATE {fq_table("async_operations")}
-                        SET result_metadata = result_metadata || $1::jsonb, updated_at = now()
-                        WHERE operation_id = $2
+                        SET result_metadata = jsonb_set(
+                            result_metadata || $1::jsonb,
+                            '{{facts_committed_document_ids}}',
+                            CASE
+                                WHEN COALESCE(result_metadata->'facts_committed_document_ids', '[]'::jsonb) @> $2::jsonb
+                                    THEN result_metadata->'facts_committed_document_ids'
+                                ELSE COALESCE(result_metadata->'facts_committed_document_ids', '[]'::jsonb) || $2::jsonb
+                            END,
+                            true
+                        ),
+                        updated_at = now()
+                        WHERE operation_id = $3
                         """,
                         json.dumps({"facts_committed": True, "unit_ids_count": len(all_unit_ids)}),
+                        json.dumps([effective_doc_id]),
                         uuid.UUID(operation_id),
                     )
                 log_buffer.append(f"[streaming] Checkpoint: {len(all_unit_ids)} facts committed, ANN pass next")
@@ -1217,16 +1531,31 @@ async def _streaming_retain_batch(
     # This replaces per-batch within-batch + fire-and-forget ANN with a single
     # efficient pass after all facts are in the database.
     # ---------------------------------------------------------------------------
-    if all_unit_ids:
+    if all_unit_ids and not pipeline_aborted[0]:
         ann_start = time.time()
-        await _run_final_semantic_ann(pool, bank_id, all_unit_ids, log_buffer)
+        try:
+            await _run_final_semantic_ann(pool, bank_id, all_unit_ids, log_buffer)
+        except Exception:
+            # ANN pass is best-effort. FK violations can occur if a concurrent
+            # retain cascade-deleted our units between the batch commit and here.
+            logger.warning(
+                f"[streaming] Final ANN pass failed for document {effective_doc_id} "
+                f"(units may have been superseded by concurrent retain)",
+                exc_info=True,
+            )
         log_buffer.append(f"[streaming] Final ANN pass: {time.time() - ann_start:.3f}s for {len(all_unit_ids)} units")
 
     total_time = time.time() - start_time
     log_buffer.append(f"{'=' * 60}")
-    log_buffer.append(
-        f"STREAMING RETAIN COMPLETE: {len(all_unit_ids)} units across {num_batches} batches in {total_time:.3f}s"
-    )
+    if pipeline_aborted[0]:
+        log_buffer.append(
+            f"STREAMING RETAIN ABORTED: document {effective_doc_id} was taken over by "
+            f"a concurrent request after {total_time:.3f}s — data from this request was discarded"
+        )
+    else:
+        log_buffer.append(
+            f"STREAMING RETAIN COMPLETE: {len(all_unit_ids)} units across {num_batches} batches in {total_time:.3f}s"
+        )
     log_buffer.append(f"Document: {effective_doc_id}")
     log_buffer.append(f"{'=' * 60}")
     logger.info("\n" + "\n".join(log_buffer) + "\n")
@@ -1234,7 +1563,10 @@ async def _streaming_retain_batch(
     # Map all unit_ids back to the original content items.
     # For streaming mode with a single document, all units belong to content 0.
     result_unit_ids = [all_unit_ids] + [[] for _ in contents[1:]]
-    return result_unit_ids, total_usage
+    # The streaming path doesn't compute per-chunk content-hash dedup in
+    # a way that lets us report a partial-processed tokens count — signal
+    # ``None`` so callers bill against the full submitted payload.
+    return result_unit_ids, total_usage, None
 
 
 # ---------------------------------------------------------------------------
@@ -1243,7 +1575,7 @@ async def _streaming_retain_batch(
 
 
 async def _try_delta_retain(
-    pool,
+    pool: Any,
     embeddings_model,
     llm_config,
     entity_resolver,
@@ -1262,10 +1594,15 @@ async def _try_delta_retain(
     schema,
     outbox_callback,
     db_semaphore: "asyncio.Semaphore | None" = None,
-):
+) -> tuple[list[list[str]], TokenUsage, int | None] | None:
     """
     Attempt delta retain for a document upsert. Returns result tuple if delta
     was performed, or None to fall back to full retain.
+
+    When a result tuple is returned, the third element is the content+context
+    token count for the chunks that actually went through extraction
+    (``0`` if the submission matched prior content exactly and nothing was
+    re-extracted).
     """
     # Need a single document_id
     effective_doc_id = document_id
@@ -1275,9 +1612,17 @@ async def _try_delta_retain(
             return None
         effective_doc_id = doc_ids.pop()
 
-    # Load existing chunks
+    # Load existing chunks and snapshot the document's content_hash. This is
+    # outside the write TXN, so a concurrent retain could modify the document
+    # between this read and the write. The write TXN verifies the hash hasn't
+    # changed; if it has, we fall back to streaming (which has full protection).
     async with acquire_with_retry(pool) as conn:
         existing_chunks = await chunk_storage.load_existing_chunks(conn, bank_id, effective_doc_id)
+        doc_hash_at_load = await conn.fetchval(
+            f"SELECT content_hash FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
+            effective_doc_id,
+            bank_id,
+        )
 
     if not existing_chunks:
         return None
@@ -1385,8 +1730,28 @@ async def _try_delta_retain(
         )
 
         # PHASE 2 — Core Write Transaction (atomic)
+        # Lock the document row and verify ownership. Delta loaded existing
+        # chunks OUTSIDE this TXN, so a concurrent retain may have cascade-deleted
+        # and replaced the document since then. If the content_hash changed,
+        # the chunk state we based our delta diff on is stale — abort.
         async with acquire_with_retry(pool) as conn:
             async with conn.transaction():
+                current_hash = await conn.fetchval(
+                    f"SELECT content_hash FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2 FOR UPDATE",
+                    effective_doc_id,
+                    bank_id,
+                )
+                # Verify the document hasn't been replaced since we loaded chunks.
+                # Compare the current hash against what we snapshotted at load time.
+                if current_hash is not None and doc_hash_at_load is not None and current_hash != doc_hash_at_load:
+                    log_buffer.append(
+                        f"[delta] Document {effective_doc_id} was modified by concurrent request "
+                        f"since chunks were loaded — aborting delta, falling back to full retain"
+                    )
+                    logger.info("\n" + "\n".join(log_buffer) + "\n")
+                    # Return None to fall back to streaming (which has full FOR UPDATE protection)
+                    return None
+
                 # Update document metadata (no delete)
                 step_start = time.time()
                 combined_content = "\n".join([c.get("content", "") for c in contents_dicts])
@@ -1438,7 +1803,7 @@ async def _try_delta_retain(
                         for cm in new_chunk_metadata
                     ]
                     chunk_id_map = await chunk_storage.store_chunks_batch(
-                        conn, bank_id, effective_doc_id, remapped_chunks
+                        conn, bank_id, effective_doc_id, remapped_chunks, ops=pool.ops
                     )
                     for chunk_idx, chunk_id in chunk_id_map.items():
                         chunk_id_map_by_doc[(effective_doc_id, chunk_idx)] = chunk_id
@@ -1472,6 +1837,7 @@ async def _try_delta_retain(
                     unit_to_entity_ids=phase1.entities.unit_to_entity_ids,
                     semantic_ann_links=phase1.semantic_ann_links,
                     outbox_callback=outbox_callback,
+                    ops=pool.ops,
                 )
 
             # PHASE 3 — Best-Effort Display Data (post-transaction)
@@ -1496,11 +1862,16 @@ async def _try_delta_retain(
             await _run_delta_db_work()
     else:
         await _run_delta_db_work()
-    return result_unit_ids, usage
+    # Count content + context tokens that actually went through extraction.
+    # ``delta_contents`` holds the per-chunk RetainContent items for the
+    # changed/new chunks (see ``_build_delta_contents``) — i.e. exactly what
+    # the LLM pipeline saw this call. Unchanged chunks contribute zero.
+    processed_tokens = _count_delta_content_tokens(delta_contents)
+    return result_unit_ids, usage, processed_tokens
 
 
 async def _delta_metadata_only(
-    pool,
+    pool: Any,
     bank_id,
     contents_dicts,
     contents,
@@ -1513,6 +1884,12 @@ async def _delta_metadata_only(
     """Handle the case where no chunks changed — just update document metadata and tags."""
     async with acquire_with_retry(pool) as conn:
         async with conn.transaction():
+            # Lock the document row to serialize with concurrent retains
+            await conn.fetchval(
+                f"SELECT content_hash FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2 FOR UPDATE",
+                document_id,
+                bank_id,
+            )
             combined_content = "\n".join([c.get("content", "") for c in contents_dicts])
             retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
             await fact_storage.upsert_document_metadata(
@@ -1530,7 +1907,11 @@ async def _delta_metadata_only(
     total_time = time.time() - start_time
     log_buffer.append(f"DELTA RETAIN (no changes): metadata updated in {total_time:.3f}s")
     logger.info("\n" + "\n".join(log_buffer) + "\n")
-    return [[] for _ in contents], TokenUsage()
+    # Nothing went through the extraction pipeline — report 0 processed
+    # content tokens so callers can bill accordingly (a caller that's been
+    # told ``0`` knows the retain was a pure metadata update and should
+    # charge nothing for content).
+    return [[] for _ in contents], TokenUsage(), 0
 
 
 # ---------------------------------------------------------------------------

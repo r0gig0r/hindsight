@@ -13,7 +13,7 @@ Usage:
 Environment variables:
     HINDSIGHT_API_LLM_API_KEY: Required. API key for LLM provider.
     HINDSIGHT_API_LLM_PROVIDER: Optional. LLM provider (default: "openai").
-    HINDSIGHT_API_LLM_MODEL: Optional. LLM model (default: "gpt-4o-mini").
+    HINDSIGHT_API_LLM_MODEL: Optional. LLM model (default: provider-specific, resolved by hindsight-api).
     HINDSIGHT_EMBED_BANK_ID: Optional. Memory bank ID (default: "default").
     HINDSIGHT_EMBED_API_URL: Optional. Use external API server instead of starting local daemon.
     HINDSIGHT_EMBED_API_TOKEN: Optional. Authentication token for external API (sent as Bearer token).
@@ -116,40 +116,31 @@ def load_config_file():
                         os.environ[key] = value
 
 
-def get_default_model_for_provider(provider: str) -> str:
-    """Return the default model for a given provider.
-
-    Delegates to hindsight_api.config when available (same Python environment),
-    with a minimal fallback for standalone use.
-    """
-    try:
-        from hindsight_api.config import PROVIDER_DEFAULT_MODELS
-
-        return PROVIDER_DEFAULT_MODELS.get(provider, "gpt-4o-mini")
-    except ImportError:
-        return "gpt-4o-mini"
-
-
 def get_config():
-    """Get configuration from environment variables."""
+    """Get configuration from environment variables.
+
+    `llm_model` is left unset (None) when the env var is missing — the daemon's
+    hindsight-api process owns `PROVIDER_DEFAULT_MODELS` and resolves the
+    provider-keyed default itself. Duplicating that table here would silently
+    desync, and importing it from `hindsight_api.config` fails in standalone
+    venvs (e.g. `uvx hindsight-embed`) where `hindsight-api` isn't installed.
+    """
     load_config_file()
-    provider = os.environ.get("HINDSIGHT_API_LLM_PROVIDER", "openai")
-    default_model = get_default_model_for_provider(provider)
     return {
         "llm_api_key": os.environ.get("HINDSIGHT_API_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY"),
-        "llm_provider": provider,
-        "llm_model": os.environ.get("HINDSIGHT_API_LLM_MODEL", default_model),
+        "llm_provider": os.environ.get("HINDSIGHT_API_LLM_PROVIDER", "openai"),
+        "llm_model": os.environ.get("HINDSIGHT_API_LLM_MODEL"),
         "bank_id": os.environ.get("HINDSIGHT_EMBED_BANK_ID", "default"),
     }
 
 
-# Provider choices for interactive configure: (provider_id, default_model, env_key_name)
-PROVIDER_DEFAULTS = {
-    "openai": ("openai", get_default_model_for_provider("openai"), "OPENAI_API_KEY"),
-    "groq": ("groq", get_default_model_for_provider("groq"), "GROQ_API_KEY"),
-    "gemini": ("gemini", get_default_model_for_provider("gemini"), "GEMINI_API_KEY"),
-    "ollama": ("ollama", get_default_model_for_provider("ollama"), None),
-    "vertexai": ("vertexai", get_default_model_for_provider("vertexai"), None),
+# Provider -> API-key env var (None = no key needed)
+PROVIDER_API_KEYS = {
+    "openai": "OPENAI_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "ollama": None,
+    "vertexai": None,
 }
 
 
@@ -174,7 +165,13 @@ def do_configure(args):
         # Pass port (may be None for auto-allocation/reuse)
         return _do_configure_profile_interactive(profile, port)
 
-    # Default behavior: interactive configuration for default profile
+    # Default behavior: interactive configuration for default profile.
+    # Prefer non-interactive mode when the CI/env-driven inputs are already
+    # set — otherwise Windows CI hits the interactive path (pwsh makes stdin
+    # look like a TTY) and blocks on EOF instead of using the env vars.
+    if _has_non_interactive_env():
+        return _do_configure_from_env()
+
     # If stdin is not a terminal (e.g., running via curl | bash),
     # redirect stdin from /dev/tty for interactive prompts
     original_stdin = None
@@ -194,19 +191,29 @@ def do_configure(args):
             sys.stdin = original_stdin
 
 
+def _has_non_interactive_env() -> bool:
+    """Whether the env vars required by _do_configure_from_env are already set.
+
+    Returns True when an API key is present, OR when the provider is one that
+    doesn't need a key (ollama, vertexai — the latter authenticates via a
+    service-account file path). Prevents the interactive prompt from kicking
+    in when the user clearly wants CI/scripted behavior.
+    """
+    if os.environ.get("HINDSIGHT_API_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY"):
+        return True
+    return os.environ.get("HINDSIGHT_API_LLM_PROVIDER") in ("ollama", "vertexai")
+
+
 def _do_configure_from_env():
     """Non-interactive configuration from environment variables (for CI)."""
     # Check for required environment variables
     api_key = os.environ.get("HINDSIGHT_API_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
     provider = os.environ.get("HINDSIGHT_API_LLM_PROVIDER", "openai")
 
-    if provider not in PROVIDER_DEFAULTS:
-        print(
-            f"Error: Unknown provider '{provider}'. Supported: {', '.join(PROVIDER_DEFAULTS.keys())}", file=sys.stderr
-        )
-        return 1
-
-    _, default_model, env_key = PROVIDER_DEFAULTS[provider]
+    # Don't gate on PROVIDER_API_KEYS — that's only the interactive-menu set
+    # (5 entries). hindsight-api's PROVIDER_DEFAULT_MODELS supports ~18
+    # providers (anthropic, claude-code, bedrock, openrouter, ...). Let the
+    # daemon validate; rejecting here would block valid configurations.
 
     # Check for API key (required for non-ollama and non-vertexai providers)
     # vertexai uses GCP service account credentials instead of an API key
@@ -216,17 +223,19 @@ def _do_configure_from_env():
         print("For non-interactive (CI) mode, set environment variables:", file=sys.stderr)
         print("  HINDSIGHT_API_LLM_API_KEY=<your-api-key>", file=sys.stderr)
         print(f"  HINDSIGHT_API_LLM_PROVIDER={provider}  # optional, default: openai", file=sys.stderr)
-        print(f"  HINDSIGHT_API_LLM_MODEL=<model>  # optional, default: {default_model}", file=sys.stderr)
+        print(
+            "  HINDSIGHT_API_LLM_MODEL=<model>  # optional, defaults to provider's recommended model", file=sys.stderr
+        )
         return 1
 
-    model = os.environ.get("HINDSIGHT_API_LLM_MODEL", default_model)
+    model = os.environ.get("HINDSIGHT_API_LLM_MODEL")
     bank_id = os.environ.get("HINDSIGHT_EMBED_BANK_ID", "default")
 
     print()
     print("\033[1m\033[36m  Hindsight Embed - Non-interactive Configuration\033[0m")
     print()
     print(f"  \033[2mProvider:\033[0m {provider}")
-    print(f"  \033[2mModel:\033[0m {model}")
+    print(f"  \033[2mModel:\033[0m {model or '(provider default)'}")
     print(f"  \033[2mBank ID:\033[0m {bank_id}")
 
     # Save configuration
@@ -236,19 +245,11 @@ def _do_configure_from_env():
         f.write("# Hindsight Embed Configuration\n")
         f.write("# Generated by hindsight-embed configure (non-interactive)\n\n")
         f.write(f"HINDSIGHT_API_LLM_PROVIDER={provider}\n")
-        f.write(f"HINDSIGHT_API_LLM_MODEL={model}\n")
+        if model:
+            f.write(f"HINDSIGHT_API_LLM_MODEL={model}\n")
         f.write(f"HINDSIGHT_EMBED_BANK_ID={bank_id}\n")
         if api_key:
             f.write(f"HINDSIGHT_API_LLM_API_KEY={api_key}\n")
-
-        # Force CPU mode for embeddings/reranker on macOS to avoid MPS/XPC crashes in daemon mode
-        # On Linux, users can set these to 0 to use CUDA if available
-        import platform
-
-        if platform.system() == "Darwin":  # macOS
-            f.write("\n# Daemon settings (macOS: force CPU to avoid MPS/XPC issues)\n")
-            f.write("HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU=1\n")
-            f.write("HINDSIGHT_API_RERANKER_LOCAL_FORCE_CPU=1\n")
 
     CONFIG_FILE.chmod(0o600)
 
@@ -383,7 +384,7 @@ def _do_configure_interactive(profile_name: str | None = None, port: int | None 
         print("\n\033[33m⚠\033[0m Configuration cancelled.")
         return 1
 
-    _, default_model, env_key = PROVIDER_DEFAULTS[provider]
+    env_key = PROVIDER_API_KEYS[provider]
     print()
 
     # API key
@@ -404,8 +405,8 @@ def _do_configure_interactive(profile_name: str | None = None, port: int | None 
                 return 1
             print()
 
-    # Model selection
-    model = _prompt_text("Model name", default=default_model)
+    # Empty = let the daemon pick the provider default (PROVIDER_DEFAULT_MODELS)
+    model = _prompt_text("Model name (leave empty for provider default)")
     if model is None:
         return 1
     print()
@@ -418,21 +419,14 @@ def _do_configure_interactive(profile_name: str | None = None, port: int | None 
     # Save configuration
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Prepare config dict
     config_dict = {
         "HINDSIGHT_API_LLM_PROVIDER": provider,
-        "HINDSIGHT_API_LLM_MODEL": model,
         "HINDSIGHT_EMBED_BANK_ID": bank_id,
     }
+    if model:
+        config_dict["HINDSIGHT_API_LLM_MODEL"] = model
     if api_key:
         config_dict["HINDSIGHT_API_LLM_API_KEY"] = api_key
-
-    # Force CPU mode for embeddings/reranker on macOS to avoid MPS/XPC crashes in daemon mode
-    import platform
-
-    if platform.system() == "Darwin":  # macOS
-        config_dict["HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU"] = "1"
-        config_dict["HINDSIGHT_API_RERANKER_LOCAL_FORCE_CPU"] = "1"
 
     if profile_name:
         # Create named profile
@@ -1353,6 +1347,17 @@ def do_profile_command(args: list[str]) -> int:
 
 def main():
     """Main entry point."""
+    # Windows defaults stdout/stderr to the legacy cp1252 codec, which crashes
+    # on the Unicode glyphs (✓, box-drawing, etc.) used throughout Rich-rendered
+    # output. Reconfigure to UTF-8 before the first print. `errors="replace"`
+    # keeps the CLI from dying on an unexpected character (e.g. a redirected
+    # pipe) — glyphs that can't be rendered become '?' rather than raising.
+    if sys.platform == "win32":
+        for stream in (sys.stdout, sys.stderr):
+            reconfigure = getattr(stream, "reconfigure", None)
+            if reconfigure is not None:
+                reconfigure(encoding="utf-8", errors="replace")
+
     # Use argparse to properly parse global flags
     # Create a parent parser for global --profile/-p flag
     parent_parser = argparse.ArgumentParser(add_help=False)

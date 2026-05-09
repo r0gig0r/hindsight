@@ -17,6 +17,8 @@ from collections.abc import Sequence
 
 from alembic import context, op
 
+from hindsight_api.alembic._dialect import run_for_dialect
+
 # revision identifiers, used by Alembic.
 revision: str = "h3c4d5e6f7g8"
 down_revision: str | Sequence[str] | None = "g2a3b4c5d6e7"
@@ -30,7 +32,7 @@ def _get_schema_prefix() -> str:
     return f'"{schema}".' if schema else ""
 
 
-def upgrade() -> None:
+def _pg_upgrade() -> None:
     """Apply mental models v4 changes."""
     schema = _get_schema_prefix()
 
@@ -85,6 +87,26 @@ def upgrade() -> None:
         )
     """)
 
+    # Step 4b: If the table already existed (from reflections rename chain),
+    # it won't have the v4 columns. Add them idempotently so the migration
+    # works regardless of whether CREATE TABLE above was a no-op.
+    for col_ddl in [
+        "subtype VARCHAR(32) NOT NULL DEFAULT 'directive'",
+        "description TEXT NOT NULL DEFAULT ''",
+        "entity_id UUID",
+        "observations JSONB DEFAULT '{\"observations\": []}'::jsonb",
+        "links VARCHAR[]",
+        "last_updated TIMESTAMP WITH TIME ZONE",
+    ]:
+        op.execute(f"ALTER TABLE {schema}mental_models ADD COLUMN IF NOT EXISTS {col_ddl}")
+
+    # Ensure the subtype CHECK constraint exists (may not if table was renamed)
+    op.execute(f"ALTER TABLE {schema}mental_models DROP CONSTRAINT IF EXISTS ck_mental_models_subtype")
+    op.execute(f"""
+        ALTER TABLE {schema}mental_models
+        ADD CONSTRAINT ck_mental_models_subtype CHECK (subtype IN ('structural', 'emergent', 'pinned', 'learned'))
+    """)
+
     # Step 5: Create indexes for efficient queries (if not exist)
     op.execute(f"CREATE INDEX IF NOT EXISTS idx_mental_models_bank_id ON {schema}mental_models(bank_id)")
     op.execute(f"CREATE INDEX IF NOT EXISTS idx_mental_models_subtype ON {schema}mental_models(bank_id, subtype)")
@@ -93,7 +115,7 @@ def upgrade() -> None:
     op.execute(f"CREATE INDEX IF NOT EXISTS idx_mental_models_tags ON {schema}mental_models USING GIN(tags)")
 
 
-def downgrade() -> None:
+def _pg_downgrade() -> None:
     """Revert mental models v4 changes."""
     schema = _get_schema_prefix()
 
@@ -110,3 +132,11 @@ def downgrade() -> None:
     op.execute(f"ALTER TABLE {schema}banks DROP COLUMN IF EXISTS mission")
 
     # Note: Cannot restore deleted observations - they are lost on downgrade
+
+
+def upgrade() -> None:
+    run_for_dialect(pg=_pg_upgrade)
+
+
+def downgrade() -> None:
+    run_for_dialect(pg=_pg_downgrade)

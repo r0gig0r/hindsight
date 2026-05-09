@@ -73,6 +73,14 @@ interface BankStats {
 type Period = "1h" | "12h" | "1d" | "7d" | "30d" | "90d";
 const PERIODS: Period[] = ["1h", "12h", "1d", "7d", "30d", "90d"];
 
+type TimeField = "created_at" | "mentioned_at" | "occurred_start";
+const TIME_FIELD_LABELS: Record<TimeField, { short: string; long: string }> = {
+  created_at: { short: "Ingested", long: "When records were ingested" },
+  mentioned_at: { short: "Mentioned", long: "When facts were mentioned (event time)" },
+  occurred_start: { short: "Occurred", long: "When the underlying event started" },
+};
+const TIME_FIELDS: TimeField[] = ["created_at", "mentioned_at", "occurred_start"];
+
 interface TimeseriesBucket {
   time: string;
   world: number;
@@ -219,8 +227,17 @@ function formatRelativeTime(ts: string | null): string {
   return `${days}d ago`;
 }
 
+// Bucket timestamps arrive from the memories-timeseries endpoint, which is
+// canonically UTC. An ISO string without an explicit offset (e.g. `2026-04-18T00:00:00`)
+// would be parsed by `new Date()` as *local* time per ECMA-262, shifting the
+// displayed bucket by the browser's timezone. Append `Z` when the offset is
+// missing so we always anchor to UTC before converting to the user's locale.
+function parseBucketIso(iso: string): Date {
+  return new Date(/[+Z-]$/.test(iso) || /[+-]\d\d:?\d\d$/.test(iso) ? iso : `${iso}Z`);
+}
+
 function formatBucketLabel(iso: string, trunc: string): string {
-  const d = new Date(iso);
+  const d = parseBucketIso(iso);
   if (trunc === "day") {
     return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
   }
@@ -228,7 +245,7 @@ function formatBucketLabel(iso: string, trunc: string): string {
 }
 
 function formatBucketTooltip(iso: string, trunc: string): string {
-  const d = new Date(iso);
+  const d = parseBucketIso(iso);
   if (trunc === "day") {
     return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
   }
@@ -365,20 +382,20 @@ function InlineStat({
   );
 }
 
-const OPS_STATUS_ORDER = ["completed", "in_progress", "pending", "failed", "cancelled"] as const;
+const OPS_STATUS_ORDER = ["completed", "processing", "pending", "failed", "cancelled"] as const;
 const OPS_STATUS_COLORS: Record<string, string> = {
-  completed: CHART_COLORS.success,
-  in_progress: CHART_COLORS.semantic,
-  pending: CHART_COLORS.warning,
-  failed: CHART_COLORS.danger,
-  cancelled: CHART_COLORS.mutedFg,
+  completed: "#10b981", // emerald-500
+  processing: "#3b82f6", // blue-500
+  pending: "#f59e0b", // amber-500
+  failed: "#ef4444", // red-500
+  cancelled: "#6b7280", // gray-500
 };
 const OPS_STATUS_LABELS: Record<string, string> = {
-  completed: "Completed",
-  in_progress: "In progress",
-  pending: "Pending",
-  failed: "Failed",
-  cancelled: "Cancelled",
+  completed: "completed",
+  processing: "processing",
+  pending: "pending",
+  failed: "failed",
+  cancelled: "cancelled",
 };
 
 interface OpsStatusEntry {
@@ -772,6 +789,7 @@ export function BankStatsView() {
   const [mentalModels, setMentalModels] = useState<MentalModel[]>([]);
   const [loading, setLoading] = useState(false);
   const [period, setPeriod] = useState<Period>("7d");
+  const [timeField, setTimeField] = useState<TimeField>("created_at");
   const [timeseries, setTimeseries] = useState<{ trunc: string; buckets: TimeseriesBucket[] }>({
     trunc: "day",
     buckets: [],
@@ -803,7 +821,7 @@ export function BankStatsView() {
   const loadTimeseries = async () => {
     if (!currentBank) return;
     try {
-      const data = await client.getMemoriesTimeseries(currentBank, period);
+      const data = await client.getMemoriesTimeseries(currentBank, period, timeField);
       setTimeseries({ trunc: data.trunc, buckets: data.buckets || [] });
     } catch (error) {
       console.error("Error loading memories timeseries:", error);
@@ -824,7 +842,7 @@ export function BankStatsView() {
       const interval = setInterval(loadTimeseries, 5000);
       return () => clearInterval(interval);
     }
-  }, [currentBank, period]);
+  }, [currentBank, period, timeField]);
 
   if (loading && !stats) {
     return (
@@ -947,7 +965,9 @@ export function BankStatsView() {
           <Card className="lg:col-span-2">
             <CardHeader className="pb-2 space-y-2">
               <div className="flex flex-row items-center justify-between">
-                <CardTitle className="text-sm font-semibold">Memories ingested</CardTitle>
+                <CardTitle className="text-sm font-semibold">
+                  Memories by {TIME_FIELD_LABELS[timeField].short.toLowerCase()} time
+                </CardTitle>
                 <div className="flex items-center gap-0.5 rounded-md bg-muted/60 p-0.5">
                   {PERIODS.map((p) => (
                     <button
@@ -963,6 +983,22 @@ export function BankStatsView() {
                     </button>
                   ))}
                 </div>
+              </div>
+              <div className="flex items-center gap-0.5 rounded-md bg-muted/60 p-0.5 w-fit">
+                {TIME_FIELDS.map((tf) => (
+                  <button
+                    key={tf}
+                    onClick={() => setTimeField(tf)}
+                    title={TIME_FIELD_LABELS[tf].long}
+                    className={`px-2 py-0.5 text-[11px] font-medium rounded transition-colors ${
+                      timeField === tf
+                        ? "bg-background text-foreground shadow-sm"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    {TIME_FIELD_LABELS[tf].short}
+                  </button>
+                ))}
               </div>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-1.5">

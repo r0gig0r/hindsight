@@ -409,14 +409,14 @@ async def test_worker_batch_recovery(memory, request_context):
         tenant_extension = DefaultTenantExtension(config={"schema": schema} if schema else {})
 
         poller = WorkerPoller(
-            pool=pool,
+            backend=pool,
             worker_id="test_worker_recovery",
             executor=memory,
             poll_interval_ms=100,
             schema=schema,
             tenant_extension=tenant_extension,
             max_slots=5,
-            consolidation_max_slots=2,
+            slot_reservations={"consolidation": 2},
         )
 
         # Run recovery

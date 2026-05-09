@@ -1,5 +1,5 @@
 """
-OpenAI-compatible LLM provider supporting OpenAI, Groq, Ollama, LMStudio, and MiniMax.
+OpenAI-compatible LLM provider supporting OpenAI, Groq, Ollama, LMStudio, MiniMax, and DeepSeek.
 
 This provider handles all OpenAI API-compatible models including:
 - OpenAI: GPT-4, GPT-4o, GPT-5, o1, o3 (reasoning models)
@@ -7,6 +7,7 @@ This provider handles all OpenAI API-compatible models including:
 - Ollama: Local models with native streaming API support
 - LMStudio: Local models with OpenAI-compatible API
 - MiniMax: MiniMax-M2.7 models with 1M context window
+- DeepSeek: deepseek-v4-flash / deepseek-v4-pro / deepseek-chat / deepseek-reasoner via api.deepseek.com
 
 Features:
 - Reasoning models with extended thinking (o1, o3, GPT-5 families)
@@ -39,6 +40,15 @@ logger = logging.getLogger(__name__)
 
 # Seed applied to every Groq request for deterministic behavior
 DEFAULT_LLM_SEED = 4242
+JSON_MODE_USER_HINT = "Return valid json only."
+
+
+class ProviderResponseError(RuntimeError):
+    """Raised when a provider returns a success response without usable content."""
+
+    def __init__(self, message: str, *, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def _strip_code_fences(content: str) -> str:
@@ -60,6 +70,131 @@ def _strip_code_fences(content: str) -> str:
         return content
 
 
+def _response_get(response: Any, key: str, default: Any = None) -> Any:
+    if isinstance(response, dict):
+        return response.get(key, default)
+    return getattr(response, key, default)
+
+
+def _response_to_dict(response: Any) -> dict[str, Any]:
+    if isinstance(response, dict):
+        return response
+    if hasattr(response, "model_dump"):
+        try:
+            return response.model_dump(mode="json")
+        except Exception:
+            return {}
+    return {}
+
+
+def _summarize_provider_error_payload(error: Any, max_len: int = 400) -> str:
+    if error is None:
+        return "<none>"
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("error") or error
+        err_type = error.get("type")
+        param = error.get("param")
+        summary = str(message)
+        details = [f"type={err_type}" if err_type else "", f"param={param}" if param else ""]
+        details = [d for d in details if d]
+        if details:
+            summary = f"{summary} ({', '.join(details)})"
+    else:
+        summary = str(error)
+    if len(summary) > max_len:
+        summary = summary[:max_len] + "...TRUNCATED"
+    return summary
+
+
+def _finish_reason_for_choice(choice: Any) -> Any:
+    return _response_get(choice, "finish_reason")
+
+
+def _message_for_choice(choice: Any) -> Any:
+    return _response_get(choice, "message")
+
+
+def _message_content(message: Any) -> Any:
+    return _response_get(message, "content")
+
+
+def _message_tool_calls(message: Any) -> Any:
+    return _response_get(message, "tool_calls")
+
+
+def _message_refusal(message: Any) -> Any:
+    return _response_get(message, "refusal")
+
+
+def _first_choice_or_error(response: Any, *, provider: str, model: str, scope: str) -> Any:
+    """Return the first choice or raise a clear error for malformed success responses."""
+
+    data = _response_to_dict(response)
+    error_payload = _response_get(response, "error") or data.get("error")
+    if error_payload:
+        raise ProviderResponseError(
+            f"Provider returned error payload ({provider}/{model}, scope={scope}): "
+            f"{_summarize_provider_error_payload(error_payload)}",
+            retryable=False,
+        )
+
+    choices = _response_get(response, "choices")
+    if not choices:
+        raise ProviderResponseError(
+            f"Provider returned no choices ({provider}/{model}, scope={scope})",
+            retryable=True,
+        )
+    return choices[0]
+
+
+def _content_or_error(response: Any, *, provider: str, model: str, scope: str) -> tuple[str, Any]:
+    """Extract message.content while turning provider shape issues into useful errors."""
+
+    choice = _first_choice_or_error(response, provider=provider, model=model, scope=scope)
+    message = _message_for_choice(choice)
+    finish_reason = _finish_reason_for_choice(choice)
+    if message is None:
+        raise ProviderResponseError(
+            f"Provider returned a choice without message ({provider}/{model}, scope={scope}, "
+            f"finish_reason={finish_reason})",
+            retryable=True,
+        )
+
+    content = _message_content(message)
+    if content is None or content == "":
+        tool_calls = _message_tool_calls(message)
+        refusal = _message_refusal(message)
+        retryable = finish_reason not in {"content_filter"}
+        raise ProviderResponseError(
+            f"Provider returned empty message content ({provider}/{model}, scope={scope}, "
+            f"finish_reason={finish_reason}, has_tool_calls={bool(tool_calls)}, "
+            f"refusal={bool(refusal)})",
+            retryable=retryable,
+        )
+    return content, choice
+
+
+def _ensure_json_word_in_user_message(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Some OpenAI-compatible gateways require 'json' in a user message for json_object mode."""
+
+    normalized = [dict(message) for message in messages]
+    user_indexes = [
+        index
+        for index, message in enumerate(normalized)
+        if message.get("role") == "user" and isinstance(message.get("content"), str)
+    ]
+    if not user_indexes:
+        normalized.append({"role": "user", "content": JSON_MODE_USER_HINT})
+        return normalized
+
+    if any("json" in normalized[index]["content"] for index in user_indexes):
+        return normalized
+
+    last_user = user_indexes[-1]
+    normalized[last_user]["content"] = f"{JSON_MODE_USER_HINT}\n\n{normalized[last_user]['content']}"
+    return normalized
+
+
 def _summarize_status_error(e: APIStatusError, body_max: int = 400) -> str:
     """Render an APIStatusError with status code + truncated response body.
 
@@ -76,7 +211,7 @@ def _summarize_status_error(e: APIStatusError, body_max: int = 400) -> str:
             body = None
     if isinstance(body, (dict, list)):
         try:
-            body_str = json.dumps(body, default=str)
+            body_str = json.dumps(body, default=str, ensure_ascii=False)
         except Exception:
             body_str = str(body)
     else:
@@ -96,6 +231,7 @@ class OpenAICompatibleLLM(LLMInterface):
     - Ollama: Local models with native streaming API for better structured output
     - LMStudio: Local models with OpenAI-compatible API
     - MiniMax: MiniMax-M2.7 models via OpenAI-compatible API (https://api.minimax.io/v1)
+    - DeepSeek: deepseek-v4-flash / deepseek-v4-pro / deepseek-chat / deepseek-reasoner via https://api.deepseek.com
     """
 
     def __init__(
@@ -127,7 +263,18 @@ class OpenAICompatibleLLM(LLMInterface):
         super().__init__(provider, api_key, base_url, model, reasoning_effort, **kwargs)
 
         # Validate provider
-        valid_providers = ["openai", "groq", "ollama", "lmstudio", "llamacpp", "minimax", "volcano", "openrouter"]
+        valid_providers = [
+            "openai",
+            "groq",
+            "ollama",
+            "lmstudio",
+            "llamacpp",
+            "minimax",
+            "deepseek",
+            "volcano",
+            "openrouter",
+            "zai",
+        ]
         if self.provider not in valid_providers:
             raise ValueError(f"OpenAICompatibleLLM only supports: {', '.join(valid_providers)}. Got: {self.provider}")
 
@@ -141,15 +288,19 @@ class OpenAICompatibleLLM(LLMInterface):
                 self.base_url = "http://localhost:1234/v1"
             elif self.provider == "minimax":
                 self.base_url = "https://api.minimax.io/v1"
+            elif self.provider == "deepseek":
+                self.base_url = "https://api.deepseek.com"
             elif self.provider == "openrouter":
                 self.base_url = "https://openrouter.ai/api/v1"
+            elif self.provider == "zai":
+                self.base_url = "https://api.z.ai/api/coding/paas/v4"
 
         # For ollama/lmstudio, use dummy key if not provided
         if self.provider in ("ollama", "lmstudio") and not self.api_key:
             self.api_key = "local"
 
         # Validate API key for cloud providers
-        if self.provider in ("openai", "groq", "minimax", "openrouter") and not self.api_key:
+        if self.provider in ("openai", "groq", "minimax", "deepseek", "openrouter", "zai") and not self.api_key:
             raise ValueError(f"API key is required for {self.provider}")
 
         # Service tier configuration (from config, not env vars)
@@ -206,7 +357,12 @@ class OpenAICompatibleLLM(LLMInterface):
     def _supports_reasoning_model(self) -> bool:
         """Check if the current model is a reasoning model (o1, o3, GPT-5, DeepSeek)."""
         model_lower = self.model.lower()
-        return any(x in model_lower for x in ["gpt-5", "o1", "o3", "deepseek"])
+        if "deepseek" in model_lower:
+            # DeepSeek v4-flash is the non-thinking route. Treating every
+            # DeepSeek model as a reasoning model injects reasoning_effort,
+            # which conflicts with thinking-disabled flash calls.
+            return any(x in model_lower for x in ["v4-pro", "reasoner", "r1", "thinking"])
+        return any(x in model_lower for x in ["gpt-5", "o1", "o3"])
 
     def _get_max_reasoning_tokens(self) -> int | None:
         """Get max reasoning tokens for reasoning models."""
@@ -308,7 +464,7 @@ class OpenAICompatibleLLM(LLMInterface):
         # Build call parameters
         call_params: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": [dict(message) for message in messages],
         }
 
         # Check if model supports reasoning parameter
@@ -365,9 +521,7 @@ class OpenAICompatibleLLM(LLMInterface):
             else:
                 # Soft enforcement: add schema to prompt and use json_object mode
                 if schema is not None:
-                    schema_msg = (
-                        f"\n\nYou must respond with valid JSON matching this schema:\n{json.dumps(schema, indent=2)}"
-                    )
+                    schema_msg = f"\n\nYou must respond with valid JSON matching this schema:\n{json.dumps(schema, indent=2, ensure_ascii=False)}"
 
                     if call_params["messages"] and call_params["messages"][0].get("role") == "system":
                         first_msg = call_params["messages"][0]
@@ -384,6 +538,7 @@ class OpenAICompatibleLLM(LLMInterface):
 
                     skip_grammar = get_config().llamacpp_no_grammar
                 if not skip_grammar:
+                    call_params["messages"] = _ensure_json_word_in_user_message(call_params["messages"])
                     call_params["response_format"] = {"type": "json_object"}
 
         last_exception = None
@@ -398,19 +553,23 @@ class OpenAICompatibleLLM(LLMInterface):
                 if response_format is not None:
                     response = await self._client.chat.completions.create(**call_params)
 
-                    content = response.choices[0].message.content
+                    content, first_choice = _content_or_error(
+                        response,
+                        provider=self.provider,
+                        model=self.model,
+                        scope=scope,
+                    )
 
                     # Strip reasoning model thinking tags
                     # Supports: <think>, <thinking>, <reasoning>, |startthink|/|endthink|
-                    if content:
-                        original_len = len(content)
-                        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
-                        content = re.sub(r"<thinking>.*?</thinking>", "", content, flags=re.DOTALL)
-                        content = re.sub(r"<reasoning>.*?</reasoning>", "", content, flags=re.DOTALL)
-                        content = re.sub(r"\|startthink\|.*?\|endthink\|", "", content, flags=re.DOTALL)
-                        content = content.strip()
-                        if len(content) < original_len:
-                            logger.debug(f"Stripped {original_len - len(content)} chars of reasoning tokens")
+                    original_len = len(content)
+                    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+                    content = re.sub(r"<thinking>.*?</thinking>", "", content, flags=re.DOTALL)
+                    content = re.sub(r"<reasoning>.*?</reasoning>", "", content, flags=re.DOTALL)
+                    content = re.sub(r"\|startthink\|.*?\|endthink\|", "", content, flags=re.DOTALL)
+                    content = content.strip()
+                    if len(content) < original_len:
+                        logger.debug(f"Stripped {original_len - len(content)} chars of reasoning tokens")
 
                     # Strip markdown code fences if present — any provider may
                     # produce these (confirmed with MiniMax, some Ollama models,
@@ -432,7 +591,7 @@ class OpenAICompatibleLLM(LLMInterface):
                                 f"  Model: {self.provider}/{self.model}\n"
                                 f"  Content length: {len(content) if content else 0} chars\n"
                                 f"  Content preview: {content_preview!r}\n"
-                                f"  Finish reason: {response.choices[0].finish_reason if response.choices else 'unknown'}"
+                                f"  Finish reason: {_finish_reason_for_choice(first_choice)}"
                             )
                             # Retry on JSON parse errors
                             if attempt < max_retries:
@@ -450,7 +609,12 @@ class OpenAICompatibleLLM(LLMInterface):
                         result = response_format.model_validate(json_data)
                 else:
                     response = await self._client.chat.completions.create(**call_params)
-                    result = response.choices[0].message.content
+                    result, first_choice = _content_or_error(
+                        response,
+                        provider=self.provider,
+                        model=self.model,
+                        scope=scope,
+                    )
 
                 # Record token usage metrics
                 duration = time.time() - start_time
@@ -474,13 +638,13 @@ class OpenAICompatibleLLM(LLMInterface):
                 # Record trace span
                 from hindsight_api.tracing import _serialize_for_span, get_span_recorder
 
-                finish_reason = response.choices[0].finish_reason if response.choices else None
+                finish_reason = _finish_reason_for_choice(first_choice)
                 span_recorder = get_span_recorder()
                 span_recorder.record_llm_call(
                     provider=self.provider,
                     model=self.model,
                     scope=scope,
-                    messages=messages,
+                    messages=call_params["messages"],
                     response_content=_serialize_for_span(result),
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
@@ -591,6 +755,22 @@ class OpenAICompatibleLLM(LLMInterface):
                     )
                     raise
 
+            except ProviderResponseError as e:
+                last_exception = e
+                if e.retryable and attempt < max_retries:
+                    logger.warning(
+                        f"Provider response error ({self.provider}/{self.model}, scope={scope}, "
+                        f"attempt {attempt + 1}/{max_retries + 1}): {e}"
+                    )
+                    backoff = min(initial_backoff * (2**attempt), max_backoff)
+                    await asyncio.sleep(backoff)
+                    continue
+                logger.error(
+                    f"Provider response error after {attempt + 1} attempts "
+                    f"({self.provider}/{self.model}, scope={scope}): {e}"
+                )
+                raise
+
             except Exception:
                 raise
 
@@ -629,26 +809,59 @@ class OpenAICompatibleLLM(LLMInterface):
         """
         start_time = time.time()
 
+        request_tool_choice: str | dict[str, Any] | None = tool_choice
+
         # Normalize named tool_choice dicts to "required" + filter tools.
         # Some providers (e.g. LM Studio, Ollama) reject the OpenAI named format
         # {"type": "function", "function": {"name": "..."}}.  The semantics are
         # identical to tool_choice="required" with the tools list restricted to
-        # just the requested tool, so we apply that transformation universally.
-        if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
-            forced_name = tool_choice.get("function", {}).get("name")
+        # just the requested tool, so we apply that transformation where supported.
+        if isinstance(request_tool_choice, dict) and request_tool_choice.get("type") == "function":
+            forced_name = request_tool_choice.get("function", {}).get("name")
             if forced_name:
                 filtered = [t for t in tools if t.get("function", {}).get("name") == forced_name]
                 if filtered:
                     tools = filtered
-                tool_choice = "required"
+                request_tool_choice = "required"
+
+        # DeepSeek accepts tool calls but rejects explicit required/named
+        # tool_choice values. The tools list has already been narrowed for
+        # forced calls, so omitting tool_choice preserves the practical behavior.
+        if "deepseek" in self.model.lower() and request_tool_choice != "auto":
+            request_tool_choice = None
+
+        # "auto" is the OpenAI API default — omitting tool_choice is semantically
+        # identical. Some providers (e.g. DeepSeek's reasoner pathway, which
+        # deepseek-v4-flash falls into when thinking mode is enabled) reject the
+        # parameter outright, returning HTTP 400 even for value "auto". Sending it
+        # only when the caller asks for a non-default behaviour avoids those 400s
+        # without changing semantics for compliant providers.
+        if request_tool_choice == "auto":
+            request_tool_choice = None
+
+        # DeepSeek tool-call replies can carry provider-specific reasoning_content.
+        # The normalized tool result does not retain it, but replaying assistant
+        # tool_calls without the field can trigger a 400. DeepSeek accepts an
+        # empty-string fallback, matching the provider's history-replay contract.
+        if "deepseek" in self.model.lower():
+            normalized_messages: list[dict[str, Any]] = []
+            for msg in messages:
+                if msg.get("role") == "assistant" and msg.get("tool_calls") and "reasoning_content" not in msg:
+                    normalized_msg = dict(msg)
+                    normalized_msg["reasoning_content"] = ""
+                    normalized_messages.append(normalized_msg)
+                else:
+                    normalized_messages.append(msg)
+            messages = normalized_messages
 
         # Build call parameters
         call_params: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "tools": tools,
-            "tool_choice": tool_choice,
         }
+        if request_tool_choice is not None:
+            call_params["tool_choice"] = request_tool_choice
 
         if max_completion_tokens is not None:
             call_params[self._max_tokens_param_name()] = max_completion_tokens
@@ -976,7 +1189,7 @@ class OpenAICompatibleLLM(LLMInterface):
         logger.info(f"Submitting batch with {len(requests)} requests to {self.provider}")
 
         # Format requests as JSONL
-        jsonl_content = "\n".join(json.dumps(req) for req in requests)
+        jsonl_content = "\n".join(json.dumps(req, ensure_ascii=False) for req in requests)
 
         # Upload file to provider (wrap in BytesIO with filename)
         file_bytes = io.BytesIO(jsonl_content.encode("utf-8"))

@@ -144,6 +144,7 @@ Retrieve a document's original text and metadata. This is useful for expanding d
 ### Python
 
 ```python
+import asyncio
 from hindsight_client_api import ApiClient, Configuration
 from hindsight_client_api.api import DocumentsApi
 
@@ -169,6 +170,8 @@ asyncio.run(get_document_example())
 ### Node.js
 
 ```javascript
+const apiClient = createClient(createConfig({ baseUrl: 'http://localhost:8888' }));
+
 // Get document to expand context from recall results
 const { data: doc, error } = await sdk.getDocument({
     client: apiClient,
@@ -310,84 +313,13 @@ List documents in a bank with optional filtering by ID and tags.
 ### Python
 
 ```python
-from hindsight_client_api import ApiClient, Configuration
-from hindsight_client_api.api import DocumentsApi
-
-async def list_documents_example():
-    config = Configuration(host="http://localhost:8888")
-    api_client = ApiClient(config)
-    api = DocumentsApi(api_client)
-
-    # List all documents
-    result = await api.list_documents(bank_id="my-bank")
-    print(f"Total documents: {result.total}")
-
-    # Filter by document ID substring
-    result = await api.list_documents(bank_id="my-bank", q="report")
-
-    # Filter by tags — only docs tagged with "team-a" (untagged excluded)
-    result = await api.list_documents(
-        bank_id="my-bank",
-        tags=["team-a"],
-        tags_match="any_strict",
-    )
-
-    # Combine ID search and tags
-    result = await api.list_documents(
-        bank_id="my-bank",
-        q="meeting",
-        tags=["team-a", "team-b"],
-        tags_match="all_strict",  # must have both tags
-    )
-
-    # Paginate
-    result = await api.list_documents(bank_id="my-bank", limit=20, offset=40)
-    print(f"Page items: {len(result.items)}")
-
-import asyncio
-asyncio.run(list_documents_example())
+# Section 'document-list' not found in api/documents.py
 ```
 
 ### Node.js
 
 ```javascript
-const apiClient = createClient(createConfig({ baseUrl: 'http://localhost:8888' }));
-
-// List all documents
-const { data: allDocs } = await sdk.listDocuments({
-    client: apiClient,
-    path: { bank_id: 'my-bank' }
-});
-console.log(`Total documents: ${allDocs.total}`);
-
-// Filter by document ID substring
-const { data: reportDocs } = await sdk.listDocuments({
-    client: apiClient,
-    path: { bank_id: 'my-bank' },
-    query: { q: 'report' }
-});
-
-// Filter by tags — only docs tagged with "team-a" (untagged excluded)
-const { data: taggedDocs } = await sdk.listDocuments({
-    client: apiClient,
-    path: { bank_id: 'my-bank' },
-    query: { tags: ['team-a'], tags_match: 'any_strict' }
-});
-
-// Combine ID search and tags
-const { data: filtered } = await sdk.listDocuments({
-    client: apiClient,
-    path: { bank_id: 'my-bank' },
-    query: { q: 'meeting', tags: ['team-a', 'team-b'], tags_match: 'all_strict' }
-});
-
-// Paginate
-const { data: page } = await sdk.listDocuments({
-    client: apiClient,
-    path: { bank_id: 'my-bank' },
-    query: { limit: 20, offset: 40 }
-});
-console.log(`Page items: ${page.items.length}`);
+# Section 'document-list' not found in api/documents.mjs
 ```
 
 ### CLI
@@ -436,6 +368,11 @@ hindsight document list my-bank --tags team-a --tags team-b
   "original_text": "Alice presented the Q4 roadmap...",
   "content_hash": "abc123def456",
   "memory_unit_count": 12,
+  "nodes_by_fact_type": {
+    "world": 5,
+    "experience": 4,
+    "observation": 3
+  },
   "created_at": "2024-03-15T14:00:00Z",
   "updated_at": "2024-03-15T14:00:00Z"
 }

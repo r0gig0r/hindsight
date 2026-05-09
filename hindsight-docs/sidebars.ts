@@ -180,6 +180,18 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: 'link',
+          href: '/sdks/integrations/chatgpt',
+          label: 'ChatGPT',
+          customProps: { icon: '/img/icons/chatgpt.png' },
+        },
+        {
+          type: 'link',
+          href: '/sdks/integrations/perplexity',
+          label: 'Perplexity',
+          customProps: { icon: '/img/icons/perplexity.png' },
+        },
+        {
+          type: 'link',
           href: '/sdks/integrations/litellm',
           label: 'LiteLLM',
           customProps: { icon: '/img/icons/litellm.png' },
@@ -261,6 +273,18 @@ const sidebars: SidebarsConfig = {
           href: '/sdks/integrations/strands',
           label: 'Strands Agents',
           customProps: { icon: '/img/icons/strands.png' },
+        },
+        {
+          type: 'link',
+          href: '/sdks/integrations/agentcore',
+          label: 'AgentCore Runtime',
+          customProps: { icon: '/img/icons/agentcore.png' },
+        },
+        {
+          type: 'link',
+          href: '/sdks/integrations/smolagents',
+          label: 'SmolAgents',
+          customProps: { icon: '/img/icons/smolagents.png' },
         },
         {
           type: 'link',

@@ -45,8 +45,9 @@ Migrations will automatically create the schema if it doesn't exist and create a
 |----------|-------------|---------|
 | `HINDSIGHT_API_DB_POOL_MIN_SIZE` | Minimum connections in the pool | `5` |
 | `HINDSIGHT_API_DB_POOL_MAX_SIZE` | Maximum connections in the pool | `100` |
-| `HINDSIGHT_API_DB_COMMAND_TIMEOUT` | PostgreSQL command timeout in seconds | `60` |
+| `HINDSIGHT_API_DB_COMMAND_TIMEOUT` | PostgreSQL command timeout in seconds (asyncpg client-side) | `60` |
 | `HINDSIGHT_API_DB_ACQUIRE_TIMEOUT` | Connection acquisition timeout in seconds | `30` |
+| `HINDSIGHT_API_DB_STATEMENT_TIMEOUT` | Postgres `statement_timeout` applied to every pool connection, in seconds. Server-side safety net for runaway queries. Does **not** apply to Alembic migrations (which run on a separate psycopg2 engine). Set to `0` to disable. | `600` |
 
 For high-concurrency workloads, increase `DB_POOL_MAX_SIZE`. Each concurrent recall/think operation can use 2-4 connections.
 
@@ -161,12 +162,12 @@ To switch between backends:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HINDSIGHT_API_LLM_PROVIDER` | Provider: `openai`, `openai-codex`, `claude-code`, `anthropic`, `gemini`, `groq`, `minimax`, `ollama`, `lmstudio`, `llamacpp`, `vertexai`, `bedrock`, `litellm`, `volcano`, `openrouter`, `none` | `openai` |
+| `HINDSIGHT_API_LLM_PROVIDER` | Provider: `openai`, `openai-codex`, `claude-code`, `anthropic`, `gemini`, `groq`, `minimax`, `deepseek`, `ollama`, `lmstudio`, `llamacpp`, `vertexai`, `bedrock`, `litellm`, `volcano`, `openrouter`, `none` | `openai` |
 | `HINDSIGHT_API_LLM_API_KEY` | API key for LLM provider | - |
 | `HINDSIGHT_API_LLM_MODEL` | Model name | `gpt-5-mini` |
 | `HINDSIGHT_API_LLM_BASE_URL` | Custom LLM endpoint | Provider default |
 | `HINDSIGHT_API_LLM_MAX_CONCURRENT` | Max concurrent LLM requests | `32` |
-| `HINDSIGHT_API_LLM_MAX_RETRIES` | Max retry attempts for LLM API calls | `10` |
+| `HINDSIGHT_API_LLM_MAX_RETRIES` | Max retry attempts for LLM API calls | `3` |
 | `HINDSIGHT_API_LLM_INITIAL_BACKOFF` | Initial retry backoff in seconds (exponential backoff) | `1.0` |
 | `HINDSIGHT_API_LLM_MAX_BACKOFF` | Max retry backoff cap in seconds | `60.0` |
 | `HINDSIGHT_API_LLM_TIMEOUT` | LLM request timeout in seconds | `120` |
@@ -252,6 +253,18 @@ export HINDSIGHT_API_LLM_MODEL=doubao-pro-32k
 export HINDSIGHT_API_LLM_PROVIDER=openrouter
 export HINDSIGHT_API_LLM_API_KEY=your-openrouter-api-key
 export HINDSIGHT_API_LLM_MODEL=qwen/qwen3.5-9b
+
+# DeepSeek (OpenAI-compatible, https://api.deepseek.com)
+export HINDSIGHT_API_LLM_PROVIDER=deepseek
+export HINDSIGHT_API_LLM_API_KEY=sk-xxxxxxxxxxxx
+export HINDSIGHT_API_LLM_MODEL=deepseek-v4-flash
+# Notes:
+# - `deepseek-v4-flash` defaults to thinking mode at the API level (treated as
+#   `deepseek-reasoner`). Hindsight handles this transparently; the reflect
+#   agent will not crash with "deepseek-reasoner does not support this
+#   tool_choice".
+# - Use `deepseek-v4-pro` for the higher-quality reasoning route.
+# - Use `deepseek-chat` for the non-thinking alias (faster, cheaper).
 
 # AWS Bedrock (native support - no API key needed, uses AWS credentials)
 export HINDSIGHT_API_LLM_PROVIDER=bedrock
@@ -401,11 +414,13 @@ export HINDSIGHT_API_RETAIN_LLM_MAX_BACKOFF=120.0    # Cap at 2min instead of 1m
 | `HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY` | OpenAI API key (falls back to `HINDSIGHT_API_LLM_API_KEY`) | - |
 | `HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL` | OpenAI embedding model | `text-embedding-3-small` |
 | `HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL` | Custom base URL for OpenAI-compatible API (e.g., Azure OpenAI) | - |
+| `HINDSIGHT_API_EMBEDDINGS_OPENAI_BATCH_SIZE` | Max inputs per `embeddings.create` call for `openai`/`openrouter` providers — lower this when the upstream endpoint enforces stricter limits (e.g. DashScope caps at 10) | `100` |
 | `HINDSIGHT_API_EMBEDDINGS_OPENROUTER_API_KEY` | OpenRouter API key for embeddings (falls back to `HINDSIGHT_API_OPENROUTER_API_KEY`, then `HINDSIGHT_API_LLM_API_KEY`) | - |
 | `HINDSIGHT_API_EMBEDDINGS_OPENROUTER_MODEL` | OpenRouter embedding model | `perplexity/pplx-embed-v1-0.6b` |
 | `HINDSIGHT_API_EMBEDDINGS_COHERE_API_KEY` | Cohere API key for embeddings | - |
 | `HINDSIGHT_API_EMBEDDINGS_COHERE_MODEL` | Cohere embedding model | `embed-english-v3.0` |
 | `HINDSIGHT_API_EMBEDDINGS_COHERE_BASE_URL` | Custom base URL for Cohere-compatible API (e.g., Azure-hosted) | - |
+| `HINDSIGHT_API_EMBEDDINGS_COHERE_OUTPUT_DIMENSIONS` | Output embedding dimensions for Cohere (e.g., `256`, `512`, `1024`). When set, overrides the model's default dimension. | - |
 | `HINDSIGHT_API_EMBEDDINGS_LITELLM_API_BASE` | LiteLLM proxy base URL for embeddings | `http://localhost:4000` |
 | `HINDSIGHT_API_EMBEDDINGS_LITELLM_API_KEY` | LiteLLM proxy API key for embeddings (optional, depends on proxy config) | - |
 | `HINDSIGHT_API_EMBEDDINGS_LITELLM_MODEL` | LiteLLM embedding model (use provider prefix, e.g., `cohere/embed-english-v3.0`) | `text-embedding-3-small` |
@@ -417,6 +432,7 @@ export HINDSIGHT_API_RETAIN_LLM_MAX_BACKOFF=120.0    # Cap at 2min instead of 1m
 | `HINDSIGHT_API_EMBEDDINGS_GEMINI_API_KEY` | Gemini API key for embeddings (falls back to `HINDSIGHT_API_LLM_API_KEY`) | - |
 | `HINDSIGHT_API_EMBEDDINGS_GEMINI_MODEL` | Gemini embedding model | `gemini-embedding-001` |
 | `HINDSIGHT_API_EMBEDDINGS_GEMINI_OUTPUT_DIMENSIONALITY` | Output embedding dimensions (Gemini supports configurable dimensionality) | `768` |
+| `HINDSIGHT_API_EMBEDDINGS_GEMINI_FORCE_IPV4` | Force the Gemini embeddings client to use an IPv4-only HTTP transport. Useful in environments where IPv6 egress is broken (e.g. some Docker/VPC setups) and AAAA DNS records cause long hangs. | `false` |
 | `HINDSIGHT_API_EMBEDDINGS_VERTEXAI_PROJECT_ID` | Vertex AI project ID for embeddings (falls back to `HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID`) | - |
 | `HINDSIGHT_API_EMBEDDINGS_VERTEXAI_REGION` | Vertex AI region for embeddings (falls back to `HINDSIGHT_API_LLM_VERTEXAI_REGION`) | - |
 | `HINDSIGHT_API_EMBEDDINGS_VERTEXAI_SERVICE_ACCOUNT_KEY` | Service account key for Vertex AI embeddings (falls back to `HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY`) | - |
@@ -455,6 +471,8 @@ export HINDSIGHT_API_EMBEDDINGS_OPENROUTER_MODEL=perplexity/pplx-embed-v1-0.6b
 export HINDSIGHT_API_EMBEDDINGS_PROVIDER=cohere
 export HINDSIGHT_API_EMBEDDINGS_COHERE_API_KEY=your-api-key
 export HINDSIGHT_API_EMBEDDINGS_COHERE_MODEL=embed-english-v3.0  # 1024 dimensions
+# Optional: override output dimensions (for Matryoshka-capable models)
+# export HINDSIGHT_API_EMBEDDINGS_COHERE_OUTPUT_DIMENSIONS=512
 
 # Azure-hosted Cohere - embeddings via custom endpoint
 export HINDSIGHT_API_EMBEDDINGS_PROVIDER=cohere
@@ -555,6 +573,7 @@ Google's `gemini-embedding-001` produces 3072 dimensions natively but supports c
 | `HINDSIGHT_API_RERANKER_GOOGLE_SERVICE_ACCOUNT_KEY` | Path to service account JSON key (falls back to `HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY`). If unset, uses ADC. | - |
 | `HINDSIGHT_API_RERANKER_FLASHRANK_MODEL` | FlashRank model for fast CPU-based reranking | `ms-marco-MiniLM-L-12-v2` |
 | `HINDSIGHT_API_RERANKER_FLASHRANK_CACHE_DIR` | Cache directory for FlashRank models | System default |
+| `HINDSIGHT_API_RERANKER_FLASHRANK_CPU_MEM_ARENA` | Enable ONNX Runtime CPU memory arena for FlashRank. When `true`, ONNX pre-allocates a memory arena that never shrinks, causing RSS to grow monotonically. `false` trades slightly slower per-call allocation for bounded RSS. | `false` |
 | `HINDSIGHT_API_RERANKER_JINA_MLX_MODEL_PATH` | Local path to downloaded `jina-reranker-v3-mlx` model (auto-downloads from HuggingFace if unset) | - |
 
 ```bash
@@ -913,6 +932,25 @@ export HINDSIGHT_API_FILE_PARSER_IRIS_ORG_ID=your-org-id
 export HINDSIGHT_API_FILE_PARSER=iris,markitdown
 ```
 
+#### Parser: llama_parse
+
+Cloud-based extraction via [LlamaParse](https://docs.cloud.llamaindex.ai/llamaparse) (LlamaIndex). Strong extraction for complex layouts — tables, charts, multi-column PDFs.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HINDSIGHT_API_FILE_PARSER_LLAMA_PARSE_API_KEY` | LlamaCloud API key (typically starts with `llx-`) | — |
+
+**Supported formats:** PDF, DOCX, PPTX, XLSX, HTML, EPUB, RTF, TXT, and many more — see the [LlamaParse docs](https://docs.cloud.llamaindex.ai/llamaparse/features/supported_document_types) for the full list.
+
+```bash
+# Use llama_parse as the only parser
+export HINDSIGHT_API_FILE_PARSER=llama_parse
+export HINDSIGHT_API_FILE_PARSER_LLAMA_PARSE_API_KEY=llx-your-api-key
+
+# Or: try llama_parse first, fall back to markitdown
+export HINDSIGHT_API_FILE_PARSER=llama_parse,markitdown
+```
+
 ```bash
 # Increase batch limits for large file imports
 export HINDSIGHT_API_FILE_CONVERSION_MAX_BATCH_SIZE=20
@@ -1020,7 +1058,8 @@ Observations are deduplicated, evidence-grounded knowledge consolidated from mul
 | `HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND` | Maximum memories processed per consolidation round. When the limit is reached, the job yields its worker slot and re-queues itself so other banks get fair scheduling. Mental model refreshes only run on the final round. `0` = unlimited. Configurable per bank. | `100` |
 | `HINDSIGHT_API_CONSOLIDATION_MAX_TOKENS` | Max tokens for recall when finding related observations during consolidation | `1024` |
 | `HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE` | Number of facts sent to the LLM in a single consolidation call. Higher values reduce LLM calls and improve throughput at the cost of larger prompts. Set to `1` to disable batching. Configurable per bank. | `8` |
-| `HINDSIGHT_API_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS` | Total token budget for source facts included with observations in the consolidation prompt. `-1` = unlimited. Configurable per bank. | `-1` |
+| `HINDSIGHT_API_CONSOLIDATION_RECALL_BUDGET` | Budget level for the recall pass inside consolidation (`low`, `mid`, `high`). Lower budgets fetch fewer candidate rows, reducing peak memory usage on large banks. | `low` |
+| `HINDSIGHT_API_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS` | Total token budget for source facts included with observations in the consolidation prompt. `-1` = unlimited. Configurable per bank. | `4096` |
 | `HINDSIGHT_API_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS_PER_OBSERVATION` | Per-observation token cap for source facts in the consolidation prompt. Each observation independently gets at most this many tokens of source facts. `-1` = unlimited. Configurable per bank. | `256` |
 | `HINDSIGHT_API_OBSERVATIONS_MISSION` | What this bank should synthesise into durable observations. Replaces the built-in consolidation rules — leave unset to use the server default. | - |
 | `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE` | Maximum number of observations allowed per tag scope. When the limit is reached, consolidation will only update or delete existing observations — no new ones are created. Applies per tag scope (e.g., per-tag when using `per_tag` observation scopes). Observations with no tags are not subject to this limit. `-1` = unlimited. Configurable per bank. | `-1` |
@@ -1119,7 +1158,7 @@ export HINDSIGHT_API_MCP_ENABLED_TOOLS=recall
 export HINDSIGHT_API_MCP_ENABLED_TOOLS=recall,reflect
 ```
 
-Available tool names: `retain`, `recall`, `reflect`, `list_banks`, `create_bank`, `list_mental_models`, `get_mental_model`, `create_mental_model`, `update_mental_model`, `delete_mental_model`, `refresh_mental_model`, `list_directives`, `create_directive`, `delete_directive`, `list_memories`, `get_memory`, `delete_memory`, `list_documents`, `get_document`, `delete_document`, `list_operations`, `get_operation`, `cancel_operation`, `list_tags`, `get_bank`, `get_bank_stats`, `update_bank`, `delete_bank`, `clear_memories`.
+Available tool names: `retain`, `recall`, `reflect`, `list_banks`, `create_bank`, `list_mental_models`, `get_mental_model`, `create_mental_model`, `update_mental_model`, `delete_mental_model`, `refresh_mental_model`, `list_directives`, `create_directive`, `delete_directive`, `list_memories`, `get_memory`, `list_documents`, `get_document`, `delete_document`, `list_operations`, `get_operation`, `cancel_operation`, `list_tags`, `get_bank`, `get_bank_stats`, `update_bank`, `delete_bank`, `clear_memories`.
 
 This can also be overridden per bank via the [config API](#hierarchical-configuration):
 
@@ -1161,10 +1200,17 @@ Configuration for background task processing. By default, the API processes task
 | `HINDSIGHT_API_WORKER_MAX_RETRIES` | Max retries before marking task failed | `3` |
 | `HINDSIGHT_API_WORKER_HTTP_PORT` | HTTP port for worker metrics/health (worker CLI only) | `8889` |
 | `HINDSIGHT_API_WORKER_MAX_SLOTS` | Maximum concurrent tasks per worker (total across all operation types) | `10` |
-| `HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS` | Slots reserved for consolidation tasks within `WORKER_MAX_SLOTS` | `2` |
+| `HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS` | Reserved slots for consolidation tasks within `WORKER_MAX_SLOTS` (bank-serialization preserved) | `2` |
+| `HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS` | Reserved slots for retain tasks within `WORKER_MAX_SLOTS` | `0` |
+| `HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_MAX_SLOTS` | Reserved slots for file_convert_retain tasks within `WORKER_MAX_SLOTS` | `0` |
+| `HINDSIGHT_API_WORKER_REFRESH_MENTAL_MODEL_MAX_SLOTS` | Reserved slots for refresh_mental_model tasks within `WORKER_MAX_SLOTS` | `0` |
 
-:::note Slot reservation
-`WORKER_CONSOLIDATION_MAX_SLOTS` is a **reservation within** `WORKER_MAX_SLOTS`, not an additive pool. With the defaults (`MAX_SLOTS=10`, `CONSOLIDATION_MAX_SLOTS=2`), retain and other non-consolidation tasks may use at most `10 - 2 = 8` concurrent slots, leaving 2 always available for consolidation. This prevents consolidation from being starved when retain throughput continuously saturates the queue. Set `CONSOLIDATION_MAX_SLOTS=0` to give all slots to non-consolidation work.
+:::note Slot reservations and shared pool
+Per-operation `*_MAX_SLOTS` values are **reservations within** `WORKER_MAX_SLOTS`, not additive pools. The sum of all reservations must not exceed `WORKER_MAX_SLOTS` (startup raises `ValueError` otherwise). Remaining capacity (`WORKER_MAX_SLOTS - sum of reservations`) forms a **shared pool** usable by any operation type on a first-come basis; operation types whose reserved capacity is full can also overflow into the shared pool. Consolidation's bank-serialization constraint (no two consolidation tasks for the same bank concurrently) is preserved regardless of which pool claims the slot.
+
+Example: `MAX_SLOTS=10, CONSOLIDATION=2, RETAIN=3, REFRESH_MENTAL_MODEL=2` → shared pool = `10 - (2+3+2) = 3`.
+
+With the defaults (`MAX_SLOTS=10`, `CONSOLIDATION_MAX_SLOTS=2`, all other reservations `0`), 2 slots are always reserved for consolidation and the remaining 8 form the shared pool for any operation type. Set `CONSOLIDATION_MAX_SLOTS=0` to release consolidation's reserved capacity into the shared pool.
 :::
 
 ### Performance Optimization

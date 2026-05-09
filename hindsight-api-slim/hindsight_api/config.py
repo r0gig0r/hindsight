@@ -10,9 +10,12 @@ import os
 import sys
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from dotenv import find_dotenv, load_dotenv
+
+from ._vector_index import validate_extension
+from .utils import mask_network_location
 
 # Load .env file, searching current and parent directories (overrides existing env vars)
 load_dotenv(find_dotenv(usecwd=True), override=True)
@@ -117,7 +120,11 @@ def normalize_config_dict(config: dict[str, Any]) -> dict[str, Any]:
 
 
 # Environment variable names
+ENV_DATABASE_BACKEND = "HINDSIGHT_API_DATABASE_BACKEND"
 ENV_DATABASE_URL = "HINDSIGHT_API_DATABASE_URL"
+ENV_READ_DATABASE_URL = "HINDSIGHT_API_READ_DATABASE_URL"
+ENV_READ_DB_POOL_MIN_SIZE = "HINDSIGHT_API_READ_DB_POOL_MIN_SIZE"
+ENV_READ_DB_POOL_MAX_SIZE = "HINDSIGHT_API_READ_DB_POOL_MAX_SIZE"
 ENV_MIGRATION_DATABASE_URL = "HINDSIGHT_API_MIGRATION_DATABASE_URL"
 ENV_DATABASE_SCHEMA = "HINDSIGHT_API_DATABASE_SCHEMA"
 ENV_LLM_PROVIDER = "HINDSIGHT_API_LLM_PROVIDER"
@@ -132,11 +139,23 @@ ENV_LLM_TIMEOUT = "HINDSIGHT_API_LLM_TIMEOUT"
 ENV_LLM_GROQ_SERVICE_TIER = "HINDSIGHT_API_LLM_GROQ_SERVICE_TIER"
 ENV_LLM_OPENAI_SERVICE_TIER = "HINDSIGHT_API_LLM_OPENAI_SERVICE_TIER"
 ENV_LLM_EXTRA_BODY = "HINDSIGHT_API_LLM_EXTRA_BODY"
+ENV_LLM_DEFAULT_HEADERS = "HINDSIGHT_API_LLM_DEFAULT_HEADERS"
+
+# LiteLLM Router chain — provider-specific config consumed by the "litellmrouter"
+# provider. Each entry is a deployment; the Router tries them in declared order and
+# falls back to the next on transient errors (5xx, rate-limit, timeout).
+# Provider-scoped naming mirrors other provider-specific flags (e.g. llm_groq_*,
+# llm_vertexai_*). Note the single token "LITELLMROUTER" — keeping it one word
+# disambiguates from the embeddings/reranker LITELLM_* settings.
+ENV_LLM_LITELLMROUTER_CONFIG = "HINDSIGHT_API_LLM_LITELLMROUTER_CONFIG"
 
 # Defaults for service tiers
 DEFAULT_LLM_GROQ_SERVICE_TIER = "auto"  # "on_demand", "flex", or "auto"
 DEFAULT_LLM_OPENAI_SERVICE_TIER = None  # None (default) or "flex" (50% cheaper)
 DEFAULT_LLM_EXTRA_BODY = None  # None = no extra body params; JSON dict merged into OpenAI extra_body
+DEFAULT_LLM_DEFAULT_HEADERS = (
+    None  # None = no extra headers; JSON dict passed as default_headers to provider SDK clients
+)
 
 # Per-operation LLM configuration (optional, falls back to global LLM config)
 ENV_RETAIN_LLM_PROVIDER = "HINDSIGHT_API_RETAIN_LLM_PROVIDER"
@@ -148,6 +167,7 @@ ENV_RETAIN_LLM_MAX_RETRIES = "HINDSIGHT_API_RETAIN_LLM_MAX_RETRIES"
 ENV_RETAIN_LLM_INITIAL_BACKOFF = "HINDSIGHT_API_RETAIN_LLM_INITIAL_BACKOFF"
 ENV_RETAIN_LLM_MAX_BACKOFF = "HINDSIGHT_API_RETAIN_LLM_MAX_BACKOFF"
 ENV_RETAIN_LLM_TIMEOUT = "HINDSIGHT_API_RETAIN_LLM_TIMEOUT"
+ENV_RETAIN_LLM_LITELLMROUTER_CONFIG = "HINDSIGHT_API_RETAIN_LLM_LITELLMROUTER_CONFIG"
 
 ENV_REFLECT_LLM_PROVIDER = "HINDSIGHT_API_REFLECT_LLM_PROVIDER"
 ENV_REFLECT_LLM_API_KEY = "HINDSIGHT_API_REFLECT_LLM_API_KEY"
@@ -158,6 +178,7 @@ ENV_REFLECT_LLM_MAX_RETRIES = "HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES"
 ENV_REFLECT_LLM_INITIAL_BACKOFF = "HINDSIGHT_API_REFLECT_LLM_INITIAL_BACKOFF"
 ENV_REFLECT_LLM_MAX_BACKOFF = "HINDSIGHT_API_REFLECT_LLM_MAX_BACKOFF"
 ENV_REFLECT_LLM_TIMEOUT = "HINDSIGHT_API_REFLECT_LLM_TIMEOUT"
+ENV_REFLECT_LLM_LITELLMROUTER_CONFIG = "HINDSIGHT_API_REFLECT_LLM_LITELLMROUTER_CONFIG"
 
 ENV_CONSOLIDATION_LLM_PROVIDER = "HINDSIGHT_API_CONSOLIDATION_LLM_PROVIDER"
 ENV_CONSOLIDATION_LLM_API_KEY = "HINDSIGHT_API_CONSOLIDATION_LLM_API_KEY"
@@ -168,6 +189,7 @@ ENV_CONSOLIDATION_LLM_MAX_RETRIES = "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_RETRIES
 ENV_CONSOLIDATION_LLM_INITIAL_BACKOFF = "HINDSIGHT_API_CONSOLIDATION_LLM_INITIAL_BACKOFF"
 ENV_CONSOLIDATION_LLM_MAX_BACKOFF = "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_BACKOFF"
 ENV_CONSOLIDATION_LLM_TIMEOUT = "HINDSIGHT_API_CONSOLIDATION_LLM_TIMEOUT"
+ENV_CONSOLIDATION_LLM_LITELLMROUTER_CONFIG = "HINDSIGHT_API_CONSOLIDATION_LLM_LITELLMROUTER_CONFIG"
 
 ENV_EMBEDDINGS_PROVIDER = "HINDSIGHT_API_EMBEDDINGS_PROVIDER"
 ENV_EMBEDDINGS_LOCAL_MODEL = "HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL"
@@ -177,11 +199,13 @@ ENV_EMBEDDINGS_TEI_URL = "HINDSIGHT_API_EMBEDDINGS_TEI_URL"
 ENV_EMBEDDINGS_OPENAI_API_KEY = "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"
 ENV_EMBEDDINGS_OPENAI_MODEL = "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL"
 ENV_EMBEDDINGS_OPENAI_BASE_URL = "HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL"
+ENV_EMBEDDINGS_OPENAI_BATCH_SIZE = "HINDSIGHT_API_EMBEDDINGS_OPENAI_BATCH_SIZE"
 
 # Gemini/Vertex AI embeddings configuration
 ENV_EMBEDDINGS_GEMINI_API_KEY = "HINDSIGHT_API_EMBEDDINGS_GEMINI_API_KEY"
 ENV_EMBEDDINGS_GEMINI_MODEL = "HINDSIGHT_API_EMBEDDINGS_GEMINI_MODEL"
 ENV_EMBEDDINGS_GEMINI_OUTPUT_DIMENSIONALITY = "HINDSIGHT_API_EMBEDDINGS_GEMINI_OUTPUT_DIMENSIONALITY"
+ENV_EMBEDDINGS_GEMINI_FORCE_IPV4 = "HINDSIGHT_API_EMBEDDINGS_GEMINI_FORCE_IPV4"
 ENV_EMBEDDINGS_VERTEXAI_PROJECT_ID = "HINDSIGHT_API_EMBEDDINGS_VERTEXAI_PROJECT_ID"
 ENV_EMBEDDINGS_VERTEXAI_REGION = "HINDSIGHT_API_EMBEDDINGS_VERTEXAI_REGION"
 ENV_EMBEDDINGS_VERTEXAI_SERVICE_ACCOUNT_KEY = "HINDSIGHT_API_EMBEDDINGS_VERTEXAI_SERVICE_ACCOUNT_KEY"
@@ -190,6 +214,7 @@ ENV_EMBEDDINGS_VERTEXAI_SERVICE_ACCOUNT_KEY = "HINDSIGHT_API_EMBEDDINGS_VERTEXAI
 ENV_EMBEDDINGS_COHERE_API_KEY = "HINDSIGHT_API_EMBEDDINGS_COHERE_API_KEY"
 ENV_EMBEDDINGS_COHERE_MODEL = "HINDSIGHT_API_EMBEDDINGS_COHERE_MODEL"
 ENV_EMBEDDINGS_COHERE_BASE_URL = "HINDSIGHT_API_EMBEDDINGS_COHERE_BASE_URL"
+ENV_EMBEDDINGS_COHERE_OUTPUT_DIMENSIONS = "HINDSIGHT_API_EMBEDDINGS_COHERE_OUTPUT_DIMENSIONS"
 ENV_RERANKER_COHERE_API_KEY = "HINDSIGHT_API_RERANKER_COHERE_API_KEY"
 ENV_RERANKER_COHERE_MODEL = "HINDSIGHT_API_RERANKER_COHERE_MODEL"
 ENV_RERANKER_COHERE_BASE_URL = "HINDSIGHT_API_RERANKER_COHERE_BASE_URL"
@@ -242,6 +267,7 @@ ENV_RERANKER_TEI_HTTP_TIMEOUT = "HINDSIGHT_API_RERANKER_TEI_HTTP_TIMEOUT"
 ENV_RERANKER_MAX_CANDIDATES = "HINDSIGHT_API_RERANKER_MAX_CANDIDATES"
 ENV_RERANKER_FLASHRANK_MODEL = "HINDSIGHT_API_RERANKER_FLASHRANK_MODEL"
 ENV_RERANKER_FLASHRANK_CACHE_DIR = "HINDSIGHT_API_RERANKER_FLASHRANK_CACHE_DIR"
+ENV_RERANKER_FLASHRANK_CPU_MEM_ARENA = "HINDSIGHT_API_RERANKER_FLASHRANK_CPU_MEM_ARENA"
 
 # ZeroEntropy configuration (reranker only)
 ENV_RERANKER_ZEROENTROPY_API_KEY = "HINDSIGHT_API_RERANKER_ZEROENTROPY_API_KEY"
@@ -327,6 +353,7 @@ ENV_FILE_PARSER = "HINDSIGHT_API_FILE_PARSER"
 ENV_FILE_PARSER_ALLOWLIST = "HINDSIGHT_API_FILE_PARSER_ALLOWLIST"
 ENV_FILE_PARSER_IRIS_TOKEN = "HINDSIGHT_API_FILE_PARSER_IRIS_TOKEN"
 ENV_FILE_PARSER_IRIS_ORG_ID = "HINDSIGHT_API_FILE_PARSER_IRIS_ORG_ID"
+ENV_FILE_PARSER_LLAMA_PARSE_API_KEY = "HINDSIGHT_API_FILE_PARSER_LLAMA_PARSE_API_KEY"
 ENV_FILE_CONVERSION_MAX_BATCH_SIZE_MB = "HINDSIGHT_API_FILE_CONVERSION_MAX_BATCH_SIZE_MB"
 ENV_FILE_CONVERSION_MAX_BATCH_SIZE = "HINDSIGHT_API_FILE_CONVERSION_MAX_BATCH_SIZE"
 ENV_ENABLE_FILE_UPLOAD_API = "HINDSIGHT_API_ENABLE_FILE_UPLOAD_API"
@@ -342,6 +369,7 @@ ENV_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS = "HINDSIGHT_API_CONSOLIDATION_SOURCE_
 ENV_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS_PER_OBSERVATION = (
     "HINDSIGHT_API_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS_PER_OBSERVATION"
 )
+ENV_CONSOLIDATION_RECALL_BUDGET = "HINDSIGHT_API_CONSOLIDATION_RECALL_BUDGET"
 ENV_CONSOLIDATION_MAX_ATTEMPTS = "HINDSIGHT_API_CONSOLIDATION_MAX_ATTEMPTS"
 ENV_OBSERVATIONS_MISSION = "HINDSIGHT_API_OBSERVATIONS_MISSION"
 ENV_MAX_OBSERVATIONS_PER_SCOPE = "HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE"
@@ -383,6 +411,7 @@ ENV_DB_POOL_MIN_SIZE = "HINDSIGHT_API_DB_POOL_MIN_SIZE"
 ENV_DB_POOL_MAX_SIZE = "HINDSIGHT_API_DB_POOL_MAX_SIZE"
 ENV_DB_COMMAND_TIMEOUT = "HINDSIGHT_API_DB_COMMAND_TIMEOUT"
 ENV_DB_ACQUIRE_TIMEOUT = "HINDSIGHT_API_DB_ACQUIRE_TIMEOUT"
+ENV_DB_STATEMENT_TIMEOUT = "HINDSIGHT_API_DB_STATEMENT_TIMEOUT"
 
 # Worker configuration (distributed task processing)
 ENV_WORKER_ENABLED = "HINDSIGHT_API_WORKER_ENABLED"
@@ -391,7 +420,18 @@ ENV_WORKER_POLL_INTERVAL_MS = "HINDSIGHT_API_WORKER_POLL_INTERVAL_MS"
 ENV_WORKER_MAX_RETRIES = "HINDSIGHT_API_WORKER_MAX_RETRIES"
 ENV_WORKER_HTTP_PORT = "HINDSIGHT_API_WORKER_HTTP_PORT"
 ENV_WORKER_MAX_SLOTS = "HINDSIGHT_API_WORKER_MAX_SLOTS"
-ENV_WORKER_CONSOLIDATION_MAX_SLOTS = "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS"
+
+# Per-operation-type slot reservations. Each entry maps an operation_type
+# (as stored in async_operations.operation_type) to its env var and default.
+# Adding a new operation type here is the ONLY change needed to make it
+# reservable via env var — config fields, from_env(), and the
+# worker_slot_reservations property all derive from this dict.
+WORKER_SLOT_RESERVATION_TYPES: dict[str, tuple[str, int]] = {
+    "consolidation": ("HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS", 2),
+    "retain": ("HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS", 0),
+    "file_convert_retain": ("HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_MAX_SLOTS", 0),
+    "refresh_mental_model": ("HINDSIGHT_API_WORKER_REFRESH_MENTAL_MODEL_MAX_SLOTS", 0),
+}
 ENV_RETAIN_MAX_CONCURRENT = "HINDSIGHT_API_RETAIN_MAX_CONCURRENT"
 
 # Reflect agent settings
@@ -434,6 +474,7 @@ ENV_DISPOSITION_LITERALISM = "HINDSIGHT_API_DISPOSITION_LITERALISM"
 ENV_DISPOSITION_EMPATHY = "HINDSIGHT_API_DISPOSITION_EMPATHY"
 
 # Default values
+DEFAULT_DATABASE_BACKEND = "postgresql"
 DEFAULT_DATABASE_URL = "pg0"
 DEFAULT_DATABASE_SCHEMA = "public"
 DEFAULT_LLM_PROVIDER = "openai"
@@ -445,11 +486,13 @@ PROVIDER_DEFAULT_MODELS = {
     "gemini": "gemini-2.5-flash",
     "groq": "openai/gpt-oss-120b",
     "minimax": "MiniMax-M2.7",
+    "deepseek": "deepseek-v4-flash",
+    "zai": "glm-4.5-flash",
     "ollama": "gemma3:12b",
     "llamacpp": "gemma-4-e2b-it",
     "lmstudio": "local-model",
     "vertexai": "google/gemini-2.5-flash-lite",
-    "openai-codex": "gpt-5.2-codex",
+    "openai-codex": "gpt-5.4-mini",
     "claude-code": "claude-sonnet-4-5-20250929",
     "mock": "mock-model",
     "none": "none",
@@ -482,16 +525,18 @@ DEFAULT_LLM_GEMINI_SAFETY_SETTINGS = None  # None = use Gemini default safety se
 
 DEFAULT_EMBEDDINGS_PROVIDER = "local"
 DEFAULT_EMBEDDINGS_LOCAL_MODEL = "BAAI/bge-small-en-v1.5"
-DEFAULT_EMBEDDINGS_LOCAL_FORCE_CPU = False  # Force CPU mode for local embeddings (avoids MPS/XPC issues on macOS)
+DEFAULT_EMBEDDINGS_LOCAL_FORCE_CPU = False  # Force CPU mode for local embeddings
 DEFAULT_EMBEDDINGS_LOCAL_TRUST_REMOTE_CODE = False  # Security: disabled by default, required for some models
 DEFAULT_EMBEDDINGS_OPENAI_MODEL = "text-embedding-3-small"
+DEFAULT_EMBEDDINGS_OPENAI_BATCH_SIZE = 100
 DEFAULT_EMBEDDINGS_GEMINI_MODEL = "gemini-embedding-001"
 DEFAULT_EMBEDDINGS_GEMINI_OUTPUT_DIMENSIONALITY = 768
+DEFAULT_EMBEDDINGS_GEMINI_FORCE_IPV4 = False
 DEFAULT_EMBEDDING_DIMENSION = 384
 
 DEFAULT_RERANKER_PROVIDER = "local"
 DEFAULT_RERANKER_LOCAL_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-DEFAULT_RERANKER_LOCAL_FORCE_CPU = False  # Force CPU mode for local reranker (avoids MPS/XPC issues on macOS)
+DEFAULT_RERANKER_LOCAL_FORCE_CPU = False  # Force CPU mode for local reranker
 DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT = 4  # Limit concurrent CPU-bound reranking to prevent thrashing
 DEFAULT_RERANKER_LOCAL_TRUST_REMOTE_CODE = (
     False  # Security: disabled by default, required for some models like jina-reranker-v2
@@ -505,6 +550,7 @@ DEFAULT_RERANKER_TEI_HTTP_TIMEOUT = 30.0  # HTTP timeout for TEI reranker reques
 DEFAULT_RERANKER_MAX_CANDIDATES = 300
 DEFAULT_RERANKER_FLASHRANK_MODEL = "ms-marco-MiniLM-L-12-v2"  # Best balance of speed and quality
 DEFAULT_RERANKER_FLASHRANK_CACHE_DIR = None  # Use default cache directory
+DEFAULT_RERANKER_FLASHRANK_CPU_MEM_ARENA = False  # Disable ONNX CPU memory arena to bound RSS
 
 DEFAULT_EMBEDDINGS_COHERE_MODEL = "embed-english-v3.0"
 DEFAULT_RERANKER_COHERE_MODEL = "rerank-english-v3.0"
@@ -520,8 +566,8 @@ DEFAULT_RERANKER_SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 
 DEFAULT_RERANKER_GOOGLE_MODEL = "semantic-ranker-default-004"
 
-# Vector extension (pgvector, vchord, or pgvectorscale)
-DEFAULT_VECTOR_EXTENSION = "pgvector"  # Options: "pgvector", "vchord", "pgvectorscale"
+# Vector extension (pgvector, vchord, pgvectorscale, or AlloyDB ScaNN)
+DEFAULT_VECTOR_EXTENSION = "pgvector"  # Options: "pgvector", "vchord", "pgvectorscale", "scann"
 
 # Text search extension (native PostgreSQL, vchord BM25, or Timescale pg_textsearch)
 DEFAULT_TEXT_SEARCH_EXTENSION = "native"  # Options: "native", "vchord", "pg_textsearch"
@@ -593,10 +639,11 @@ DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = (
     100  # Max memories per consolidation round (0 = unlimited). Limits how long one bank holds a worker slot.
 )
 DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE = 8  # Facts per LLM call (1 = no batching; >1 = batch mode)
-DEFAULT_CONSOLIDATION_MAX_TOKENS = 1024  # Max tokens for recall when finding related observations
+DEFAULT_CONSOLIDATION_MAX_TOKENS = 1024  # [FORK] Higher recall token budget for observation quality
+DEFAULT_CONSOLIDATION_RECALL_BUDGET = "low"  # Budget level for consolidation recall (low/mid/high)
 DEFAULT_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS = (
-    -1
-)  # Total token budget for source facts in consolidation recall (-1 = unlimited)
+    4096  # Total token budget for source facts in consolidation recall (-1 = unlimited)
+)
 DEFAULT_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS_PER_OBSERVATION = (
     256  # Max tokens of source facts per observation in consolidation prompt (-1 = unlimited)
 )
@@ -616,6 +663,7 @@ DEFAULT_DB_POOL_MIN_SIZE = 5
 DEFAULT_DB_POOL_MAX_SIZE = 100
 DEFAULT_DB_COMMAND_TIMEOUT = 60  # seconds
 DEFAULT_DB_ACQUIRE_TIMEOUT = 30  # seconds
+DEFAULT_DB_STATEMENT_TIMEOUT = 600  # seconds (Postgres statement_timeout applied on every pool connection; 0 disables)
 
 # Worker configuration (distributed task processing)
 DEFAULT_WORKER_ENABLED = True  # API runs worker by default (standalone mode)
@@ -624,7 +672,6 @@ DEFAULT_WORKER_POLL_INTERVAL_MS = 500  # Poll database every 500ms
 DEFAULT_WORKER_MAX_RETRIES = 3  # Max retries before marking task failed
 DEFAULT_WORKER_HTTP_PORT = 8889  # HTTP port for worker metrics/health
 DEFAULT_WORKER_MAX_SLOTS = 10  # Total concurrent tasks per worker
-DEFAULT_WORKER_CONSOLIDATION_MAX_SLOTS = 2  # Max concurrent consolidation tasks per worker
 DEFAULT_RETAIN_MAX_CONCURRENT = 4  # Max concurrent retain DB phases (HNSW reads + writes). Limits I/O contention.
 
 # Reflect agent settings
@@ -753,6 +800,25 @@ def _parse_str_list(value: str) -> list[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
+def _parse_positive_int(name: str, raw: str | None, default: int) -> int:
+    """
+    Parse an env var that must be a positive integer (>= 1).
+
+    Falls back to ``default`` when unset/empty. Raises ValueError on non-integer
+    or non-positive values so misconfiguration fails fast instead of triggering
+    infinite loops or zero-step range() calls downstream.
+    """
+    if raw is None or raw == "":
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError as e:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from e
+    if parsed < 1:
+        raise ValueError(f"{name} must be >= 1, got {parsed}")
+    return parsed
+
+
 def _validate_extraction_mode(mode: str) -> str:
     """Validate and normalize extraction mode."""
     mode_lower = mode.lower()
@@ -782,6 +848,24 @@ def _get_default_model_for_provider(provider: str) -> str:
     return PROVIDER_DEFAULT_MODELS.get(provider.lower(), DEFAULT_LLM_MODEL)
 
 
+def _parse_llm_router_config(env_var: str) -> dict | None:
+    """
+    Parse a LiteLLM Router configuration from a JSON env var.
+
+    The value is forwarded verbatim to ``litellm.Router(**config)``. We only
+    check that it parses as JSON; LiteLLM Router is authoritative about the
+    shape (``model_list``, ``fallbacks``, ``routing_strategy``, …). See
+    https://docs.litellm.ai/docs/routing.
+    """
+    raw = os.getenv(env_var, "").strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid {env_var}: invalid JSON: {e}") from e
+
+
 def _parse_default_bank_template(raw: str | None) -> dict | None:
     """
     Parse HINDSIGHT_API_DEFAULT_BANK_TEMPLATE as JSON.
@@ -807,10 +891,16 @@ class HindsightConfig:
     """Configuration container for Hindsight API."""
 
     # Database
+    database_backend: Literal["postgresql", "oracle"]
     database_url: str
+    # Optional read-replica URL for recall queries. When set, the engine opens
+    # a second pool and routes recall SELECTs through it.
+    read_database_url: str | None
+    read_db_pool_min_size: int
+    read_db_pool_max_size: int
     migration_database_url: str | None
     database_schema: str
-    vector_extension: str  # "pgvector" or "vchord"
+    vector_extension: str  # "pgvector", "vchord", "pgvectorscale", or "scann"
     text_search_extension: str  # "native" or "vchord"
 
     # LLM (default, used as fallback for per-operation config)
@@ -828,6 +918,15 @@ class HindsightConfig:
     llm_extra_body: (
         dict | None
     )  # Extra body params merged into OpenAI-compatible API calls (e.g. {"chat_template_kwargs": {"enable_thinking": true}})
+    llm_default_headers: (
+        dict | None
+    )  # Custom headers passed as default_headers to provider SDK clients (e.g. {"X-Component-Id": "hindsight"} for proxies / request tracing)
+
+    # LiteLLM Router chain (provider-specific; consumed by the "litellmrouter" provider).
+    # List of deployment dicts evaluated in order with fallback on transient errors.
+    # Each entry: {"provider": str, "model": str, "api_key": str | None, "base_url": str | None}.
+    # Treated as a credential field because entries embed api keys.
+    llm_litellmrouter_config: dict | None
 
     # Vertex AI configuration
     llm_vertexai_project_id: str | None
@@ -855,6 +954,7 @@ class HindsightConfig:
     retain_llm_initial_backoff: float | None
     retain_llm_max_backoff: float | None
     retain_llm_timeout: float | None
+    retain_llm_litellmrouter_config: dict | None
 
     reflect_llm_provider: str | None
     reflect_llm_api_key: str | None
@@ -865,6 +965,7 @@ class HindsightConfig:
     reflect_llm_initial_backoff: float | None
     reflect_llm_max_backoff: float | None
     reflect_llm_timeout: float | None
+    reflect_llm_litellmrouter_config: dict | None
 
     consolidation_llm_provider: str | None
     consolidation_llm_api_key: str | None
@@ -875,6 +976,7 @@ class HindsightConfig:
     consolidation_llm_initial_backoff: float | None
     consolidation_llm_max_backoff: float | None
     consolidation_llm_timeout: float | None
+    consolidation_llm_litellmrouter_config: dict | None
 
     # Embeddings
     embeddings_provider: str
@@ -886,6 +988,7 @@ class HindsightConfig:
     embeddings_cohere_api_key: str | None
     embeddings_cohere_model: str
     embeddings_cohere_base_url: str | None
+    embeddings_cohere_output_dimensions: int | None
     embeddings_openrouter_api_key: str | None
     embeddings_openrouter_model: str
     embeddings_litellm_api_base: str
@@ -900,6 +1003,7 @@ class HindsightConfig:
     embeddings_gemini_api_key: str | None
     embeddings_gemini_model: str
     embeddings_gemini_output_dimensionality: int | None
+    embeddings_gemini_force_ipv4: bool
     embeddings_vertexai_project_id: str | None
     embeddings_vertexai_region: str | None
     embeddings_vertexai_service_account_key: str | None
@@ -995,6 +1099,7 @@ class HindsightConfig:
     file_parser_allowlist: list[str] | None  # Parsers clients may request (None = all registered)
     file_parser_iris_token: str | None  # Vectorize API token for iris parser (VECTORIZE_TOKEN)
     file_parser_iris_org_id: str | None  # Vectorize org ID for iris parser (VECTORIZE_ORG_ID)
+    file_parser_llama_parse_api_key: str | None  # LlamaCloud API key for llama_parse parser
     file_conversion_max_batch_size_mb: int  # Max total batch size in MB (all files combined)
     file_conversion_max_batch_size: int  # Max files per request
     enable_file_upload_api: bool
@@ -1008,6 +1113,7 @@ class HindsightConfig:
     consolidation_max_memories_per_round: int
     consolidation_llm_batch_size: int
     consolidation_max_tokens: int
+    consolidation_recall_budget: str
     consolidation_source_facts_max_tokens: int
     consolidation_source_facts_max_tokens_per_observation: int
     consolidation_max_attempts: int
@@ -1078,6 +1184,7 @@ class HindsightConfig:
     db_pool_max_size: int
     db_command_timeout: int
     db_acquire_timeout: int
+    db_statement_timeout: int
 
     # Worker configuration (distributed task processing)
     worker_enabled: bool
@@ -1086,7 +1193,7 @@ class HindsightConfig:
     worker_max_retries: int
     worker_http_port: int
     worker_max_slots: int
-    worker_consolidation_max_slots: int
+    worker_slot_reservations: dict[str, int]
     retain_max_concurrent: int
 
     # Reflect agent settings
@@ -1113,6 +1220,10 @@ class HindsightConfig:
     webhook_event_types: list[str]  # Event types to deliver globally
     webhook_delivery_poll_interval_seconds: int  # How often the delivery worker polls
 
+    # Defaulted fields (source-compatible additions — existing direct constructor callers keep working).
+    # Keep at the end of the dataclass; Python forbids non-default fields after default fields.
+    embeddings_openai_batch_size: int = DEFAULT_EMBEDDINGS_OPENAI_BATCH_SIZE
+
     # Class-level sets for configuration categorization
 
     # CREDENTIAL_FIELDS: Never exposed via API, never configurable per-tenant/bank
@@ -1122,6 +1233,11 @@ class HindsightConfig:
         "retain_llm_api_key",
         "reflect_llm_api_key",
         "consolidation_llm_api_key",
+        # LiteLLM Router chains — entries embed api_keys and base_urls
+        "llm_litellmrouter_config",
+        "retain_llm_litellmrouter_config",
+        "reflect_llm_litellmrouter_config",
+        "consolidation_llm_litellmrouter_config",
         # Base URLs (could expose infrastructure)
         "llm_base_url",
         "retain_llm_base_url",
@@ -1145,6 +1261,7 @@ class HindsightConfig:
         "file_storage_azure_account_key",
         # File parser credentials
         "file_parser_iris_token",
+        "file_parser_llama_parse_api_key",
     }
 
     # CONFIGURABLE_FIELDS: Safe behavioral settings that can be customized per-tenant/bank
@@ -1264,11 +1381,7 @@ class HindsightConfig:
     def validate(self) -> None:
         """Validate configuration values and raise errors for invalid combinations."""
         # Validate vector_extension
-        valid_extensions = ("pgvector", "vchord", "pgvectorscale")
-        if self.vector_extension not in valid_extensions:
-            raise ValueError(
-                f"Invalid vector_extension: {self.vector_extension}. Must be one of: {', '.join(valid_extensions)}"
-            )
+        validate_extension(self.vector_extension)
 
         # Validate text_search_extension
         valid_text_search = ("native", "vchord", "pg_textsearch")
@@ -1301,6 +1414,40 @@ class HindsightConfig:
                 f"provider: {self.retain_llm_provider or self.llm_provider})"
             )
 
+        # Warn if local ML dependencies are missing when configured.
+        # Don't hard-fail here — the actual ImportError fires at model init time
+        # with a clear message. This early warning catches it before startup proceeds.
+        if self.embeddings_provider == "local" or self.reranker_provider == "local":
+            try:
+                import importlib
+
+                importlib.import_module("sentence_transformers")
+            except ImportError:
+                missing = []
+                if self.embeddings_provider == "local":
+                    missing.append("embeddings")
+                if self.reranker_provider == "local":
+                    missing.append("reranker")
+                logger.warning(
+                    "Local ML provider configured for %s, but 'sentence-transformers' "
+                    "is not installed. The API will fail at startup. Either:\n"
+                    "  1. Install local ML deps: pip install hindsight-api[local-ml]\n"
+                    "  2. Use a remote provider instead:\n"
+                    "     HINDSIGHT_API_EMBEDDINGS_PROVIDER=openai (or gemini, tei)\n"
+                    "     HINDSIGHT_API_RERANKER_PROVIDER=none (or tei)",
+                    " and ".join(missing),
+                )
+
+        # Validate that sum of per-operation slot reservations does not exceed max_slots
+        total_reserved = sum(self.worker_slot_reservations.values())
+        if total_reserved > self.worker_max_slots:
+            reservation_details = ", ".join(f"{k}={v}" for k, v in self.worker_slot_reservations.items() if v > 0)
+            raise ValueError(
+                f"Sum of per-operation slot reservations ({total_reserved}: {reservation_details}) "
+                f"exceeds worker_max_slots ({self.worker_max_slots}). "
+                f"Reduce reservations or increase HINDSIGHT_API_WORKER_MAX_SLOTS."
+            )
+
     @classmethod
     def from_env(cls) -> "HindsightConfig":
         """Create configuration from environment variables."""
@@ -1310,7 +1457,11 @@ class HindsightConfig:
 
         config = cls(
             # Database
+            database_backend=os.getenv(ENV_DATABASE_BACKEND, DEFAULT_DATABASE_BACKEND).lower(),
             database_url=os.getenv(ENV_DATABASE_URL, DEFAULT_DATABASE_URL),
+            read_database_url=os.getenv(ENV_READ_DATABASE_URL) or None,
+            read_db_pool_min_size=int(os.getenv(ENV_READ_DB_POOL_MIN_SIZE, str(DEFAULT_DB_POOL_MIN_SIZE))),
+            read_db_pool_max_size=int(os.getenv(ENV_READ_DB_POOL_MAX_SIZE, str(DEFAULT_DB_POOL_MAX_SIZE))),
             migration_database_url=os.getenv(ENV_MIGRATION_DATABASE_URL) or None,
             database_schema=os.getenv(ENV_DATABASE_SCHEMA, DEFAULT_DATABASE_SCHEMA),
             vector_extension=os.getenv(ENV_VECTOR_EXTENSION, DEFAULT_VECTOR_EXTENSION).lower(),
@@ -1328,6 +1479,8 @@ class HindsightConfig:
             llm_groq_service_tier=os.getenv(ENV_LLM_GROQ_SERVICE_TIER, DEFAULT_LLM_GROQ_SERVICE_TIER),
             llm_openai_service_tier=os.getenv(ENV_LLM_OPENAI_SERVICE_TIER, DEFAULT_LLM_OPENAI_SERVICE_TIER),
             llm_extra_body=json.loads(os.getenv(ENV_LLM_EXTRA_BODY, "null")),
+            llm_default_headers=json.loads(os.getenv(ENV_LLM_DEFAULT_HEADERS, "null")),
+            llm_litellmrouter_config=_parse_llm_router_config(ENV_LLM_LITELLMROUTER_CONFIG),
             # Vertex AI
             llm_vertexai_project_id=os.getenv(ENV_LLM_VERTEXAI_PROJECT_ID) or DEFAULT_LLM_VERTEXAI_PROJECT_ID,
             llm_vertexai_region=os.getenv(ENV_LLM_VERTEXAI_REGION, DEFAULT_LLM_VERTEXAI_REGION),
@@ -1366,6 +1519,7 @@ class HindsightConfig:
             if os.getenv(ENV_RETAIN_LLM_MAX_BACKOFF)
             else None,
             retain_llm_timeout=float(os.getenv(ENV_RETAIN_LLM_TIMEOUT)) if os.getenv(ENV_RETAIN_LLM_TIMEOUT) else None,
+            retain_llm_litellmrouter_config=_parse_llm_router_config(ENV_RETAIN_LLM_LITELLMROUTER_CONFIG),
             reflect_llm_provider=os.getenv(ENV_REFLECT_LLM_PROVIDER) or None,
             reflect_llm_api_key=os.getenv(ENV_REFLECT_LLM_API_KEY) or None,
             reflect_llm_model=os.getenv(ENV_REFLECT_LLM_MODEL)
@@ -1390,6 +1544,7 @@ class HindsightConfig:
             reflect_llm_timeout=float(os.getenv(ENV_REFLECT_LLM_TIMEOUT))
             if os.getenv(ENV_REFLECT_LLM_TIMEOUT)
             else None,
+            reflect_llm_litellmrouter_config=_parse_llm_router_config(ENV_REFLECT_LLM_LITELLMROUTER_CONFIG),
             consolidation_llm_provider=os.getenv(ENV_CONSOLIDATION_LLM_PROVIDER) or None,
             consolidation_llm_api_key=os.getenv(ENV_CONSOLIDATION_LLM_API_KEY) or None,
             consolidation_llm_model=os.getenv(ENV_CONSOLIDATION_LLM_MODEL)
@@ -1414,6 +1569,7 @@ class HindsightConfig:
             consolidation_llm_timeout=float(os.getenv(ENV_CONSOLIDATION_LLM_TIMEOUT))
             if os.getenv(ENV_CONSOLIDATION_LLM_TIMEOUT)
             else None,
+            consolidation_llm_litellmrouter_config=_parse_llm_router_config(ENV_CONSOLIDATION_LLM_LITELLMROUTER_CONFIG),
             # Embeddings
             embeddings_provider=os.getenv(ENV_EMBEDDINGS_PROVIDER, DEFAULT_EMBEDDINGS_PROVIDER),
             embeddings_local_model=os.getenv(ENV_EMBEDDINGS_LOCAL_MODEL, DEFAULT_EMBEDDINGS_LOCAL_MODEL),
@@ -1427,10 +1583,18 @@ class HindsightConfig:
             in ("true", "1"),
             embeddings_tei_url=os.getenv(ENV_EMBEDDINGS_TEI_URL),
             embeddings_openai_base_url=os.getenv(ENV_EMBEDDINGS_OPENAI_BASE_URL) or None,
+            embeddings_openai_batch_size=_parse_positive_int(
+                ENV_EMBEDDINGS_OPENAI_BATCH_SIZE,
+                os.getenv(ENV_EMBEDDINGS_OPENAI_BATCH_SIZE),
+                DEFAULT_EMBEDDINGS_OPENAI_BATCH_SIZE,
+            ),
             # Cohere embeddings (with backward-compatible fallback to shared API key)
             embeddings_cohere_api_key=os.getenv(ENV_EMBEDDINGS_COHERE_API_KEY) or os.getenv(ENV_COHERE_API_KEY),
             embeddings_cohere_model=os.getenv(ENV_EMBEDDINGS_COHERE_MODEL, DEFAULT_EMBEDDINGS_COHERE_MODEL),
             embeddings_cohere_base_url=os.getenv(ENV_EMBEDDINGS_COHERE_BASE_URL) or None,
+            embeddings_cohere_output_dimensions=int(v)
+            if (v := os.getenv(ENV_EMBEDDINGS_COHERE_OUTPUT_DIMENSIONS))
+            else None,
             # OpenRouter embeddings (with fallback to shared OpenRouter key, then LLM key)
             embeddings_openrouter_api_key=os.getenv(ENV_EMBEDDINGS_OPENROUTER_API_KEY)
             or os.getenv(ENV_OPENROUTER_API_KEY)
@@ -1462,6 +1626,11 @@ class HindsightConfig:
                     str(DEFAULT_EMBEDDINGS_GEMINI_OUTPUT_DIMENSIONALITY),
                 )
             ),
+            embeddings_gemini_force_ipv4=os.getenv(
+                ENV_EMBEDDINGS_GEMINI_FORCE_IPV4,
+                str(DEFAULT_EMBEDDINGS_GEMINI_FORCE_IPV4),
+            ).lower()
+            in ("true", "1"),
             embeddings_vertexai_project_id=os.getenv(ENV_EMBEDDINGS_VERTEXAI_PROJECT_ID)
             or os.getenv(ENV_LLM_VERTEXAI_PROJECT_ID),
             embeddings_vertexai_region=os.getenv(ENV_EMBEDDINGS_VERTEXAI_REGION) or os.getenv(ENV_LLM_VERTEXAI_REGION),
@@ -1622,6 +1791,7 @@ class HindsightConfig:
             else None,
             file_parser_iris_token=os.getenv(ENV_FILE_PARSER_IRIS_TOKEN) or None,
             file_parser_iris_org_id=os.getenv(ENV_FILE_PARSER_IRIS_ORG_ID) or None,
+            file_parser_llama_parse_api_key=os.getenv(ENV_FILE_PARSER_LLAMA_PARSE_API_KEY) or None,
             file_conversion_max_batch_size_mb=int(
                 os.getenv(ENV_FILE_CONVERSION_MAX_BATCH_SIZE_MB, str(DEFAULT_FILE_CONVERSION_MAX_BATCH_SIZE_MB))
             ),
@@ -1659,6 +1829,7 @@ class HindsightConfig:
             consolidation_max_tokens=int(
                 os.getenv(ENV_CONSOLIDATION_MAX_TOKENS, str(DEFAULT_CONSOLIDATION_MAX_TOKENS))
             ),
+            consolidation_recall_budget=os.getenv(ENV_CONSOLIDATION_RECALL_BUDGET, DEFAULT_CONSOLIDATION_RECALL_BUDGET),
             consolidation_source_facts_max_tokens=int(
                 os.getenv(ENV_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS, str(DEFAULT_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS))
             ),
@@ -1684,6 +1855,7 @@ class HindsightConfig:
             db_pool_max_size=int(os.getenv(ENV_DB_POOL_MAX_SIZE, str(DEFAULT_DB_POOL_MAX_SIZE))),
             db_command_timeout=int(os.getenv(ENV_DB_COMMAND_TIMEOUT, str(DEFAULT_DB_COMMAND_TIMEOUT))),
             db_acquire_timeout=int(os.getenv(ENV_DB_ACQUIRE_TIMEOUT, str(DEFAULT_DB_ACQUIRE_TIMEOUT))),
+            db_statement_timeout=int(os.getenv(ENV_DB_STATEMENT_TIMEOUT, str(DEFAULT_DB_STATEMENT_TIMEOUT))),
             # Worker configuration
             worker_enabled=os.getenv(ENV_WORKER_ENABLED, str(DEFAULT_WORKER_ENABLED)).lower() == "true",
             worker_id=os.getenv(ENV_WORKER_ID) or DEFAULT_WORKER_ID,
@@ -1691,9 +1863,11 @@ class HindsightConfig:
             worker_max_retries=int(os.getenv(ENV_WORKER_MAX_RETRIES, str(DEFAULT_WORKER_MAX_RETRIES))),
             worker_http_port=int(os.getenv(ENV_WORKER_HTTP_PORT, str(DEFAULT_WORKER_HTTP_PORT))),
             worker_max_slots=int(os.getenv(ENV_WORKER_MAX_SLOTS, str(DEFAULT_WORKER_MAX_SLOTS))),
-            worker_consolidation_max_slots=int(
-                os.getenv(ENV_WORKER_CONSOLIDATION_MAX_SLOTS, str(DEFAULT_WORKER_CONSOLIDATION_MAX_SLOTS))
-            ),
+            worker_slot_reservations={
+                op_type: int(os.getenv(env_var, str(default)))
+                for op_type, (env_var, default) in WORKER_SLOT_RESERVATION_TYPES.items()
+                if int(os.getenv(env_var, str(default))) > 0
+            },
             retain_max_concurrent=int(os.getenv(ENV_RETAIN_MAX_CONCURRENT, str(DEFAULT_RETAIN_MAX_CONCURRENT))),
             # Reflect agent settings
             reflect_max_iterations=int(os.getenv(ENV_REFLECT_MAX_ITERATIONS, str(DEFAULT_REFLECT_MAX_ITERATIONS))),
@@ -1857,9 +2031,11 @@ class HindsightConfig:
 
     def log_config(self) -> None:
         """Log the current configuration (without sensitive values)."""
-        logger.info(f"Database: {self.database_url} (schema: {self.database_schema})")
+        logger.info(f"Database: {mask_network_location(self.database_url)} (schema: {self.database_schema})")
+        if self.read_database_url:
+            logger.info(f"Read database (recall queries only): {mask_network_location(self.read_database_url)}")
         if self.migration_database_url:
-            logger.info(f"Migration database: {self.migration_database_url}")
+            logger.info(f"Migration database: {mask_network_location(self.migration_database_url)}")
         logger.info(f"LLM: provider={self.llm_provider}, model={self.llm_model}")
         if self.retain_llm_provider or self.retain_llm_model:
             retain_provider = self.retain_llm_provider or self.llm_provider

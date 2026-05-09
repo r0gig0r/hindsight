@@ -4,6 +4,7 @@ Tests for configuration validation.
 Verifies that config validation catches invalid parameter combinations.
 """
 
+import logging
 import os
 
 import pytest
@@ -20,6 +21,8 @@ def setup_test_env():
         "HINDSIGHT_API_RETAIN_CHUNK_SIZE",
         "HINDSIGHT_API_LLM_PROVIDER",
         "HINDSIGHT_API_LLM_MODEL",
+        "HINDSIGHT_API_DATABASE_URL",
+        "HINDSIGHT_API_MIGRATION_DATABASE_URL",
     ]
 
     # Save original values
@@ -97,6 +100,100 @@ def test_valid_retain_config_succeeds():
     config = HindsightConfig.from_env()
     assert config.retain_max_completion_tokens == 64000
     assert config.retain_chunk_size == 3000
+
+
+def test_log_config_masks_database_urls(caplog):
+    """Config startup logs must not expose database credentials."""
+    from hindsight_api.config import HindsightConfig
+
+    os.environ["HINDSIGHT_API_DATABASE_URL"] = "postgresql://hindsight_user:plain-password@db:5432/hindsight_db"
+    os.environ["HINDSIGHT_API_MIGRATION_DATABASE_URL"] = (
+        "postgresql://migration_user:migration-password@db-admin:5432/hindsight_db"
+    )
+    os.environ["HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS"] = "64000"
+    os.environ["HINDSIGHT_API_RETAIN_CHUNK_SIZE"] = "3000"
+    os.environ["HINDSIGHT_API_LLM_PROVIDER"] = "mock"
+
+    caplog.set_level(logging.INFO, logger="hindsight_api.config")
+
+    config = HindsightConfig.from_env()
+    config.log_config()
+
+    log_output = "\n".join(record.getMessage() for record in caplog.records)
+    assert "hindsight_user" not in log_output
+    assert "plain-password" not in log_output
+    assert "migration_user" not in log_output
+    assert "migration-password" not in log_output
+    assert "postgresql://***:***@db:5432/hindsight_db" in log_output
+    assert "postgresql://***:***@db-admin:5432/hindsight_db" in log_output
+
+
+def test_read_database_url_defaults_to_none_when_unset(monkeypatch):
+    """Without HINDSIGHT_API_READ_DATABASE_URL, the field is None — engine
+    will alias the read backend to the primary, preserving today's
+    single-pool behaviour byte-for-bit. This is the most important guarantee
+    of the change: zero-config means zero behaviour change.
+    """
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.delenv("HINDSIGHT_API_READ_DATABASE_URL", raising=False)
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    config = HindsightConfig.from_env()
+    assert config.read_database_url is None
+
+
+def test_read_database_url_is_loaded_when_set(monkeypatch):
+    """When HINDSIGHT_API_READ_DATABASE_URL is set, the value flows into
+    config so MemoryEngine.initialize() will open a second backend against
+    that URL for recall queries.
+    """
+    from hindsight_api.config import HindsightConfig
+
+    read_url = "postgresql://reader:secret@replica.example:5432/hindsight"
+    monkeypatch.setenv("HINDSIGHT_API_READ_DATABASE_URL", read_url)
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    config = HindsightConfig.from_env()
+    assert config.read_database_url == read_url
+
+
+def test_read_database_url_empty_string_is_treated_as_unset(monkeypatch):
+    """Helm sometimes renders an unset env var as the empty string. Treat it
+    the same as unset so deployments that conditionally set the var don't
+    accidentally try to open a pool against `''`.
+    """
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_READ_DATABASE_URL", "")
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    config = HindsightConfig.from_env()
+    assert config.read_database_url is None
+
+
+def test_log_config_masks_read_database_url(monkeypatch, caplog):
+    """Read-replica URL credentials must be masked in startup logs, same as
+    the primary URL.
+    """
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_DATABASE_URL", "postgresql://hindsight:pw@primary:5432/db")
+    monkeypatch.setenv("HINDSIGHT_API_READ_DATABASE_URL", "postgresql://reader:replica-secret@replica:5432/db")
+    monkeypatch.setenv("HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS", "64000")
+    monkeypatch.setenv("HINDSIGHT_API_RETAIN_CHUNK_SIZE", "3000")
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    caplog.set_level(logging.INFO, logger="hindsight_api.config")
+
+    config = HindsightConfig.from_env()
+    config.log_config()
+
+    log_output = "\n".join(record.getMessage() for record in caplog.records)
+    assert "reader" not in log_output
+    assert "replica-secret" not in log_output
+    assert "Read database" in log_output
+    assert "postgresql://***:***@replica:5432/db" in log_output
 
 
 # Note: The BadRequestError wrapping is implemented in fact_extraction.py

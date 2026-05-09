@@ -12,10 +12,16 @@ import pytest
 
 @pytest.fixture
 def temp_home(tmp_path, monkeypatch):
-    """Create a temporary home directory."""
+    """Create a temporary home directory.
+
+    Both POSIX and Windows env vars are set because `Path.home()` consults
+    USERPROFILE (then HOMEDRIVE+HOMEPATH) on Windows, not HOME — without
+    USERPROFILE override the tests would operate on the real user profile.
+    """
     temp_home = tmp_path / "home"
     temp_home.mkdir()
     monkeypatch.setenv("HOME", str(temp_home))
+    monkeypatch.setenv("USERPROFILE", str(temp_home))
     return temp_home
 
 
@@ -108,7 +114,7 @@ def test_load_config_file_uses_correct_profile(temp_home, monkeypatch):
     default_config_dir = temp_home / ".hindsight"
     default_config_dir.mkdir(parents=True, exist_ok=True)
     (default_config_dir / "embed").write_text(
-        "HINDSIGHT_API_LLM_PROVIDER=openai\n" "HINDSIGHT_API_LLM_MODEL=gpt-4o-mini\n"
+        "HINDSIGHT_API_LLM_PROVIDER=openai\nHINDSIGHT_API_LLM_MODEL=gpt-4o-mini\n"
     )
 
     # Create a named profile with a DIFFERENT provider
@@ -117,7 +123,7 @@ def test_load_config_file_uses_correct_profile(temp_home, monkeypatch):
 
     profile_name = "myapp"
     profile_env_path = profile_dir / f"{profile_name}.env"
-    profile_env_path.write_text("HINDSIGHT_API_LLM_PROVIDER=groq\n" "HINDSIGHT_API_LLM_MODEL=llama-3.1-70b\n")
+    profile_env_path.write_text("HINDSIGHT_API_LLM_PROVIDER=groq\nHINDSIGHT_API_LLM_MODEL=llama-3.1-70b\n")
 
     # Create metadata
     import json
@@ -223,59 +229,6 @@ def test_get_config_respects_profile(temp_home, monkeypatch):
     assert config["bank_id"] == "production-bank", "Should use profile's bank_id"
 
 
-def test_macos_forces_cpu_for_local_embeddings_and_reranker(temp_home, monkeypatch):
-    """Regression test for issue #962.
-
-    On macOS, the daemon must force CPU for local embeddings/reranker by default to
-    avoid sentence-transformers selecting MPS and hanging during startup. PR #933
-    removed this default when adding the llamacpp provider; this test guards against
-    that regression.
-    """
-    from unittest.mock import MagicMock, patch
-
-    from hindsight_embed.daemon_embed_manager import DaemonEmbedManager
-
-    # Clear any caller-supplied force-cpu env so we test the default behavior.
-    monkeypatch.delenv("HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU", raising=False)
-    monkeypatch.delenv("HINDSIGHT_API_RERANKER_LOCAL_FORCE_CPU", raising=False)
-
-    manager = DaemonEmbedManager()
-
-    captured: dict[str, dict[str, str]] = {}
-    popen_called = [False]
-
-    def fake_popen(cmd, env, **kwargs):
-        captured["env"] = env
-        popen_called[0] = True
-        proc = MagicMock()
-        proc.pid = 12345
-        return proc
-
-    # is_running must return False before Popen (so _start_daemon and
-    # _start_daemon_locked don't short-circuit on the pre-Popen checks added
-    # in #1016) and True after Popen (so the readiness wait loop breaks
-    # immediately). Tying it to popen_called gives us both for free.
-    def fake_is_running(profile=""):
-        return popen_called[0]
-
-    with (
-        patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", side_effect=fake_popen),
-        patch("hindsight_embed.daemon_embed_manager.time.sleep"),  # skip 2s stability wait
-        patch.object(manager, "_clear_port", return_value=True),
-        patch.object(manager, "_find_api_command", return_value=["hindsight-api"]),
-        patch.object(manager, "is_running", side_effect=fake_is_running),
-        patch("hindsight_embed.daemon_embed_manager.platform.system", return_value="Darwin"),
-    ):
-        manager._start_daemon(
-            config={"llm_provider": "openai", "llm_api_key": "sk-x", "llm_model": "gpt-4o-mini"},
-            profile="",
-        )
-
-    env = captured["env"]
-    assert env.get("HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU") == "1"
-    assert env.get("HINDSIGHT_API_RERANKER_LOCAL_FORCE_CPU") == "1"
-
-
 def test_profile_env_propagates_arbitrary_hindsight_keys_to_daemon(temp_home, monkeypatch):
     """Regression test: HINDSIGHT_* keys in profile .env must reach the daemon subprocess env.
 
@@ -355,14 +308,12 @@ def test_profile_env_propagates_arbitrary_hindsight_keys_to_daemon(temp_home, mo
     assert env.get("HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU") == "1"
 
 
-def test_macos_force_cpu_respects_explicit_override(temp_home, monkeypatch):
-    """Users who explicitly disable FORCE_CPU (e.g. to use MPS) must not be overridden."""
+def test_daemon_child_env_var_set_in_daemon_env(temp_home, monkeypatch):
+    """hindsight-embed must set _HINDSIGHT_DAEMON_CHILD=1 so the daemon child
+    skips the redundant re-exec in daemonize()."""
     from unittest.mock import MagicMock, patch
 
     from hindsight_embed.daemon_embed_manager import DaemonEmbedManager
-
-    monkeypatch.setenv("HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU", "0")
-    monkeypatch.setenv("HINDSIGHT_API_RERANKER_LOCAL_FORCE_CPU", "0")
 
     manager = DaemonEmbedManager()
     captured: dict[str, dict[str, str]] = {}
@@ -384,7 +335,6 @@ def test_macos_force_cpu_respects_explicit_override(temp_home, monkeypatch):
         patch.object(manager, "_clear_port", return_value=True),
         patch.object(manager, "_find_api_command", return_value=["hindsight-api"]),
         patch.object(manager, "is_running", side_effect=fake_is_running),
-        patch("hindsight_embed.daemon_embed_manager.platform.system", return_value="Darwin"),
     ):
         manager._start_daemon(
             config={"llm_provider": "openai", "llm_api_key": "sk-x", "llm_model": "gpt-4o-mini"},
@@ -392,5 +342,233 @@ def test_macos_force_cpu_respects_explicit_override(temp_home, monkeypatch):
         )
 
     env = captured["env"]
-    assert env.get("HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU") == "0"
-    assert env.get("HINDSIGHT_API_RERANKER_LOCAL_FORCE_CPU") == "0"
+    assert env.get("_HINDSIGHT_DAEMON_CHILD") == "1"
+
+
+def test_windows_popen_uses_detached_process_flags(temp_home, monkeypatch):
+    """
+    On Windows the daemon must be spawned with
+    `creationflags=DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP` (the POSIX
+    `start_new_session` doesn't exist there) AND stdout/stderr must be
+    redirected, since DETACHED_PROCESS leaves the child with no console.
+    """
+    import subprocess
+    from unittest.mock import MagicMock, patch
+
+    from hindsight_embed.daemon_embed_manager import DaemonEmbedManager
+
+    # These subprocess constants only exist on Windows CPython; patch them in
+    # so the test passes on Linux/macOS CI too. Values from Win32 API docs.
+    monkeypatch.setattr(subprocess, "DETACHED_PROCESS", 0x00000008, raising=False)
+    monkeypatch.setattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, raising=False)
+
+    manager = DaemonEmbedManager()
+    captured: dict = {}
+    popen_called = [False]
+
+    def fake_popen(cmd, env, **kwargs):
+        captured["kwargs"] = kwargs
+        popen_called[0] = True
+        proc = MagicMock()
+        proc.pid = 12345
+        return proc
+
+    def fake_is_running(profile=""):
+        return popen_called[0]
+
+    with (
+        patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", side_effect=fake_popen),
+        patch("hindsight_embed.daemon_embed_manager.time.sleep"),
+        patch.object(manager, "_clear_port", return_value=True),
+        patch.object(manager, "_find_api_command", return_value=["hindsight-api"]),
+        patch.object(manager, "is_running", side_effect=fake_is_running),
+        patch("hindsight_embed.daemon_embed_manager.platform.system", return_value="Windows"),
+    ):
+        manager._start_daemon(
+            config={"llm_provider": "openai", "llm_api_key": "sk-x", "llm_model": "gpt-4o-mini"},
+            profile="",
+        )
+
+    kwargs = captured["kwargs"]
+    expected_flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    assert kwargs.get("creationflags") == expected_flags
+    assert "start_new_session" not in kwargs
+    assert kwargs.get("stdin") is subprocess.DEVNULL
+    assert kwargs.get("stderr") is subprocess.STDOUT
+    # stdout must be a real file handle, not None — a None stdout under
+    # DETACHED_PROCESS crashes the child on first write.
+    assert kwargs.get("stdout") is not None
+
+
+def test_posix_popen_uses_start_new_session(temp_home, monkeypatch):
+    """Lock down POSIX behavior so a future refactor doesn't flip it."""
+    from unittest.mock import MagicMock, patch
+
+    from hindsight_embed.daemon_embed_manager import DaemonEmbedManager
+
+    manager = DaemonEmbedManager()
+    captured: dict = {}
+    popen_called = [False]
+
+    def fake_popen(cmd, env, **kwargs):
+        captured["kwargs"] = kwargs
+        popen_called[0] = True
+        proc = MagicMock()
+        proc.pid = 12345
+        return proc
+
+    def fake_is_running(profile=""):
+        return popen_called[0]
+
+    with (
+        patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", side_effect=fake_popen),
+        patch("hindsight_embed.daemon_embed_manager.time.sleep"),
+        patch.object(manager, "_clear_port", return_value=True),
+        patch.object(manager, "_find_api_command", return_value=["hindsight-api"]),
+        patch.object(manager, "is_running", side_effect=fake_is_running),
+        patch("hindsight_embed.daemon_embed_manager.platform.system", return_value="Linux"),
+    ):
+        manager._start_daemon(
+            config={"llm_provider": "openai", "llm_api_key": "sk-x", "llm_model": "gpt-4o-mini"},
+            profile="",
+        )
+
+    kwargs = captured["kwargs"]
+    assert kwargs.get("start_new_session") is True
+    assert "creationflags" not in kwargs
+
+
+def test_posix_popen_redirects_stdout_stderr_to_log(temp_home, monkeypatch):
+    """Regression test for #1380: on POSIX, the daemon child must NOT inherit
+    the parent's stdout/stderr — output would otherwise leak into a TUI
+    parent communicating over stdio (Hermes, JSON-RPC gateways) and corrupt
+    its rendering. Both streams must be redirected to a real file handle.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from hindsight_embed.daemon_embed_manager import DaemonEmbedManager
+
+    manager = DaemonEmbedManager()
+    captured: dict = {}
+    popen_called = [False]
+
+    def fake_popen(cmd, env, **kwargs):
+        captured["kwargs"] = kwargs
+        popen_called[0] = True
+        proc = MagicMock()
+        proc.pid = 12345
+        return proc
+
+    def fake_is_running(profile=""):
+        return popen_called[0]
+
+    with (
+        patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", side_effect=fake_popen),
+        patch("hindsight_embed.daemon_embed_manager.time.sleep"),
+        patch.object(manager, "_clear_port", return_value=True),
+        patch.object(manager, "_find_api_command", return_value=["hindsight-api"]),
+        patch.object(manager, "is_running", side_effect=fake_is_running),
+        patch("hindsight_embed.daemon_embed_manager.platform.system", return_value="Linux"),
+    ):
+        manager._start_daemon(
+            config={"llm_provider": "openai", "llm_api_key": "sk-x", "llm_model": "gpt-4o-mini"},
+            profile="",
+        )
+
+    kwargs = captured["kwargs"]
+    stdout = kwargs.get("stdout")
+    stderr = kwargs.get("stderr")
+    # Must be real file objects, not None (inherit) or DEVNULL.
+    assert stdout is not None and hasattr(stdout, "write"), (
+        f"daemon stdout must be redirected to a file handle, got {stdout!r}"
+    )
+    assert stderr is not None and hasattr(stderr, "write"), (
+        f"daemon stderr must be redirected to a file handle, got {stderr!r}"
+    )
+
+
+def test_get_config_does_not_default_llm_model(temp_home, monkeypatch):
+    """Regression test for issue #1360.
+
+    When `HINDSIGHT_API_LLM_MODEL` is unset, `get_config()` must return None
+    rather than a hardcoded `gpt-4o-mini`. Previously the CLI tried to import
+    `hindsight_api.config.PROVIDER_DEFAULT_MODELS` to compute a provider-keyed
+    default, but that import fails in standalone venvs (`uvx hindsight-embed`,
+    bundled installs) where `hindsight-api` isn't installed, and the fallback
+    silently routed every non-OpenAI provider to `gpt-4o-mini` — which they
+    reject, causing retain to silently store zero memories.
+
+    Leaving the value unset lets the daemon (which has hindsight-api) resolve
+    the correct provider default itself.
+    """
+    from hindsight_embed.cli import get_config, set_cli_profile_override
+
+    set_cli_profile_override(None)
+    monkeypatch.delenv("HINDSIGHT_EMBED_PROFILE", raising=False)
+    monkeypatch.delenv("HINDSIGHT_API_LLM_MODEL", raising=False)
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "gemini")
+
+    config = get_config()
+
+    assert config["llm_provider"] == "gemini"
+    assert config["llm_model"] is None, (
+        "llm_model must be None when env var is unset so the daemon resolves "
+        "the provider default; got a hardcoded fallback instead"
+    )
+
+
+def test_configure_from_env_omits_model_when_unset(temp_home, monkeypatch):
+    """Regression test for issue #1360.
+
+    `_do_configure_from_env` must not write a hardcoded `HINDSIGHT_API_LLM_MODEL`
+    line into the profile .env when the user didn't set one — that line would
+    then be re-injected on every daemon start and suppress the daemon's
+    provider-keyed default lookup.
+    """
+    from hindsight_embed import cli
+
+    # CONFIG_DIR/CONFIG_FILE are computed from Path.home() at module import time,
+    # so the temp_home fixture's HOME override doesn't reach them. Redirect the
+    # module-level constants for the duration of this test.
+    config_dir = temp_home / ".hindsight"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "embed")
+
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "gemini")
+    monkeypatch.setenv("HINDSIGHT_API_LLM_API_KEY", "test-key")
+    monkeypatch.delenv("HINDSIGHT_API_LLM_MODEL", raising=False)
+
+    rc = cli._do_configure_from_env()
+    assert rc == 0
+
+    contents = (config_dir / "embed").read_text()
+    assert "HINDSIGHT_API_LLM_PROVIDER=gemini" in contents
+    assert "HINDSIGHT_API_LLM_MODEL" not in contents, (
+        "model line must be omitted when the user didn't set one, so the daemon picks the provider default"
+    )
+
+
+def test_configure_from_env_accepts_providers_outside_interactive_menu(temp_home, monkeypatch):
+    """Regression test for issue #1360.
+
+    `_do_configure_from_env` previously rejected any provider not in the small
+    interactive-menu set (`PROVIDER_API_KEYS` — 5 entries) with "Unknown
+    provider". hindsight-api supports ~18 providers (anthropic, claude-code,
+    bedrock, openrouter, ...), so the gate blocked valid CI configurations.
+    Validation belongs in the daemon, not in the CLI's UX-only menu list.
+    """
+    from hindsight_embed import cli
+
+    config_dir = temp_home / ".hindsight"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "embed")
+
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("HINDSIGHT_API_LLM_API_KEY", "sk-ant-test")
+    monkeypatch.delenv("HINDSIGHT_API_LLM_MODEL", raising=False)
+
+    rc = cli._do_configure_from_env()
+    assert rc == 0, "anthropic must be accepted — the daemon validates providers, not the CLI"
+
+    contents = (config_dir / "embed").read_text()
+    assert "HINDSIGHT_API_LLM_PROVIDER=anthropic" in contents

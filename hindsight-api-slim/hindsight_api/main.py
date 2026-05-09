@@ -24,10 +24,11 @@ import uvicorn
 from . import MemoryEngine, __version__
 from .api import create_app
 from .banner import print_banner
-from .config import DEFAULT_WORKERS, ENV_WORKERS, HindsightConfig, _get_raw_config
+from .config import DEFAULT_WORKERS, ENV_HOST, ENV_WORKERS, HindsightConfig, _get_raw_config
 from .daemon import (
     DEFAULT_DAEMON_PORT,
     DEFAULT_IDLE_TIMEOUT,
+    ENV_DAEMON_CHILD,
     IdleTimeoutMiddleware,
     daemonize,
 )
@@ -62,6 +63,22 @@ def _signal_handler(signum, frame):
     print(f"\nReceived signal {signum}, shutting down...")
     _cleanup()
     sys.exit(0)
+
+
+def resolve_daemon_host_port(*, args_host: str, args_port: int, config_host: str, config_port: int) -> tuple[str, int]:
+    """Resolve host/port for daemon mode.
+
+    Defaults to 127.0.0.1 for security, but honors explicit user overrides
+    via --host flag or HINDSIGHT_API_HOST env var. Uses DEFAULT_DAEMON_PORT
+    unless the user specified a custom port.
+    """
+    port = args_port if args_port != config_port else DEFAULT_DAEMON_PORT
+    # Only force localhost if the user didn't explicitly set a host
+    if args_host != config_host or os.environ.get(ENV_HOST):
+        host = args_host
+    else:
+        host = "127.0.0.1"
+    return host, port
 
 
 def main():
@@ -134,19 +151,29 @@ def main():
 
     args = parser.parse_args()
 
-    # Daemon mode handling
-    if args.daemon:
-        # Use port from args (may be custom for profiles)
-        if args.port == config.port:  # No custom port specified
-            args.port = DEFAULT_DAEMON_PORT
-        args.host = "127.0.0.1"  # Only bind to localhost for security
+    # Daemon mode handling.
+    # is_daemon_child is True when we are the re-exec'd child spawned by
+    # daemonize() or by hindsight-embed's DaemonEmbedManager.  The child
+    # does not have --daemon in its argv, but must still behave as a daemon
+    # (resolve host/port, enable idle timeout, suppress banner, etc.).
+    is_daemon_child = os.environ.get(ENV_DAEMON_CHILD) == "1"
+    is_daemon = args.daemon or is_daemon_child
 
-        # Fork into background
-        # No lockfile needed - port binding prevents duplicate daemons
+    if is_daemon:
+        args.host, args.port = resolve_daemon_host_port(
+            args_host=args.host,
+            args_port=args.port,
+            config_host=config.host,
+            config_port=config.port,
+        )
+
+        # Detach into background (parent re-execs and exits; child redirects
+        # stdio to log file).  No lockfile needed — port binding prevents
+        # duplicate daemons.
         daemonize()
 
     # Print banner (not in daemon mode)
-    if not args.daemon:
+    if not is_daemon:
         print()
         print_banner()
 
@@ -155,7 +182,7 @@ def main():
     if args.log_level != config.log_level:
         config = dataclasses.replace(config, host=args.host, port=args.port, log_level=args.log_level)
     config.configure_logging()
-    if not args.daemon:
+    if not is_daemon:
         config.log_config()
 
     # Register cleanup handlers
@@ -204,7 +231,7 @@ def main():
 
     # Wrap with idle timeout middleware in daemon mode
     idle_middleware = None
-    if args.daemon:
+    if is_daemon:
         idle_middleware = IdleTimeoutMiddleware(app, idle_timeout=args.idle_timeout)
         app = idle_middleware
 
@@ -259,7 +286,7 @@ def main():
         uvicorn_config["ssl_certfile"] = args.ssl_certfile
 
     # Print startup info (not in daemon mode)
-    if not args.daemon:
+    if not is_daemon:
         from .banner import print_startup_info
 
         print_startup_info(

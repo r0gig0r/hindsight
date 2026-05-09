@@ -108,6 +108,12 @@ async def test_memories_timeseries_periods(
 
         for bucket in body["buckets"]:
             assert "time" in bucket
+            # Bucket `time` must serialize as a tz-aware ISO (ending in `+00:00` or `Z`).
+            # A naive ISO (`2026-04-18T00:00:00`) would be parsed as local time by
+            # `new Date()` per ECMA-262, shifting the chart by the browser's timezone.
+            assert bucket["time"].endswith("+00:00") or bucket["time"].endswith("Z"), (
+                f"bucket time must include UTC offset, got {bucket['time']!r}"
+            )
             assert bucket["world"] >= 0
             assert bucket["experience"] >= 0
             assert bucket["observation"] >= 0
@@ -138,10 +144,6 @@ async def test_memories_timeseries_empty_bank_returns_zero_filled_buckets(
 ):
     """A bank with no memories must still return the full zero-filled bucket set."""
     try:
-        # Ensure the bank exists.
-        response = await api_client.get(f"/v1/default/banks/{test_bank_id}/profile")
-        assert response.status_code == 200
-
         response = await api_client.get(
             f"/v1/default/banks/{test_bank_id}/stats/memories-timeseries",
             params={"period": "7d"},

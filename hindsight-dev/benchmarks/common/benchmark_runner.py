@@ -24,7 +24,7 @@ import os
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import pydantic
 from hindsight_api import MemoryEngine
@@ -983,7 +983,7 @@ class BenchmarkRunner:
         max_concurrent_questions: int = 1,  # Default to 1 for sequential processing
         eval_semaphore_size: int = 8,
         clear_agent_per_item: bool = False,
-        specific_item: Optional[str] = None,
+        specific_item: Optional[Union[str, Iterable[str]]] = None,
         separate_ingestion_phase: bool = False,
         filln: bool = False,
         max_concurrent_items: int = 1,  # Max concurrent items (conversations) to process in parallel
@@ -1024,13 +1024,14 @@ class BenchmarkRunner:
         console.print(f"\n[1] Loading dataset from {dataset_path}...")
         items = self.dataset.load(dataset_path, max_items)
 
-        # Filter for specific item if requested
+        # Filter for specific item(s) if requested
         if specific_item is not None:
-            items = [item for item in items if self.dataset.get_item_id(item) == specific_item]
+            target_ids = {specific_item} if isinstance(specific_item, str) else set(specific_item)
+            items = [item for item in items if self.dataset.get_item_id(item) in target_ids]
             if not items:
-                console.print(f"    [red]✗[/red] No item found with ID: {specific_item}")
-                raise ValueError(f"Item with ID '{specific_item}' not found in dataset")
-            console.print(f"    [green]✓[/green] Filtering to specific item: {specific_item}")
+                console.print(f"    [red]✗[/red] No item found with ID(s): {sorted(target_ids)}")
+                raise ValueError(f"No items matching ID(s) {sorted(target_ids)} found in dataset")
+            console.print(f"    [green]✓[/green] Filtering to {len(items)} item(s): {sorted(target_ids)}")
 
         console.print(f"    [green]✓[/green] Loaded {len(items)} items")
 
@@ -1041,6 +1042,72 @@ class BenchmarkRunner:
             console.print(f"    Bank template: {template_path}")
         console.print("    [green]✓[/green] Memory system initialized")
 
+        # Start a background worker poller when we need to wait for consolidation.
+        # Consolidation is submitted as an async task by retain_batch_async, but
+        # without a running worker those tasks sit in the queue forever.
+        poller_task = None
+        poller = None
+        if wait_consolidation:
+            from hindsight_api.worker.poller import WorkerPoller
+
+            poller = WorkerPoller(
+                backend=self.memory._backend,
+                worker_id="benchmark-runner-worker",
+                executor=self.memory.execute_task,
+                poll_interval_ms=500,
+                max_slots=4,
+            )
+            poller_task = asyncio.create_task(poller.run())
+            console.print("    [green]✓[/green] Background worker started (for consolidation)")
+
+        try:
+            return await self._run_inner(
+                items,
+                agent_id,
+                thinking_budget,
+                max_tokens,
+                skip_ingestion,
+                max_questions_per_item,
+                max_concurrent_questions,
+                eval_semaphore_size,
+                clear_agent_per_item,
+                specific_item,
+                separate_ingestion_phase,
+                filln,
+                max_concurrent_items,
+                output_path,
+                merge_with_existing,
+                wait_consolidation,
+            )
+        finally:
+            if poller and poller_task:
+                await poller.shutdown_graceful(timeout=60.0)
+                poller_task.cancel()
+                try:
+                    await poller_task
+                except asyncio.CancelledError:
+                    pass
+                console.print("    [green]✓[/green] Background worker stopped")
+
+    async def _run_inner(
+        self,
+        items: List[Dict[str, Any]],
+        agent_id: str,
+        thinking_budget: int,
+        max_tokens: int,
+        skip_ingestion: bool,
+        max_questions_per_item: Optional[int],
+        max_concurrent_questions: int,
+        eval_semaphore_size: int,
+        clear_agent_per_item: bool,
+        specific_item: Any,
+        separate_ingestion_phase: bool,
+        filln: bool,
+        max_concurrent_items: int,
+        output_path: Optional[Path],
+        merge_with_existing: bool,
+        wait_consolidation: bool,
+    ) -> Dict[str, Any]:
         if separate_ingestion_phase:
             # New two-phase approach: ingest all, then evaluate all
             return await self._run_two_phase(

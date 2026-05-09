@@ -9,6 +9,8 @@ from collections.abc import Sequence
 
 from alembic import context, op
 
+from hindsight_api.alembic._dialect import run_for_dialect
+
 revision: str = "h9i0j1k2l3m4"
 down_revision: str | Sequence[str] | None = ("h3i4j5k6l7m8", "c4x5y6z7a8b9")
 branch_labels: str | Sequence[str] | None = None
@@ -20,7 +22,7 @@ def _get_schema_prefix() -> str:
     return f'"{schema}".' if schema else ""
 
 
-def upgrade() -> None:
+def _pg_upgrade() -> None:
     schema = _get_schema_prefix()
 
     op.execute(f"ALTER TABLE {schema}memory_units ADD COLUMN IF NOT EXISTS trust_score REAL DEFAULT 0.5")
@@ -89,7 +91,7 @@ def upgrade() -> None:
     )
 
 
-def downgrade() -> None:
+def _pg_downgrade() -> None:
     schema = _get_schema_prefix()
 
     op.execute(f"DROP TABLE IF EXISTS {schema}memory_structural_vectors")
@@ -99,3 +101,11 @@ def downgrade() -> None:
     op.execute(f"ALTER TABLE {schema}memory_units DROP COLUMN IF EXISTS unhelpful_count")
     op.execute(f"ALTER TABLE {schema}memory_units DROP COLUMN IF EXISTS helpful_count")
     op.execute(f"ALTER TABLE {schema}memory_units DROP COLUMN IF EXISTS trust_score")
+
+
+def upgrade() -> None:
+    run_for_dialect(pg=_pg_upgrade)
+
+
+def downgrade() -> None:
+    run_for_dialect(pg=_pg_downgrade)

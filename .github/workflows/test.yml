@@ -3,8 +3,6 @@ name: CI
 on:
   pull_request:
     branches: [ main ]
-  pull_request_review:
-    types: [ submitted ]
   workflow_dispatch:
 
 concurrency:
@@ -13,10 +11,6 @@ concurrency:
 
 jobs:
   detect-changes:
-    # Skip non-approved pull_request_review events
-    if: >-
-      github.event_name != 'pull_request_review' ||
-      github.event.review.state == 'approved'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: read
@@ -47,19 +41,22 @@ jobs:
       integrations-llamaindex: ${{ steps.filter.outputs.integrations-llamaindex }}
       integrations-paperclip: ${{ steps.filter.outputs.integrations-paperclip }}
       integrations-opencode: ${{ steps.filter.outputs.integrations-opencode }}
+      integrations-n8n: ${{ steps.filter.outputs.integrations-n8n }}
       integrations-cloudflare-oauth-proxy: ${{ steps.filter.outputs.integrations-cloudflare-oauth-proxy }}
       integrations-lockfiles: ${{ steps.filter.outputs.integrations-lockfiles }}
       integrations-openai-agents: ${{ steps.filter.outputs.integrations-openai-agents }}
+      integrations-pipecat: ${{ steps.filter.outputs.integrations-pipecat }}
+      integrations-agentcore: ${{ steps.filter.outputs.integrations-agentcore }}
+      integrations-smolagents: ${{ steps.filter.outputs.integrations-smolagents }}
+      integrations-dify: ${{ steps.filter.outputs.integrations-dify }}
+      tools-agent-sdk: ${{ steps.filter.outputs.tools-agent-sdk }}
       dev: ${{ steps.filter.outputs.dev }}
       ci: ${{ steps.filter.outputs.ci }}
-      # Secrets are available for internal PRs, pull_request_review, and workflow_dispatch.
+      # Secrets are available for internal PRs and workflow_dispatch.
       # Fork PRs via pull_request event do NOT have access to secrets.
       has_secrets: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
     - uses: actions/checkout@v6
-      with:
-        # For pull_request_review, checkout the PR head (not the base branch)
-        ref: ${{ github.event_name == 'pull_request_review' && github.event.pull_request.head.sha || '' }}
 
     - uses: dorny/paths-filter@v4
       id: filter
@@ -128,6 +125,8 @@ jobs:
             - 'hindsight-integrations/paperclip/**'
           integrations-opencode:
             - 'hindsight-integrations/opencode/**'
+          integrations-n8n:
+            - 'hindsight-integrations/n8n/**'
           integrations-cloudflare-oauth-proxy:
             - 'hindsight-integrations/cloudflare-oauth-proxy/**'
           integrations-lockfiles:
@@ -136,6 +135,16 @@ jobs:
             - 'scripts/check-integration-lockfiles.sh'
           integrations-openai-agents:
             - 'hindsight-integrations/openai-agents/**'
+          integrations-pipecat:
+            - 'hindsight-integrations/pipecat/**'
+          integrations-agentcore:
+            - 'hindsight-integrations/agentcore/**'
+          integrations-smolagents:
+            - 'hindsight-integrations/smolagents/**'
+          integrations-dify:
+            - 'hindsight-integrations/dify/**'
+          tools-agent-sdk:
+            - 'hindsight-tools/hindsight-agent-sdk/**'
           dev:
             - 'hindsight-dev/**'
           ci:
@@ -151,7 +160,6 @@ jobs:
   check-integration-lockfiles:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-lockfiles == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -167,7 +175,6 @@ jobs:
   build-api-python-versions:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -198,7 +205,6 @@ jobs:
   build-typescript-client:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.clients-ts == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -225,7 +231,6 @@ jobs:
   build-hindsight-all-npm:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.all-npm == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -255,7 +260,6 @@ jobs:
   build-openclaw-integration:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-openclaw == 'true' ||
       needs.detect-changes.outputs.clients-ts == 'true' ||
@@ -289,6 +293,9 @@ jobs:
     - name: Build hindsight-all-npm (openclaw dep)
       run: npm run build --workspace=hindsight-all-npm
 
+    - name: Build hindsight-agent-sdk (openclaw dep)
+      run: npm run build --workspace=hindsight-tools/hindsight-agent-sdk
+
     - name: Install openclaw dependencies
       working-directory: ./hindsight-integrations/openclaw
       run: npm ci
@@ -308,7 +315,6 @@ jobs:
   smoke-openclaw-install:
     needs: [detect-changes, build-openclaw-integration]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-openclaw == 'true' ||
       needs.detect-changes.outputs.clients-ts == 'true' ||
@@ -352,6 +358,9 @@ jobs:
     - name: Build hindsight-all-npm (openclaw dep)
       run: npm run build --workspace=hindsight-all-npm
 
+    - name: Build hindsight-agent-sdk (openclaw dep)
+      run: npm run build --workspace=hindsight-tools/hindsight-agent-sdk
+
     - name: Install openclaw dependencies
       working-directory: ./hindsight-integrations/openclaw
       run: npm ci
@@ -363,7 +372,6 @@ jobs:
   test-claude-code-integration:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-claude-code == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -389,7 +397,6 @@ jobs:
   test-codex-integration:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-codex == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -415,7 +422,6 @@ jobs:
   build-ai-sdk-integration:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-ai-sdk == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -446,7 +452,6 @@ jobs:
   test-ai-sdk-integration-deno:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-ai-sdk == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -478,7 +483,6 @@ jobs:
   test-opencode-integration:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-opencode == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -506,10 +510,71 @@ jobs:
       working-directory: ./hindsight-integrations/opencode
       run: npm run build
 
+  test-n8n-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-n8n == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: '22'
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/n8n
+      run: npm install --no-fund --no-audit
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/n8n
+      run: npm test
+
+    - name: Build
+      working-directory: ./hindsight-integrations/n8n
+      run: npm run build
+
+  test-hindsight-agent-sdk:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.tools-agent-sdk == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: '22'
+        cache: 'npm'
+        cache-dependency-path: package-lock.json
+
+    - name: Install root workspace dependencies
+      run: npm ci
+
+    - name: Build hindsight-client (agent-sdk dep)
+      run: npm run build --workspace=hindsight-clients/typescript
+
+    - name: Run tests
+      run: npm test --workspace=hindsight-tools/hindsight-agent-sdk
+
+    - name: Build
+      run: npm run build --workspace=hindsight-tools/hindsight-agent-sdk
+
   test-cloudflare-oauth-proxy-integration:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-cloudflare-oauth-proxy == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -540,7 +605,6 @@ jobs:
   build-chat-integration:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-chat == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -571,7 +635,6 @@ jobs:
   test-paperclip-integration:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-paperclip == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -599,10 +662,46 @@ jobs:
       working-directory: ./hindsight-integrations/paperclip
       run: npm test
 
+  test-pipecat-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-pipecat == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Build pipecat integration
+      working-directory: ./hindsight-integrations/pipecat
+      run: uv build
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/pipecat
+      run: uv sync --frozen
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/pipecat
+      run: uv run pytest tests -v
+
+
   build-control-plane:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.control-plane == 'true' ||
       needs.detect-changes.outputs.clients-ts == 'true' ||
@@ -663,7 +762,6 @@ jobs:
   build-docs:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.docs == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -691,8 +789,7 @@ jobs:
     needs: [detect-changes]
     if: >-
       needs.detect-changes.outputs.has_secrets == 'true' &&
-      ((github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.cli == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -820,7 +917,6 @@ jobs:
   lint-helm-chart:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.helm == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -843,8 +939,7 @@ jobs:
     needs: [detect-changes]
     if: >-
       needs.detect-changes.outputs.has_secrets == 'true' &&
-      ((github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.docker == 'true' ||
       needs.detect-changes.outputs.control-plane == 'true' ||
@@ -937,8 +1032,7 @@ jobs:
     needs: [detect-changes]
     if: >-
       needs.detect-changes.outputs.has_secrets == 'true' &&
-      ((github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
@@ -1008,14 +1102,238 @@ jobs:
 
     - name: Run tests
       working-directory: ./hindsight-api-slim
-      run: uv run pytest tests -v
+      run: uv run pytest tests -v -m "not hs_llm_mat"
 
-  test-python-client:
+  test-api-llm-acceptance:
     needs: [detect-changes]
     if: >-
       needs.detect-changes.outputs.has_secrets == 'true' &&
       ((github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
       github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: vertexai
+            model: google/gemini-2.5-flash-lite
+          - provider: gemini
+            model: gemini-2.5-flash-lite
+            api_key_secret: GEMINI_API_KEY
+          - provider: openai
+            model: gpt-4.1-nano
+            api_key_secret: OPENAI_API_KEY
+          - provider: groq
+            model: openai/gpt-oss-20b
+            api_key_secret: GROQ_API_KEY
+          - provider: bedrock
+            model: us.amazon.nova-2-lite-v1:0
+          - provider: litellmrouter
+            model: gpt-4.1-nano
+            # Single-deployment chain over OpenAI — verifies the Router-backed
+            # call path works end-to-end. Built from secrets in the step below.
+    name: LLM acceptance (${{ matrix.provider }}/${{ matrix.model }})
+    env:
+      HINDSIGHT_API_LLM_PROVIDER: ${{ matrix.provider }}
+      HINDSIGHT_API_LLM_MODEL: ${{ matrix.model }}
+      HINDSIGHT_API_LLM_API_KEY: ${{ matrix.api_key_secret && secrets[matrix.api_key_secret] || '' }}
+      HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION_NAME: ${{ secrets.AWS_REGION_NAME }}
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Setup GCP credentials
+      run: |
+        printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
+        PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
+        echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Install dependencies
+      working-directory: ./hindsight-api-slim
+      run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
+
+    - name: Cache HuggingFace models
+      uses: actions/cache@v5
+      with:
+        path: ~/.cache/huggingface
+        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-huggingface-
+
+    - name: Pre-download models
+      working-directory: ./hindsight-api-slim
+      run: |
+        uv run python -c "
+        from sentence_transformers import SentenceTransformer, CrossEncoder
+        SentenceTransformer('BAAI/bge-small-en-v1.5')
+        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        "
+
+    - name: Build litellmrouter config
+      if: matrix.provider == 'litellmrouter'
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        ROUTER_MODEL: ${{ matrix.model }}
+      run: |
+        cfg=$(jq -nc \
+          --arg model "openai/$ROUTER_MODEL" \
+          --arg key "$OPENAI_API_KEY" \
+          '{model_list: [{model_name: "default", litellm_params: {model: $model, api_key: $key}}]}')
+        echo "::add-mask::$cfg"
+        echo "HINDSIGHT_API_LLM_LITELLMROUTER_CONFIG=$cfg" >> "$GITHUB_ENV"
+
+    - name: Run LLM acceptance tests
+      working-directory: ./hindsight-api-slim
+      run: uv run pytest tests -v -m "hs_llm_mat" --timeout 600
+
+  test-api-oracle:
+    needs: [detect-changes]
+    # Gated behind the "oracle-tests" PR label so it doesn't run by default.
+    # Add the label to any PR that needs Oracle validation.
+    if: >-
+      needs.detect-changes.outputs.has_secrets == 'true' &&
+      contains(github.event.pull_request.labels.*.name, 'oracle-tests') &&
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    env:
+      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
+      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      HINDSIGHT_API_DATABASE_BACKEND: oracle
+      ORACLE_TEST_DSN: oracle+oracledb://hindsight_test:hindsight_test@localhost:1521/FREEPDB1
+
+    services:
+      oracle:
+        image: container-registry.oracle.com/database/free:latest
+        env:
+          ORACLE_PWD: oracle
+        ports:
+          - 1521:1521
+        options: >-
+          --health-cmd "echo 'SELECT 1 FROM DUAL;' | sqlplus -s system/oracle@localhost:1521/FREEPDB1 || exit 1"
+          --health-interval 30s
+          --health-timeout 10s
+          --health-retries 10
+          --health-start-period 120s
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Setup Oracle test user
+      # The SYSTEM tablespace uses manual segment space management which
+      # doesn't support VECTOR types. Create an ASSM tablespace and a
+      # dedicated test user so VECTOR columns work correctly.
+      run: |
+        pip install oracledb
+        python3 -c "
+        import oracledb
+        conn = oracledb.connect(user='system', password='oracle', dsn='localhost:1521/FREEPDB1')
+        cursor = conn.cursor()
+        cursor.execute(\"\"\"
+            CREATE TABLESPACE hindsight_ts
+            DATAFILE 'hindsight_ts.dbf' SIZE 200M AUTOEXTEND ON NEXT 50M
+            EXTENT MANAGEMENT LOCAL
+            SEGMENT SPACE MANAGEMENT AUTO
+        \"\"\")
+        cursor.execute(\"\"\"
+            CREATE USER hindsight_test IDENTIFIED BY hindsight_test
+            DEFAULT TABLESPACE hindsight_ts
+            TEMPORARY TABLESPACE temp
+            QUOTA UNLIMITED ON hindsight_ts
+        \"\"\")
+        cursor.execute('GRANT CONNECT, RESOURCE, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW, CREATE PROCEDURE TO hindsight_test')
+        cursor.execute('GRANT CTXAPP TO hindsight_test')
+        conn.commit()
+        conn.close()
+        print('Oracle test user created successfully')
+        "
+
+    - name: Setup GCP credentials
+      run: |
+        printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
+        PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
+        echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Build API
+      working-directory: ./hindsight-api-slim
+      run: uv build
+
+    - name: Install dependencies
+      working-directory: ./hindsight-api-slim
+      run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
+
+    - name: Cache HuggingFace models
+      uses: actions/cache@v5
+      with:
+        path: ~/.cache/huggingface
+        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-huggingface-
+
+    - name: Pre-download models
+      working-directory: ./hindsight-api-slim
+      run: |
+        uv run python -c "
+        from sentence_transformers import SentenceTransformer, CrossEncoder
+        print('Downloading embedding model...')
+        SentenceTransformer('BAAI/bge-small-en-v1.5')
+        print('Downloading cross-encoder model...')
+        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        print('Models downloaded successfully')
+        "
+
+    - name: Run Oracle tests
+      working-directory: ./hindsight-api-slim
+      # -n0: run sequentially to avoid ORA-00060 deadlocks from concurrent
+      # test transactions against the same Oracle Free container.
+      run: uv run pytest tests -v -m oracle -n0
+
+  test-python-client:
+    needs: [detect-changes]
+    if: >-
+      needs.detect-changes.outputs.has_secrets == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-python == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -1126,8 +1444,7 @@ jobs:
     needs: [detect-changes]
     if: >-
       needs.detect-changes.outputs.has_secrets == 'true' &&
-      ((github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-ts == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -1239,12 +1556,342 @@ jobs:
         echo "=== API Server Logs ==="
         cat /tmp/api-server.log || echo "No API server log found"
 
+  # -----------------------------------------------------------------
+  # Client integration tests against Oracle 23ai.
+  #
+  # Same shape as test-python-client / test-typescript-client but with the
+  # API server pointed at an Oracle 23ai service container. Catches API
+  # changes that work on PG but break on Oracle (or vice versa) before they
+  # ship — the unit tests use the abstraction layer, but only the client
+  # tests exercise full HTTP round-trips with real serialized payloads.
+  #
+  # Runs on every API/clients change (no label needed). The "oracle-tests"
+  # label is reserved for test-api-oracle — the full unit suite is too
+  # heavy to run on every PR.
+  # -----------------------------------------------------------------
+  test-python-client-oracle:
+    needs: [detect-changes]
+    if: >-
+      needs.detect-changes.outputs.has_secrets == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.clients-python == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    env:
+      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
+      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
+      HINDSIGHT_API_URL: http://localhost:8888
+      HINDSIGHT_API_DATABASE_BACKEND: oracle
+      HINDSIGHT_API_DATABASE_URL: oracle+oracledb://hindsight_test:hindsight_test@localhost:1521/FREEPDB1
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    services:
+      oracle:
+        image: container-registry.oracle.com/database/free:latest
+        env:
+          ORACLE_PWD: oracle
+        ports:
+          - 1521:1521
+        options: >-
+          --health-cmd "echo 'SELECT 1 FROM DUAL;' | sqlplus -s system/oracle@localhost:1521/FREEPDB1 || exit 1"
+          --health-interval 30s
+          --health-timeout 10s
+          --health-retries 10
+          --health-start-period 120s
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Setup Oracle test user
+      run: |
+        pip install oracledb
+        python3 -c "
+        import oracledb
+        conn = oracledb.connect(user='system', password='oracle', dsn='localhost:1521/FREEPDB1')
+        cursor = conn.cursor()
+        cursor.execute(\"\"\"
+            CREATE TABLESPACE hindsight_ts
+            DATAFILE 'hindsight_ts.dbf' SIZE 200M AUTOEXTEND ON NEXT 50M
+            EXTENT MANAGEMENT LOCAL
+            SEGMENT SPACE MANAGEMENT AUTO
+        \"\"\")
+        cursor.execute(\"\"\"
+            CREATE USER hindsight_test IDENTIFIED BY hindsight_test
+            DEFAULT TABLESPACE hindsight_ts
+            TEMPORARY TABLESPACE temp
+            QUOTA UNLIMITED ON hindsight_ts
+        \"\"\")
+        cursor.execute('GRANT CONNECT, RESOURCE, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW, CREATE PROCEDURE TO hindsight_test')
+        cursor.execute('GRANT CTXAPP TO hindsight_test')
+        conn.commit()
+        conn.close()
+        print('Oracle test user created successfully')
+        "
+
+    - name: Setup GCP credentials
+      run: |
+        printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
+        PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
+        echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Build API
+      working-directory: ./hindsight-api-slim
+      run: uv build
+
+    - name: Build Python client
+      working-directory: ./hindsight-clients/python
+      run: uv build
+
+    - name: Install client test dependencies
+      working-directory: ./hindsight-clients/python
+      run: uv sync --frozen --extra test --index-strategy unsafe-best-match
+
+    - name: Install API dependencies
+      working-directory: ./hindsight-api-slim
+      run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
+
+    - name: Cache HuggingFace models
+      uses: actions/cache@v5
+      with:
+        path: ~/.cache/huggingface
+        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-huggingface-
+
+    - name: Pre-download models
+      working-directory: ./hindsight-api-slim
+      run: |
+        uv run python -c "
+        from sentence_transformers import SentenceTransformer, CrossEncoder
+        print('Downloading embedding model...')
+        SentenceTransformer('BAAI/bge-small-en-v1.5')
+        print('Downloading cross-encoder model...')
+        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        print('Models downloaded successfully')
+        "
+
+    - name: Create .env file
+      # The Oracle DB env vars need to be in .env for start-api.sh to pick them
+      # up — it source's the file before exec'ing the API.
+      run: |
+        cat > .env << EOF
+        HINDSIGHT_API_LLM_PROVIDER=${{ env.HINDSIGHT_API_LLM_PROVIDER }}
+        HINDSIGHT_API_LLM_MODEL=${{ env.HINDSIGHT_API_LLM_MODEL }}
+        HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/tmp/gcp-credentials.json
+        HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID
+        HINDSIGHT_API_DATABASE_BACKEND=${{ env.HINDSIGHT_API_DATABASE_BACKEND }}
+        HINDSIGHT_API_DATABASE_URL=${{ env.HINDSIGHT_API_DATABASE_URL }}
+        EOF
+
+    - name: Start API server
+      run: |
+        ./scripts/dev/start-api.sh > /tmp/api-server.log 2>&1 &
+        echo "Waiting for API server to be ready..."
+        for i in {1..120}; do
+          if curl -sf http://localhost:8888/health > /dev/null 2>&1; then
+            echo "API server is ready after ${i}s"
+            break
+          fi
+          if [ $i -eq 120 ]; then
+            echo "API server failed to start after 120s"
+            cat /tmp/api-server.log
+            exit 1
+          fi
+          sleep 1
+        done
+
+    - name: Run Python client tests (Oracle, sequential)
+      working-directory: ./hindsight-clients/python
+      # -n0 overrides the "-n auto" default in pyproject.toml. Oracle's
+      # row-level locking deadlocks (ORA-00060) under concurrent retain
+      # cleanup — same reason test-api-oracle runs sequentially.
+      run: uv run pytest tests -v -n0
+
+    - name: Show API server logs
+      if: always()
+      run: |
+        echo "=== API Server Logs ==="
+        cat /tmp/api-server.log || echo "No API server log found"
+
+  test-typescript-client-oracle:
+    needs: [detect-changes]
+    if: >-
+      needs.detect-changes.outputs.has_secrets == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.clients-ts == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    env:
+      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
+      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
+      HINDSIGHT_API_URL: http://localhost:8888
+      HINDSIGHT_API_DATABASE_BACKEND: oracle
+      HINDSIGHT_API_DATABASE_URL: oracle+oracledb://hindsight_test:hindsight_test@localhost:1521/FREEPDB1
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    services:
+      oracle:
+        image: container-registry.oracle.com/database/free:latest
+        env:
+          ORACLE_PWD: oracle
+        ports:
+          - 1521:1521
+        options: >-
+          --health-cmd "echo 'SELECT 1 FROM DUAL;' | sqlplus -s system/oracle@localhost:1521/FREEPDB1 || exit 1"
+          --health-interval 30s
+          --health-timeout 10s
+          --health-retries 10
+          --health-start-period 120s
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Setup Oracle test user
+      run: |
+        pip install oracledb
+        python3 -c "
+        import oracledb
+        conn = oracledb.connect(user='system', password='oracle', dsn='localhost:1521/FREEPDB1')
+        cursor = conn.cursor()
+        cursor.execute(\"\"\"
+            CREATE TABLESPACE hindsight_ts
+            DATAFILE 'hindsight_ts.dbf' SIZE 200M AUTOEXTEND ON NEXT 50M
+            EXTENT MANAGEMENT LOCAL
+            SEGMENT SPACE MANAGEMENT AUTO
+        \"\"\")
+        cursor.execute(\"\"\"
+            CREATE USER hindsight_test IDENTIFIED BY hindsight_test
+            DEFAULT TABLESPACE hindsight_ts
+            TEMPORARY TABLESPACE temp
+            QUOTA UNLIMITED ON hindsight_ts
+        \"\"\")
+        cursor.execute('GRANT CONNECT, RESOURCE, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW, CREATE PROCEDURE TO hindsight_test')
+        cursor.execute('GRANT CTXAPP TO hindsight_test')
+        conn.commit()
+        conn.close()
+        print('Oracle test user created successfully')
+        "
+
+    - name: Setup GCP credentials
+      run: |
+        printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
+        PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
+        echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: '20'
+
+    - name: Build API
+      working-directory: ./hindsight-api-slim
+      run: uv build
+
+    - name: Install API dependencies
+      working-directory: ./hindsight-api-slim
+      run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
+
+    - name: Install TypeScript client dependencies
+      working-directory: ./hindsight-clients/typescript
+      run: npm ci
+
+    - name: Build TypeScript client
+      working-directory: ./hindsight-clients/typescript
+      run: npm run build
+
+    - name: Cache HuggingFace models
+      uses: actions/cache@v5
+      with:
+        path: ~/.cache/huggingface
+        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-huggingface-
+
+    - name: Pre-download models
+      working-directory: ./hindsight-api-slim
+      run: |
+        uv run python -c "
+        from sentence_transformers import SentenceTransformer, CrossEncoder
+        print('Downloading embedding model...')
+        SentenceTransformer('BAAI/bge-small-en-v1.5')
+        print('Downloading cross-encoder model...')
+        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        print('Models downloaded successfully')
+        "
+
+    - name: Create .env file
+      run: |
+        cat > .env << EOF
+        HINDSIGHT_API_LLM_PROVIDER=${{ env.HINDSIGHT_API_LLM_PROVIDER }}
+        HINDSIGHT_API_LLM_MODEL=${{ env.HINDSIGHT_API_LLM_MODEL }}
+        HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/tmp/gcp-credentials.json
+        HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID
+        HINDSIGHT_API_DATABASE_BACKEND=${{ env.HINDSIGHT_API_DATABASE_BACKEND }}
+        HINDSIGHT_API_DATABASE_URL=${{ env.HINDSIGHT_API_DATABASE_URL }}
+        EOF
+
+    - name: Start API server
+      run: |
+        ./scripts/dev/start-api.sh > /tmp/api-server.log 2>&1 &
+        echo "Waiting for API server to be ready..."
+        for i in {1..120}; do
+          if curl -sf http://localhost:8888/health > /dev/null 2>&1; then
+            echo "API server is ready after ${i}s"
+            break
+          fi
+          if [ $i -eq 120 ]; then
+            echo "API server failed to start after 120s"
+            cat /tmp/api-server.log
+            exit 1
+          fi
+          sleep 1
+        done
+
+    - name: Run TypeScript client tests
+      working-directory: ./hindsight-clients/typescript
+      run: npm test
+
+    - name: Show API server logs
+      if: always()
+      run: |
+        echo "=== API Server Logs ==="
+        cat /tmp/api-server.log || echo "No API server log found"
+
   test-typescript-client-deno:
     needs: [detect-changes]
     if: >-
       needs.detect-changes.outputs.has_secrets == 'true' &&
-      ((github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-ts == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -1365,7 +2012,6 @@ jobs:
   build-rust-cli-arm64:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.cli == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -1398,8 +2044,7 @@ jobs:
     needs: [detect-changes]
     if: >-
       needs.detect-changes.outputs.has_secrets == 'true' &&
-      ((github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-rust == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -1514,8 +2159,7 @@ jobs:
     needs: [detect-changes]
     if: >-
       needs.detect-changes.outputs.has_secrets == 'true' &&
-      ((github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-go == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -1628,8 +2272,7 @@ jobs:
     needs: [detect-changes]
     if: >-
       needs.detect-changes.outputs.has_secrets == 'true' &&
-      ((github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.integrations-openclaw == 'true' ||
       needs.detect-changes.outputs.embed == 'true' ||
@@ -1714,6 +2357,9 @@ jobs:
     - name: Build hindsight-all-npm (openclaw dep)
       run: npm run build --workspace=hindsight-all-npm
 
+    - name: Build hindsight-agent-sdk (openclaw dep)
+      run: npm run build --workspace=hindsight-tools/hindsight-agent-sdk
+
     - name: Install openclaw integration dependencies
       working-directory: ./hindsight-integrations/openclaw
       run: npm ci
@@ -1758,8 +2404,7 @@ jobs:
     needs: [detect-changes]
     if: >-
       needs.detect-changes.outputs.has_secrets == 'true' &&
-      ((github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.integration-tests == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -1864,7 +2509,6 @@ jobs:
   test-ag2-integration:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-ag2 == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -1898,10 +2542,79 @@ jobs:
       working-directory: ./hindsight-integrations/ag2
       run: uv run pytest tests -v
 
-  test-crewai-integration:
+  test-smolagents-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-smolagents == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Build smolagents integration
+      working-directory: ./hindsight-integrations/smolagents
+      run: uv build
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/smolagents
+      run: uv sync --frozen
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/smolagents
+      run: uv run pytest tests -v
+
+  test-dify-integration:
     needs: [detect-changes]
     if: >-
       github.event_name != 'pull_request_review' &&
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-dify == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        # Dify plugin runtime targets Python 3.12 (see manifest.yaml)
+        python-version: '3.12'
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/dify
+      run: uv pip install --system -e . pytest pytest-mock
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/dify
+      run: pytest tests -v
+
+  test-crewai-integration:
+    needs: [detect-changes]
+    if: >-
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-crewai == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -1938,7 +2651,6 @@ jobs:
   test-litellm-integration:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-litellm == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -1975,7 +2687,6 @@ jobs:
   test-pydantic-ai-integration:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-pydantic-ai == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -2012,7 +2723,6 @@ jobs:
   test-llamaindex-integration:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-llamaindex == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -2049,7 +2759,6 @@ jobs:
   test-openai-agents-integration:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-openai-agents == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -2083,12 +2792,47 @@ jobs:
       working-directory: ./hindsight-integrations/openai-agents
       run: uv run pytest tests -v
 
+  test-agentcore-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-agentcore == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Build agentcore integration
+      working-directory: ./hindsight-integrations/agentcore
+      run: uv build
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/agentcore
+      run: uv sync --frozen
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/agentcore
+      run: uv run pytest tests -v
+
   test-pip-slim:
     needs: [detect-changes]
     if: >-
       needs.detect-changes.outputs.has_secrets == 'true' &&
-      ((github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
@@ -2156,8 +2900,7 @@ jobs:
     needs: [detect-changes]
     if: >-
       needs.detect-changes.outputs.has_secrets == 'true' &&
-      ((github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.embed == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -2215,12 +2958,193 @@ jobs:
       working-directory: ./hindsight-embed
       run: ./test.sh
 
+  test-embed-windows:
+    # Windows coverage for hindsight-embed. Runs the same unit tests + smoke
+    # test as the Linux `test-embed` job, plus a `uv pip install --target`
+    # sanity check that validates the sibling-binary resolution used by
+    # users who install via `uv pip install hindsight-all` on Windows
+    # (closes #1240).
+    needs: [detect-changes]
+    if: >-
+      needs.detect-changes.outputs.has_secrets == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.embed == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: windows-latest
+    env:
+      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: ${{ github.workspace }}/gcp-credentials.json
+      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
+      # Force UTF-8 I/O so the CLI's ✓/box-drawing output doesn't crash the
+      # default Windows cp1252 codec. Also applied at runtime via
+      # sys.stdout.reconfigure in cli.py; this belt-and-suspenders covers
+      # subprocesses the daemon spawns.
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+      # pg0-embedded unpacks Postgres on first boot — noticeably slower on a
+      # cold Windows runner than POSIX. Double the embed startup budget.
+      HINDSIGHT_EMBED_DAEMON_STARTUP_TIMEOUT: "360"
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Setup GCP credentials
+      shell: bash
+      run: |
+        printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > gcp-credentials.json
+        PROJECT_ID=$(jq -r '.project_id' gcp-credentials.json)
+        echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> "$GITHUB_ENV"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Install embed dependencies
+      working-directory: ./hindsight-embed
+      run: uv sync --frozen --index-strategy unsafe-best-match
+
+    - name: Install API dependencies (with local-ml and embedded-db for smoke test)
+      working-directory: ./hindsight-api-slim
+      run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
+
+    - name: Cache HuggingFace models
+      uses: actions/cache@v5
+      with:
+        path: ~/.cache/huggingface
+        key: ${{ runner.os }}-huggingface-embed-${{ hashFiles('hindsight-embed/pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-huggingface-embed-
+          ${{ runner.os }}-huggingface-
+
+    - name: Run unit and integration tests
+      working-directory: ./hindsight-embed
+      run: uv run pytest tests/ -v
+
+    # Smoke test's retain/recall commands delegate to the Rust hindsight CLI.
+    # On POSIX, hindsight-embed auto-installs the CLI via curl|bash; on
+    # Windows that installer isn't available (and `bash` on windows-latest
+    # routes to WSL which isn't provisioned). Build the CLI from source and
+    # drop it into ~/.local/bin where find_cli_binary() looks first.
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo build
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          hindsight-cli/target
+        key: ${{ runner.os }}-cargo-embed-smoke-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-embed-smoke-
+          ${{ runner.os }}-cargo-
+
+    - name: Build hindsight CLI
+      working-directory: ./hindsight-cli
+      run: cargo build --release
+
+    - name: Stage hindsight CLI where find_cli_binary expects it
+      shell: bash
+      run: |
+        set -euo pipefail
+        install_dir="$HOME/.local/bin"
+        mkdir -p "$install_dir"
+        cp hindsight-cli/target/release/hindsight.exe "$install_dir/hindsight.exe"
+        "$install_dir/hindsight.exe" --version
+
+    - name: Run smoke test
+      shell: bash
+      working-directory: ./hindsight-embed
+      run: ./test.sh
+
+    # Real-world install test for issue #1240: drop both packages into a
+    # --target directory (the layout you get from `uv pip install hindsight-all`
+    # or NixOS) and verify the sibling binary is discovered (not the uvx
+    # fallback). Exercises a different code path than the smoke test, which
+    # uses `uv run --project` via the monorepo branch of _find_api_command.
+    #
+    # IMPORTANT: install outside the repo checkout. `_find_api_command` first
+    # probes `<pkg>/../../hindsight-api-slim` for dev mode; if the target dir
+    # lives inside the monorepo, that branch matches and we never exercise
+    # the sibling-binary path we actually want to test.
+    - name: Install hindsight-embed and hindsight-api into --target directory
+      shell: bash
+      run: |
+        set -euo pipefail
+        target="$RUNNER_TEMP/install-test"
+        rm -rf "$target"
+        mkdir -p "$target"
+        uv pip install --target "$target" ./hindsight-embed ./hindsight-api-slim
+
+    - name: Verify sibling hindsight-api.exe is present
+      shell: bash
+      run: |
+        set -euo pipefail
+        target="$RUNNER_TEMP/install-test"
+        if [ -f "$target/Scripts/hindsight-api.exe" ]; then
+          echo "Found $target/Scripts/hindsight-api.exe"
+        elif [ -f "$target/bin/hindsight-api.exe" ]; then
+          echo "Found $target/bin/hindsight-api.exe"
+        else
+          echo "::error::hindsight-api.exe not found in install target"
+          ls "$target/"
+          exit 1
+        fi
+
+    - name: Verify _find_api_command resolves the sibling binary (not uvx)
+      shell: bash
+      run: |
+        set -euo pipefail
+        target="$RUNNER_TEMP/install-test"
+        PYTHONPATH="$target" python -c "
+        from hindsight_embed.daemon_embed_manager import DaemonEmbedManager
+        cmd = DaemonEmbedManager()._find_api_command()
+        print('Resolved command:', cmd)
+        assert len(cmd) == 1 and cmd[0].endswith('hindsight-api.exe'), (
+            f'Expected sibling hindsight-api.exe, got {cmd!r}. '
+            'Falling back to uvx on --target installs reintroduces issue #1240.'
+        )
+        "
+
+    - name: Smoke-check installed hindsight-embed binary runs
+      shell: bash
+      run: |
+        set -euo pipefail
+        target="$RUNNER_TEMP/install-test"
+        export PYTHONPATH="$target"
+        if [ -f "$target/Scripts/hindsight-embed.exe" ]; then
+          "$target/Scripts/hindsight-embed.exe" --help
+        else
+          "$target/bin/hindsight-embed.exe" --help
+        fi
+
+    - name: Collect daemon logs on failure
+      if: failure()
+      shell: bash
+      run: |
+        for f in ~/.hindsight/daemon.log ~/.hindsight/profiles/*.log ~/.hindsight/profiles/*.stderr.log; do
+          if [ -f "$f" ]; then
+            echo "=== $f ==="
+            cat "$f"
+          fi
+        done || true
+
   test-hindsight-all:
     needs: [detect-changes]
     if: >-
       needs.detect-changes.outputs.has_secrets == 'true' &&
-      ((github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.hindsight-all == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -2304,8 +3228,7 @@ jobs:
     needs: [detect-changes]
     if: >-
       needs.detect-changes.outputs.has_secrets == 'true' &&
-      ((github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-ts == 'true' ||
       needs.detect-changes.outputs.clients-python == 'true' ||
@@ -2457,8 +3380,7 @@ jobs:
     needs: [detect-changes]
     if: >-
       needs.detect-changes.outputs.has_secrets == 'true' &&
-      ((github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.dev == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -2540,7 +3462,6 @@ jobs:
         done
 
   verify-generated-files:
-    if: github.event_name != 'pull_request_review'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v6
@@ -2622,7 +3543,6 @@ jobs:
   check-openapi-compatibility:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -2674,7 +3594,6 @@ jobs:
   check-cli-coverage:
     needs: [detect-changes]
     if: >-
-      github.event_name != 'pull_request_review' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.cli == 'true' ||
@@ -2725,14 +3644,18 @@ jobs:
       - test-cloudflare-oauth-proxy-integration
       - build-chat-integration
       - test-paperclip-integration
+      - test-pipecat-integration
       - build-control-plane
       - build-docs
       - test-rust-cli
       - lint-helm-chart
       - build-docker-images
       - test-api
+      - test-api-oracle
       - test-python-client
+      - test-python-client-oracle
       - test-typescript-client
+      - test-typescript-client-oracle
       - test-typescript-client-deno
       - build-rust-cli-arm64
       - test-rust-client
@@ -2740,13 +3663,18 @@ jobs:
       - test-openclaw-integration
       - test-integration
       - test-ag2-integration
+      - test-smolagents-integration
+      - test-dify-integration
       - test-crewai-integration
       - test-litellm-integration
       - test-pydantic-ai-integration
       - test-llamaindex-integration
+      - test-agentcore-integration
       - test-pip-slim
       - test-embed
+      - test-embed-windows
       - test-hindsight-all
+      - test-hindsight-agent-sdk
       - test-doc-examples
       - test-upgrade
       - verify-generated-files
@@ -2759,7 +3687,7 @@ jobs:
     steps:
       - name: Determine overall result
         id: result
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const needs = ${{ toJSON(needs) }};
@@ -2792,7 +3720,7 @@ jobs:
             core.setOutput('run_url', runUrl);
 
       - name: Report status to PR
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             await github.rest.repos.createCommitStatus({
@@ -2806,7 +3734,7 @@ jobs:
             });
 
       - name: Comment on PR
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const prNumber = context.payload.pull_request.number;

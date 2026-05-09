@@ -269,6 +269,7 @@ impl ApiClient {
         bank_id: &str,
         files: Vec<(String, Vec<u8>)>,
         context: Option<String>,
+        strategy: Option<String>,
         verbose: bool,
     ) -> Result<FileRetainResult> {
         self.runtime.block_on(async {
@@ -283,6 +284,9 @@ impl ApiClient {
                     let mut meta = serde_json::json!({});
                     if let Some(ctx) = &context {
                         meta["context"] = serde_json::Value::String(ctx.clone());
+                    }
+                    if let Some(strat) = &strategy {
+                        meta["strategy"] = serde_json::Value::String(strat.clone());
                     }
                     // Use filename stem as document_id for deduplication
                     if let Some(stem) = std::path::Path::new(name)
@@ -338,7 +342,7 @@ impl ApiClient {
             loop {
                 let response = self
                     .client
-                    .list_operations(agent_id, None, None, None, None, None)
+                    .list_operations(agent_id, None, None, None, None, None, None)
                     .await?;
                 let ops = response.into_inner();
 
@@ -351,7 +355,7 @@ impl ApiClient {
                             eprintln!("Operation {} status: {}", operation_id, operation.status);
                         }
                         match operation.status.as_str() {
-                            "pending" => {
+                            "pending" | "processing" => {
                                 // Still running, wait and poll again
                                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             }
@@ -361,6 +365,9 @@ impl ApiClient {
                             }
                             "failed" => {
                                 return Ok((false, operation.error_message.clone()));
+                            }
+                            "cancelled" => {
+                                return Ok((false, Some("Operation was cancelled".to_string())));
                             }
                             _ => {
                                 // Unknown status, treat as failed
@@ -470,7 +477,7 @@ impl ApiClient {
         self.runtime.block_on(async {
             let response = self
                 .client
-                .list_operations(agent_id, None, None, None, None, None)
+                .list_operations(agent_id, None, None, None, None, None, None)
                 .await?;
             let value = response.into_inner();
             // Convert to JSON Value first, then parse into our type
@@ -647,7 +654,7 @@ impl ApiClient {
         self.runtime.block_on(async {
             let response = self
                 .client
-                .get_graph(bank_id, limit, type_filter, None, None, None, None)
+                .get_graph(bank_id, None, None, limit, None, None, None, type_filter, None)
                 .await?;
             Ok(response.into_inner())
         })
@@ -709,7 +716,7 @@ impl ApiClient {
         self.runtime.block_on(async {
             let response = self
                 .client
-                .list_tags(bank_id, limit, offset, q, None)
+                .list_tags(bank_id, limit, offset, q, None, None)
                 .await?;
             Ok(response.into_inner())
         })

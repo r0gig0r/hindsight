@@ -8,6 +8,57 @@ import PageHero from '@site/src/components/PageHero';
 
 [← OpenClaw integration](/sdks/integrations/openclaw)
 
+## [0.7.6](https://github.com/vectorize-io/hindsight/tree/integrations/openclaw/v0.7.6)
+
+**Bug Fixes**
+
+- Setup wizard now preserves your existing OpenClaw token and URL when re-running setup, preventing unnecessary reconfiguration.<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/nicoloboschi" target="_blank" rel="noopener noreferrer" style={{color: "var(--ifm-color-primary)", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px", verticalAlign: "middle"}}><img src="https://github.com/nicoloboschi.png?size=40" alt="@nicoloboschi" width="18" height="18" style={{borderRadius: "50%"}} />@nicoloboschi</a><span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/vectorize-io/hindsight/commit/ef600683" target="_blank" rel="noopener noreferrer" style={{fontFamily: "var(--ifm-font-family-monospace, monospace)", fontSize: "0.85em", color: "var(--ifm-color-emphasis-600)"}}>ef600683</a>
+
+## [0.7.5](https://github.com/vectorize-io/hindsight/tree/integrations/openclaw/v0.7.5)
+
+**Bug Fixes**
+
+- Setup wizard now correctly saves the “Allow conversation access” setting for OpenClaw.<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/nicoloboschi" target="_blank" rel="noopener noreferrer" style={{color: "var(--ifm-color-primary)", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px", verticalAlign: "middle"}}><img src="https://github.com/nicoloboschi.png?size=40" alt="@nicoloboschi" width="18" height="18" style={{borderRadius: "50%"}} />@nicoloboschi</a><span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/vectorize-io/hindsight/commit/abf84872" target="_blank" rel="noopener noreferrer" style={{fontFamily: "var(--ifm-font-family-monospace, monospace)", fontSize: "0.85em", color: "var(--ifm-color-emphasis-600)"}}>abf84872</a>
+
+## [0.7.4](https://github.com/vectorize-io/hindsight/tree/integrations/openclaw/v0.7.4)
+
+**Bug Fixes**
+
+- Fixes OpenClaw integration configuration so the knowledge tools toggle is correctly honored.<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/nicoloboschi" target="_blank" rel="noopener noreferrer" style={{color: "var(--ifm-color-primary)", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px", verticalAlign: "middle"}}><img src="https://github.com/nicoloboschi.png?size=40" alt="@nicoloboschi" width="18" height="18" style={{borderRadius: "50%"}} />@nicoloboschi</a><span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/vectorize-io/hindsight/commit/c95206e0" target="_blank" rel="noopener noreferrer" style={{fontFamily: "var(--ifm-font-family-monospace, monospace)", fontSize: "0.85em", color: "var(--ifm-color-emphasis-600)"}}>c95206e0</a>
+
+## [0.7.3](https://github.com/vectorize-io/hindsight/tree/integrations/openclaw/v0.7.3)
+
+**Improvements**
+
+- Added optional performance timing debug output for the OpenClaw integration.<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/nicoloboschi" target="_blank" rel="noopener noreferrer" style={{color: "var(--ifm-color-primary)", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px", verticalAlign: "middle"}}><img src="https://github.com/nicoloboschi.png?size=40" alt="@nicoloboschi" width="18" height="18" style={{borderRadius: "50%"}} />@nicoloboschi</a><span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/vectorize-io/hindsight/commit/d37940a9" target="_blank" rel="noopener noreferrer" style={{fontFamily: "var(--ifm-font-family-monospace, monospace)", fontSize: "0.85em", color: "var(--ifm-color-emphasis-600)"}}>d37940a9</a>
+
+**Bug Fixes**
+
+- Fixed mission handling semantics and corrected the allowed configuration options (including retainQueue).<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/nicoloboschi" target="_blank" rel="noopener noreferrer" style={{color: "var(--ifm-color-primary)", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px", verticalAlign: "middle"}}><img src="https://github.com/nicoloboschi.png?size=40" alt="@nicoloboschi" width="18" height="18" style={{borderRadius: "50%"}} />@nicoloboschi</a><span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/vectorize-io/hindsight/commit/aca03832" target="_blank" rel="noopener noreferrer" style={{fontFamily: "var(--ifm-font-family-monospace, monospace)", fontSize: "0.85em", color: "var(--ifm-color-emphasis-600)"}}>aca03832</a>
+- Prevented duplicate OpenClaw registration across multiple API instances to avoid repeated handlers or side effects.<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/vernmic" target="_blank" rel="noopener noreferrer" style={{color: "var(--ifm-color-primary)", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px", verticalAlign: "middle"}}><img src="https://github.com/vernmic.png?size=40" alt="@vernmic" width="18" height="18" style={{borderRadius: "50%"}} />@vernmic</a><span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/vectorize-io/hindsight/commit/0ce9f333" target="_blank" rel="noopener noreferrer" style={{fontFamily: "var(--ifm-font-family-monospace, monospace)", fontSize: "0.85em", color: "var(--ifm-color-emphasis-600)"}}>0ce9f333</a>
+
+## [0.7.2](https://github.com/vectorize-io/hindsight/tree/integrations/openclaw/v0.7.2)
+
+*This release contains internal maintenance and infrastructure changes only.*
+
+## [0.7.1](https://github.com/vectorize-io/hindsight/tree/integrations/openclaw/v0.7.1)
+
+**Bug Fixes**
+
+- Fix OpenClaw integration upgrades by using the published agent-sdk dependency and updating the plugin configuration schema.<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/nicoloboschi" target="_blank" rel="noopener noreferrer" style={{color: "var(--ifm-color-primary)", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px", verticalAlign: "middle"}}><img src="https://github.com/nicoloboschi.png?size=40" alt="@nicoloboschi" width="18" height="18" style={{borderRadius: "50%"}} />@nicoloboschi</a><span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/vectorize-io/hindsight/commit/c1924e9d" target="_blank" rel="noopener noreferrer" style={{fontFamily: "var(--ifm-font-family-monospace, monospace)", fontSize: "0.85em", color: "var(--ifm-color-emphasis-600)"}}>c1924e9d</a>
+
+## [0.7.0](https://github.com/vectorize-io/hindsight/tree/integrations/openclaw/v0.7.0)
+
+**Features**
+
+- Added initial support for self-driving agents in the OpenClaw integration for Hindsight.<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/nicoloboschi" target="_blank" rel="noopener noreferrer" style={{color: "var(--ifm-color-primary)", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px", verticalAlign: "middle"}}><img src="https://github.com/nicoloboschi.png?size=40" alt="@nicoloboschi" width="18" height="18" style={{borderRadius: "50%"}} />@nicoloboschi</a><span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/vectorize-io/hindsight/commit/7f30dcc7" target="_blank" rel="noopener noreferrer" style={{fontFamily: "var(--ifm-font-family-monospace, monospace)", fontSize: "0.85em", color: "var(--ifm-color-emphasis-600)"}}>7f30dcc7</a>
+
+## [0.6.6](https://github.com/vectorize-io/hindsight/tree/integrations/openclaw/v0.6.6)
+
+**Bug Fixes**
+
+- Retention is now applied correctly for default agent main:main sessions instead of being silently skipped.<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/nicoloboschi" target="_blank" rel="noopener noreferrer" style={{color: "var(--ifm-color-primary)", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px", verticalAlign: "middle"}}><img src="https://github.com/nicoloboschi.png?size=40" alt="@nicoloboschi" width="18" height="18" style={{borderRadius: "50%"}} />@nicoloboschi</a><span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/vectorize-io/hindsight/commit/70677457" target="_blank" rel="noopener noreferrer" style={{fontFamily: "var(--ifm-font-family-monospace, monospace)", fontSize: "0.85em", color: "var(--ifm-color-emphasis-600)"}}>70677457</a>
+
 ## [0.6.5](https://github.com/vectorize-io/hindsight/tree/integrations/openclaw/v0.6.5)
 
 **Bug Fixes**
