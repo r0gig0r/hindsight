@@ -228,9 +228,7 @@ class MetricsCollectorBase:
         """Record memory conflict detection counts."""
         raise NotImplementedError
 
-    def record_structural_retrieval(
-        self, duration: float, candidates: int, rrf_contribution: int, bank_id: str
-    ):
+    def record_structural_retrieval(self, duration: float, candidates: int, rrf_contribution: int, bank_id: str):
         """Record structural retrieval timing and contribution."""
         raise NotImplementedError
 
@@ -283,9 +281,7 @@ class NoOpMetricsCollector(MetricsCollectorBase):
     def record_memory_conflicts(self, detected: int, open_count: int, bank_id: str):
         pass
 
-    def record_structural_retrieval(
-        self, duration: float, candidates: int, rrf_contribution: int, bank_id: str
-    ):
+    def record_structural_retrieval(self, duration: float, candidates: int, rrf_contribution: int, bank_id: str):
         pass
 
 
@@ -480,18 +476,14 @@ class MetricsCollector(MetricsCollectorBase):
         self.entity_probe_total.add(1, self._experimental_attrs(bank_id, matched=matched))
 
     def record_entity_reason(self, entity_count: int, matched: bool, bank_id: str):
-        self.entity_reason_total.add(
-            1, self._experimental_attrs(bank_id, entity_count=entity_count, matched=matched)
-        )
+        self.entity_reason_total.add(1, self._experimental_attrs(bank_id, entity_count=entity_count, matched=matched))
 
     def record_memory_conflicts(self, detected: int, open_count: int, bank_id: str):
         if detected > 0:
             self.memory_conflicts_detected_total.add(detected, self._experimental_attrs(bank_id))
         self.memory_conflicts_open_total.add(open_count, self._experimental_attrs(bank_id))
 
-    def record_structural_retrieval(
-        self, duration: float, candidates: int, rrf_contribution: int, bank_id: str
-    ):
+    def record_structural_retrieval(self, duration: float, candidates: int, rrf_contribution: int, bank_id: str):
         attributes = self._experimental_attrs(bank_id)
         self.structural_retrieval_duration.record(duration, attributes)
         if candidates > 0:

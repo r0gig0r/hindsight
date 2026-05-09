@@ -86,8 +86,7 @@ def _pg_upgrade() -> None:
         """
     )
     op.execute(
-        "CREATE INDEX IF NOT EXISTS idx_memory_structural_vectors_bank "
-        f"ON {schema}memory_structural_vectors (bank_id)"
+        f"CREATE INDEX IF NOT EXISTS idx_memory_structural_vectors_bank ON {schema}memory_structural_vectors (bank_id)"
     )
 
 

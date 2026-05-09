@@ -3249,7 +3249,12 @@ class MemoryEngine(MemoryEngineInterface):
         await self._authenticate_tenant(request_context)
         flags = await self._resolved_feature_flags(bank_id, request_context)
         if not self._feature_enabled(flags, "experimental_entity_tools_enabled"):
-            return {"enabled": False, "matched": False, "results": [], "message": "experimental_entity_tools_enabled is disabled for this bank"}
+            return {
+                "enabled": False,
+                "matched": False,
+                "results": [],
+                "message": "experimental_entity_tools_enabled is disabled for this bank",
+            }
 
         pool = await self._get_pool()
         fact_types = fact_types or ["world", "experience", "observation"]
@@ -3298,7 +3303,12 @@ class MemoryEngine(MemoryEngineInterface):
         await self._authenticate_tenant(request_context)
         flags = await self._resolved_feature_flags(bank_id, request_context)
         if not self._feature_enabled(flags, "experimental_entity_tools_enabled"):
-            return {"enabled": False, "matched": False, "results": [], "message": "experimental_entity_tools_enabled is disabled for this bank"}
+            return {
+                "enabled": False,
+                "matched": False,
+                "results": [],
+                "message": "experimental_entity_tools_enabled is disabled for this bank",
+            }
 
         pool = await self._get_pool()
         fact_types = fact_types or ["world", "experience", "observation"]
@@ -3388,7 +3398,11 @@ class MemoryEngine(MemoryEngineInterface):
         await self._authenticate_tenant(request_context)
         flags = await self._resolved_feature_flags(bank_id, request_context)
         if not self._feature_enabled(flags, "experimental_conflict_detection_enabled"):
-            return {"enabled": False, "conflicts": [], "message": "experimental_conflict_detection_enabled is disabled for this bank"}
+            return {
+                "enabled": False,
+                "conflicts": [],
+                "message": "experimental_conflict_detection_enabled is disabled for this bank",
+            }
 
         pool = await self._get_pool()
         detected = 0
@@ -3655,9 +3669,7 @@ class MemoryEngine(MemoryEngineInterface):
         recall_start = time.time()
         feature_flags = feature_flags or {}
         trust_rerank_enabled = self._feature_enabled(feature_flags, "experimental_trust_rerank_enabled")
-        structural_active = self._feature_enabled(
-            feature_flags, "experimental_structural_retrieval_enabled"
-        )
+        structural_active = self._feature_enabled(feature_flags, "experimental_structural_retrieval_enabled")
         structural_shadow = self._feature_enabled(feature_flags, "experimental_structural_shadow_enabled")
 
         # Buffer logs for clean output in concurrent scenarios.

@@ -101,10 +101,7 @@ type RecallRequestParams = {
 export interface BankScopedClient {
   readonly bankId: string;
   retain(req: RetainRequest): Promise<void>;
-  recall(
-    req: RecallRequestParams,
-    timeoutMs?: number
-  ): Promise<RecallResponse>;
+  recall(req: RecallRequestParams, timeoutMs?: number): Promise<RecallResponse>;
   /** [FORK] Diversity-clustered recall with entity enrichment */
   recallExp(req: RecallRequestParams, timeoutMs?: number): Promise<RecallResponse>;
   setMissions(opts: BankMissionsUpdate): Promise<void>;
@@ -1554,7 +1551,9 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
     experimentalRecallShadow: config.experimentalRecallShadow === true,
     experimentalRecallVariant:
       typeof config.experimentalRecallVariant === "string" &&
-      EXPERIMENTAL_RECALL_VARIANTS.includes(config.experimentalRecallVariant as ExperimentalRecallVariant)
+      EXPERIMENTAL_RECALL_VARIANTS.includes(
+        config.experimentalRecallVariant as ExperimentalRecallVariant
+      )
         ? (config.experimentalRecallVariant as ExperimentalRecallVariant)
         : "baseline",
     recallTimeoutMs:
