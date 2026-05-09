@@ -188,6 +188,18 @@ class RecallRequest(BaseModel):
         return self
 
 
+class MemoryFeedbackRequest(BaseModel):
+    rating: Literal["helpful", "unhelpful"]
+    source: Literal["user", "agent", "eval"]
+    reason: str | None = None
+
+
+class EntityReasonRequest(BaseModel):
+    entities: list[str] = Field(min_length=1)
+    limit: int = Field(default=20, ge=1, le=100)
+    fact_types: list[str] | None = None
+
+
 class RecallResult(BaseModel):
     """Single recall result item."""
 
@@ -1096,6 +1108,24 @@ class CreateBankRequest(BaseModel):
         default=None,
         description="Controls what gets synthesised into observations. Replaces built-in consolidation rules entirely.",
     )
+    experimental_memory_feedback_enabled: bool | None = Field(
+        default=None, description="Enable experimental per-memory feedback collection and trust scoring."
+    )
+    experimental_trust_rerank_enabled: bool | None = Field(
+        default=None, description="Enable experimental trust-score reranking boost."
+    )
+    experimental_entity_tools_enabled: bool | None = Field(
+        default=None, description="Enable experimental entity probe/reason API tools."
+    )
+    experimental_conflict_detection_enabled: bool | None = Field(
+        default=None, description="Enable experimental memory conflict detection APIs."
+    )
+    experimental_structural_retrieval_enabled: bool | None = Field(
+        default=None, description="Enable experimental structural retrieval as an active recall arm."
+    )
+    experimental_structural_shadow_enabled: bool | None = Field(
+        default=None, description="Enable experimental structural retrieval metrics without injecting its candidates."
+    )
 
     def get_config_updates(self) -> dict[str, Any]:
         """Return only the config fields that were explicitly set.
@@ -1128,6 +1158,12 @@ class CreateBankRequest(BaseModel):
             "retain_chunk_size",
             "enable_observations",
             "observations_mission",
+            "experimental_memory_feedback_enabled",
+            "experimental_trust_rerank_enabled",
+            "experimental_entity_tools_enabled",
+            "experimental_conflict_detection_enabled",
+            "experimental_structural_retrieval_enabled",
+            "experimental_structural_shadow_enabled",
         ):
             value = getattr(self, field_name)
             if value is not None:
@@ -1834,6 +1870,24 @@ class BankTemplateConfig(BaseModel):
     recall_budget_min: int | None = Field(default=None, description="Floor for the adaptive function (after clamping)")
     recall_budget_max: int | None = Field(
         default=None, description="Ceiling for the adaptive function (after clamping)"
+    )
+    experimental_memory_feedback_enabled: bool | None = Field(
+        default=None, description="Enable experimental per-memory feedback collection and trust scoring."
+    )
+    experimental_trust_rerank_enabled: bool | None = Field(
+        default=None, description="Enable experimental trust-score reranking boost."
+    )
+    experimental_entity_tools_enabled: bool | None = Field(
+        default=None, description="Enable experimental entity probe/reason API tools."
+    )
+    experimental_conflict_detection_enabled: bool | None = Field(
+        default=None, description="Enable experimental memory conflict detection APIs."
+    )
+    experimental_structural_retrieval_enabled: bool | None = Field(
+        default=None, description="Enable experimental structural retrieval as an active recall arm."
+    )
+    experimental_structural_shadow_enabled: bool | None = Field(
+        default=None, description="Enable experimental structural retrieval metrics without injecting its candidates."
     )
 
     def get_config_updates(self) -> dict[str, Any]:
@@ -3228,6 +3282,122 @@ def _register_routes(app: FastAPI):
             logger.error(
                 f"[RECALL ERROR] bank={bank_id} handler_duration={handler_duration:.3f}s error={str(e)}\n{error_detail}"
             )
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/memories/{memory_id}/feedback",
+        summary="Record memory feedback",
+        operation_id="record_memory_feedback",
+        tags=["Memory"],
+    )
+    @audited("memory_feedback")
+    async def api_memory_feedback(
+        bank_id: str,
+        memory_id: str,
+        request: MemoryFeedbackRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        try:
+            return await app.state.memory.add_memory_feedback(
+                bank_id=bank_id,
+                memory_id=memory_id,
+                rating=request.rating,
+                source=request.source,
+                reason=request.reason,
+                request_context=request_context,
+            )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            logger.error(f"Error in memory feedback endpoint: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/entities/{entity}/probe",
+        summary="Probe memories linked to an entity",
+        operation_id="entity_probe",
+        tags=["Memory"],
+    )
+    @audited("entity_probe")
+    async def api_entity_probe(
+        bank_id: str,
+        entity: str,
+        limit: int = Query(default=20, ge=1, le=100),
+        fact_types: list[str] | None = Query(default=None),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        try:
+            return await app.state.memory.entity_probe(
+                bank_id=bank_id,
+                entity=entity,
+                request_context=request_context,
+                limit=limit,
+                fact_types=fact_types,
+            )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            logger.error(f"Error in entity probe endpoint: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/entities/reason",
+        summary="Retrieve memories linked to all requested entities",
+        operation_id="entity_reason",
+        tags=["Memory"],
+    )
+    @audited("entity_reason")
+    async def api_entity_reason(
+        bank_id: str,
+        request: EntityReasonRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        try:
+            return await app.state.memory.entity_reason(
+                bank_id=bank_id,
+                entities=request.entities,
+                request_context=request_context,
+                limit=request.limit,
+                fact_types=request.fact_types,
+            )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            logger.error(f"Error in entity reason endpoint: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/memory-conflicts",
+        summary="List experimental memory conflicts",
+        operation_id="memory_conflicts",
+        tags=["Memory"],
+    )
+    @audited("memory_conflicts")
+    async def api_memory_conflicts(
+        bank_id: str,
+        limit: int = Query(default=50, ge=1, le=200),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        try:
+            return await app.state.memory.memory_conflicts(
+                bank_id=bank_id,
+                request_context=request_context,
+                limit=limit,
+            )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            logger.error(f"Error in memory conflicts endpoint: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post(

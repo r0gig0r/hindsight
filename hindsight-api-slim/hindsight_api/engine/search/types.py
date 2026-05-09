@@ -49,6 +49,10 @@ class RetrievalResult:
     tags: list[str] | None = None  # Visibility scope tags
     metadata: dict[str, str] | None = None  # User-provided metadata
     proof_count: int | None = None  # Number of supporting memories (observations only)
+    trust_score: float | None = None  # Experimental feedback-derived trust score
+    helpful_count: int | None = None
+    unhelpful_count: int | None = None
+    source_label: str | None = None  # Optional retrieval source label for POC tracing
 
     # Retrieval-specific scores (only one will be set depending on retrieval method)
     similarity: float | None = None  # Semantic retrieval
@@ -74,6 +78,10 @@ class RetrievalResult:
             tags=row.get("tags"),
             metadata=row.get("metadata"),
             proof_count=row.get("proof_count"),
+            trust_score=row.get("trust_score"),
+            helpful_count=row.get("helpful_count"),
+            unhelpful_count=row.get("unhelpful_count"),
+            source_label=row.get("source_label"),
             similarity=row.get("similarity"),
             bm25_score=row.get("bm25_score"),
             activation=row.get("activation"),
@@ -158,6 +166,10 @@ class ScoredResult:
             "chunk_id": self.retrieval.chunk_id,
             "tags": self.retrieval.tags,
             "metadata": self.retrieval.metadata,
+            "trust_score": self.retrieval.trust_score,
+            "helpful_count": self.retrieval.helpful_count,
+            "unhelpful_count": self.retrieval.unhelpful_count,
+            "source_label": self.retrieval.source_label,
             "semantic_similarity": self.retrieval.similarity,
             "bm25_score": self.retrieval.bm25_score,
         }

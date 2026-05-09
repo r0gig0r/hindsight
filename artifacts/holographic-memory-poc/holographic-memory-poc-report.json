@@ -1,0 +1,446 @@
+{
+  "generated_at": "2026-05-09T16:27:30.146710+03:00",
+  "cases": [
+    {
+      "case_id": "hindsight_fork_maintenance",
+      "query": "For Hindsight OpenClaw maintenance, which Python version and recall injection settings should I use?",
+      "variants": {
+        "baseline": {
+          "variant": "baseline",
+          "precision_at_k": 0.5,
+          "forbidden_hit_count": 1,
+          "expected_include_hit_count": 2,
+          "expected_include_total": 3,
+          "injected_token_count": 89,
+          "injected_count": 4,
+          "duplicate_jaccard_redundancy": 0.13738721055925357,
+          "latency_ms": 165.32320802798495,
+          "source_contribution": {
+            "baseline": 4,
+            "semantic": 4,
+            "bm25": 4
+          },
+          "injected_texts": [
+            "The Hindsight daemon must use Python 3.13 because onnxruntime wheels are not available for Python 3.14.",
+            "OpenClaw memory injection should stay compact and token-economical for long sessions.",
+            "Stale note: Hindsight should use Python 3.14 for the daemon venv.",
+            "Hindsight OpenClaw runs in external API mode on port 9077 and the plugin should not spawn a daemon in this mode."
+          ]
+        },
+        "entity_tools": {
+          "variant": "entity_tools",
+          "precision_at_k": 0.5,
+          "forbidden_hit_count": 1,
+          "expected_include_hit_count": 2,
+          "expected_include_total": 3,
+          "injected_token_count": 89,
+          "injected_count": 4,
+          "duplicate_jaccard_redundancy": 0.13738721055925357,
+          "latency_ms": 125.07112498860806,
+          "source_contribution": {
+            "entity_reason": 1,
+            "baseline": 3,
+            "semantic": 4,
+            "bm25": 4
+          },
+          "injected_texts": [
+            "Hindsight OpenClaw runs in external API mode on port 9077 and the plugin should not spawn a daemon in this mode.",
+            "The Hindsight daemon must use Python 3.13 because onnxruntime wheels are not available for Python 3.14.",
+            "OpenClaw memory injection should stay compact and token-economical for long sessions.",
+            "Stale note: Hindsight should use Python 3.14 for the daemon venv."
+          ]
+        },
+        "trust": {
+          "variant": "trust",
+          "precision_at_k": 0.5,
+          "forbidden_hit_count": 1,
+          "expected_include_hit_count": 2,
+          "expected_include_total": 3,
+          "injected_token_count": 89,
+          "injected_count": 4,
+          "duplicate_jaccard_redundancy": 0.13738721055925357,
+          "latency_ms": 118.67912497837096,
+          "source_contribution": {
+            "baseline": 4,
+            "semantic": 4,
+            "bm25": 4
+          },
+          "injected_texts": [
+            "The Hindsight daemon must use Python 3.13 because onnxruntime wheels are not available for Python 3.14.",
+            "OpenClaw memory injection should stay compact and token-economical for long sessions.",
+            "Hindsight OpenClaw runs in external API mode on port 9077 and the plugin should not spawn a daemon in this mode.",
+            "Stale note: Hindsight should use Python 3.14 for the daemon venv."
+          ]
+        },
+        "structural": {
+          "variant": "structural",
+          "precision_at_k": 0.5,
+          "forbidden_hit_count": 1,
+          "expected_include_hit_count": 2,
+          "expected_include_total": 3,
+          "injected_token_count": 89,
+          "injected_count": 4,
+          "duplicate_jaccard_redundancy": 0.13738721055925357,
+          "latency_ms": 122.70108301891014,
+          "source_contribution": {
+            "baseline": 4,
+            "semantic": 4,
+            "bm25": 4,
+            "structural": 4
+          },
+          "injected_texts": [
+            "The Hindsight daemon must use Python 3.13 because onnxruntime wheels are not available for Python 3.14.",
+            "OpenClaw memory injection should stay compact and token-economical for long sessions.",
+            "Stale note: Hindsight should use Python 3.14 for the daemon venv.",
+            "Hindsight OpenClaw runs in external API mode on port 9077 and the plugin should not spawn a daemon in this mode."
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "production_incident_memory",
+      "query": "fraud-detector VM preemption dashboard incident",
+      "variants": {
+        "baseline": {
+          "variant": "baseline",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 1,
+          "expected_include_hit_count": 1,
+          "expected_include_total": 4,
+          "injected_token_count": 20,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 109.8326250212267,
+          "source_contribution": {
+            "baseline": 1,
+            "semantic": 1,
+            "bm25": 1
+          },
+          "injected_texts": [
+            "Fraud-detector VM preemption note: restart OpenClaw and inspect a generic dashboard first."
+          ]
+        },
+        "entity_tools": {
+          "variant": "entity_tools",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 0,
+          "expected_include_hit_count": 4,
+          "expected_include_total": 4,
+          "injected_token_count": 32,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 81.96037501329556,
+          "source_contribution": {
+            "entity_reason": 1,
+            "semantic": 1,
+            "bm25": 1
+          },
+          "injected_texts": [
+            "Fraud-detector production incidents often start with VM preemption; check Pub/Sub subscriptions, Redis, NFS mounts, and the watchdog scheduler before the trader dashboard."
+          ]
+        },
+        "trust": {
+          "variant": "trust",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 1,
+          "expected_include_hit_count": 1,
+          "expected_include_total": 4,
+          "injected_token_count": 20,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 80.37408400559798,
+          "source_contribution": {
+            "baseline": 1,
+            "semantic": 1,
+            "bm25": 1
+          },
+          "injected_texts": [
+            "Fraud-detector VM preemption note: restart OpenClaw and inspect a generic dashboard first."
+          ]
+        },
+        "structural": {
+          "variant": "structural",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 1,
+          "expected_include_hit_count": 1,
+          "expected_include_total": 4,
+          "injected_token_count": 20,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 82.81125000212342,
+          "source_contribution": {
+            "baseline": 1,
+            "semantic": 1,
+            "bm25": 1,
+            "structural": 1
+          },
+          "injected_texts": [
+            "Fraud-detector VM preemption note: restart OpenClaw and inspect a generic dashboard first."
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "home_automation",
+      "query": "Homey Salus garage automation status",
+      "variants": {
+        "baseline": {
+          "variant": "baseline",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 0,
+          "expected_include_hit_count": 1,
+          "expected_include_total": 4,
+          "injected_token_count": 26,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 118.98766597732902,
+          "source_contribution": {
+            "baseline": 1,
+            "semantic": 1,
+            "bm25": 1
+          },
+          "injected_texts": [
+            "homee controls the Hormann garage doors and gate, while Salus thermostats provide bedroom temperature and humidity to Homey."
+          ]
+        },
+        "entity_tools": {
+          "variant": "entity_tools",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 0,
+          "expected_include_hit_count": 3,
+          "expected_include_total": 4,
+          "injected_token_count": 34,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 99.18074996676296,
+          "source_contribution": {
+            "entity_reason": 1,
+            "semantic": 1,
+            "bm25": 1
+          },
+          "injected_texts": [
+            "Homey manages the Qubino 3-Phase Smart Meter; when values stall, restart the Homey Qubino app and reapply the association watchdog fix."
+          ]
+        },
+        "trust": {
+          "variant": "trust",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 0,
+          "expected_include_hit_count": 1,
+          "expected_include_total": 4,
+          "injected_token_count": 26,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 93.2790000224486,
+          "source_contribution": {
+            "baseline": 1,
+            "semantic": 1,
+            "bm25": 1
+          },
+          "injected_texts": [
+            "homee controls the Hormann garage doors and gate, while Salus thermostats provide bedroom temperature and humidity to Homey."
+          ]
+        },
+        "structural": {
+          "variant": "structural",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 0,
+          "expected_include_hit_count": 1,
+          "expected_include_total": 4,
+          "injected_token_count": 26,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 99.8356249765493,
+          "source_contribution": {
+            "baseline": 1,
+            "semantic": 1,
+            "bm25": 1,
+            "structural": 1
+          },
+          "injected_texts": [
+            "homee controls the Hormann garage doors and gate, while Salus thermostats provide bedroom temperature and humidity to Homey."
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "preference_correction",
+      "query": "How should you implement risky memory features for Igor?",
+      "variants": {
+        "baseline": {
+          "variant": "baseline",
+          "precision_at_k": 0.5,
+          "forbidden_hit_count": 1,
+          "expected_include_hit_count": 3,
+          "expected_include_total": 3,
+          "injected_token_count": 40,
+          "injected_count": 2,
+          "duplicate_jaccard_redundancy": 0.03333333333333333,
+          "latency_ms": 116.78258399479091,
+          "source_contribution": {
+            "baseline": 2,
+            "semantic": 2,
+            "bm25": 2
+          },
+          "injected_texts": [
+            "Igor prefers token economy, compact answers, feature toggles for risky changes, and measurable evidence before enabling new memory behavior.",
+            "Stale preference: experimental memory features can ship enabled by default without measurement."
+          ]
+        },
+        "entity_tools": {
+          "variant": "entity_tools",
+          "precision_at_k": 0.5,
+          "forbidden_hit_count": 1,
+          "expected_include_hit_count": 3,
+          "expected_include_total": 3,
+          "injected_token_count": 40,
+          "injected_count": 2,
+          "duplicate_jaccard_redundancy": 0.03333333333333333,
+          "latency_ms": 108.72454103082418,
+          "source_contribution": {
+            "entity_reason": 1,
+            "baseline": 1,
+            "semantic": 2,
+            "bm25": 2
+          },
+          "injected_texts": [
+            "Igor prefers token economy, compact answers, feature toggles for risky changes, and measurable evidence before enabling new memory behavior.",
+            "Stale preference: experimental memory features can ship enabled by default without measurement."
+          ]
+        },
+        "trust": {
+          "variant": "trust",
+          "precision_at_k": 0.5,
+          "forbidden_hit_count": 1,
+          "expected_include_hit_count": 3,
+          "expected_include_total": 3,
+          "injected_token_count": 40,
+          "injected_count": 2,
+          "duplicate_jaccard_redundancy": 0.03333333333333333,
+          "latency_ms": 102.90325002279133,
+          "source_contribution": {
+            "baseline": 2,
+            "semantic": 2,
+            "bm25": 2
+          },
+          "injected_texts": [
+            "Igor prefers token economy, compact answers, feature toggles for risky changes, and measurable evidence before enabling new memory behavior.",
+            "Stale preference: experimental memory features can ship enabled by default without measurement."
+          ]
+        },
+        "structural": {
+          "variant": "structural",
+          "precision_at_k": 0.5,
+          "forbidden_hit_count": 1,
+          "expected_include_hit_count": 3,
+          "expected_include_total": 3,
+          "injected_token_count": 40,
+          "injected_count": 2,
+          "duplicate_jaccard_redundancy": 0.03333333333333333,
+          "latency_ms": 104.0067920112051,
+          "source_contribution": {
+            "baseline": 2,
+            "semantic": 2,
+            "bm25": 2,
+            "structural": 2
+          },
+          "injected_texts": [
+            "Igor prefers token economy, compact answers, feature toggles for risky changes, and measurable evidence before enabling new memory behavior.",
+            "Stale preference: experimental memory features can ship enabled by default without measurement."
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "entity_composition",
+      "query": "Hindsight unit_entities memory_units architecture for OpenClaw",
+      "variants": {
+        "baseline": {
+          "variant": "baseline",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 0,
+          "expected_include_hit_count": 3,
+          "expected_include_total": 3,
+          "injected_token_count": 25,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 132.30529200518504,
+          "source_contribution": {
+            "baseline": 1,
+            "semantic": 1,
+            "bm25": 1
+          },
+          "injected_texts": [
+            "Hindsight plus OpenClaw should inject compact memory snippets and log raw, deduped, injected, and token counts."
+          ]
+        },
+        "entity_tools": {
+          "variant": "entity_tools",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 0,
+          "expected_include_hit_count": 3,
+          "expected_include_total": 3,
+          "injected_token_count": 25,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 100.45766702387482,
+          "source_contribution": {
+            "entity_reason": 1,
+            "semantic": 1,
+            "bm25": 1
+          },
+          "injected_texts": [
+            "Hindsight plus OpenClaw should inject compact memory snippets and log raw, deduped, injected, and token counts."
+          ]
+        },
+        "trust": {
+          "variant": "trust",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 0,
+          "expected_include_hit_count": 3,
+          "expected_include_total": 3,
+          "injected_token_count": 25,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 98.6363340052776,
+          "source_contribution": {
+            "baseline": 1,
+            "semantic": 1,
+            "bm25": 1
+          },
+          "injected_texts": [
+            "Hindsight plus OpenClaw should inject compact memory snippets and log raw, deduped, injected, and token counts."
+          ]
+        },
+        "structural": {
+          "variant": "structural",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 0,
+          "expected_include_hit_count": 3,
+          "expected_include_total": 3,
+          "injected_token_count": 25,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 101.77216597367078,
+          "source_contribution": {
+            "baseline": 1,
+            "semantic": 1,
+            "bm25": 1,
+            "structural": 1
+          },
+          "injected_texts": [
+            "Hindsight plus OpenClaw should inject compact memory snippets and log raw, deduped, injected, and token counts."
+          ]
+        }
+      }
+    }
+  ],
+  "acceptance": {
+    "improved_scenarios": 2,
+    "forbidden_regressions": [],
+    "trust_feedback_demoted_python_314": true,
+    "entity_reason_multi_entity_hit": true,
+    "structural_active_win_without_latency_regression": false,
+    "passed": true
+  }
+}

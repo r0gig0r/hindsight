@@ -139,7 +139,7 @@ class RetrievalResult(BaseModel):
 class RetrievalMethodResults(BaseModel):
     """Results from a single retrieval method."""
 
-    method_name: Literal["semantic", "bm25", "graph", "temporal"] = Field(description="Name of retrieval method")
+    method_name: Literal["semantic", "bm25", "graph", "temporal", "structural"] = Field(description="Name of retrieval method")
     fact_type: str | None = Field(default=None, description="Fact type this retrieval was for (world, experience)")
     results: list[RetrievalResult] = Field(description="Retrieved results with ranks")
     duration_seconds: float = Field(description="Time taken for this retrieval")

@@ -404,6 +404,14 @@ ENV_RECALL_INCLUDE_CHUNKS = "HINDSIGHT_API_RECALL_INCLUDE_CHUNKS"
 ENV_RECALL_MAX_TOKENS = "HINDSIGHT_API_RECALL_MAX_TOKENS"
 ENV_RECALL_CHUNKS_MAX_TOKENS = "HINDSIGHT_API_RECALL_CHUNKS_MAX_TOKENS"
 
+# Experimental holographic-inspired memory features (all default off)
+ENV_EXPERIMENTAL_MEMORY_FEEDBACK_ENABLED = "HINDSIGHT_API_EXPERIMENTAL_MEMORY_FEEDBACK_ENABLED"
+ENV_EXPERIMENTAL_TRUST_RERANK_ENABLED = "HINDSIGHT_API_EXPERIMENTAL_TRUST_RERANK_ENABLED"
+ENV_EXPERIMENTAL_ENTITY_TOOLS_ENABLED = "HINDSIGHT_API_EXPERIMENTAL_ENTITY_TOOLS_ENABLED"
+ENV_EXPERIMENTAL_CONFLICT_DETECTION_ENABLED = "HINDSIGHT_API_EXPERIMENTAL_CONFLICT_DETECTION_ENABLED"
+ENV_EXPERIMENTAL_STRUCTURAL_RETRIEVAL_ENABLED = "HINDSIGHT_API_EXPERIMENTAL_STRUCTURAL_RETRIEVAL_ENABLED"
+ENV_EXPERIMENTAL_STRUCTURAL_SHADOW_ENABLED = "HINDSIGHT_API_EXPERIMENTAL_STRUCTURAL_SHADOW_ENABLED"
+
 # Recall budget mapping (budget enum -> thinking_budget integer)
 ENV_RECALL_BUDGET_FUNCTION = "HINDSIGHT_API_RECALL_BUDGET_FUNCTION"
 ENV_RECALL_BUDGET_FIXED_LOW = "HINDSIGHT_API_RECALL_BUDGET_FIXED_LOW"
@@ -627,6 +635,12 @@ DEFAULT_REFLECT_SOURCE_FACTS_MAX_TOKENS = -1  # Token budget for source facts in
 DEFAULT_RECALL_INCLUDE_CHUNKS = True  # Whether internal recall (e.g. mental model refresh) returns raw chunks
 DEFAULT_RECALL_MAX_TOKENS = 2048  # Token budget for facts returned by internal recall
 DEFAULT_RECALL_CHUNKS_MAX_TOKENS = 1000  # Token budget for raw chunks returned by internal recall
+DEFAULT_EXPERIMENTAL_MEMORY_FEEDBACK_ENABLED = False
+DEFAULT_EXPERIMENTAL_TRUST_RERANK_ENABLED = False
+DEFAULT_EXPERIMENTAL_ENTITY_TOOLS_ENABLED = False
+DEFAULT_EXPERIMENTAL_CONFLICT_DETECTION_ENABLED = False
+DEFAULT_EXPERIMENTAL_STRUCTURAL_RETRIEVAL_ENABLED = False
+DEFAULT_EXPERIMENTAL_STRUCTURAL_SHADOW_ENABLED = False
 
 # Recall budget mapping
 # "fixed": thinking_budget = recall_budget_fixed_<level> (preserves legacy behavior)
@@ -1016,6 +1030,14 @@ class HindsightConfig:
     recall_max_tokens: int
     recall_chunks_max_tokens: int
 
+    # Experimental holographic-inspired memory features
+    experimental_memory_feedback_enabled: bool
+    experimental_trust_rerank_enabled: bool
+    experimental_entity_tools_enabled: bool
+    experimental_conflict_detection_enabled: bool
+    experimental_structural_retrieval_enabled: bool
+    experimental_structural_shadow_enabled: bool
+
     # Recall budget mapping: how the Budget enum (LOW/MID/HIGH) maps to thinking_budget integer.
     # function="fixed": use the recall_budget_fixed_* values directly (legacy behavior).
     # function="adaptive": compute round(max_tokens * recall_budget_adaptive_*),
@@ -1157,6 +1179,12 @@ class HindsightConfig:
         "recall_include_chunks",
         "recall_max_tokens",
         "recall_chunks_max_tokens",
+        "experimental_memory_feedback_enabled",
+        "experimental_trust_rerank_enabled",
+        "experimental_entity_tools_enabled",
+        "experimental_conflict_detection_enabled",
+        "experimental_structural_retrieval_enabled",
+        "experimental_structural_shadow_enabled",
         # Recall budget mapping (Budget enum -> thinking_budget integer)
         "recall_budget_function",
         "recall_budget_fixed_low",
@@ -1683,6 +1711,31 @@ class HindsightConfig:
             recall_chunks_max_tokens=int(
                 os.getenv(ENV_RECALL_CHUNKS_MAX_TOKENS, str(DEFAULT_RECALL_CHUNKS_MAX_TOKENS))
             ),
+            experimental_memory_feedback_enabled=os.getenv(
+                ENV_EXPERIMENTAL_MEMORY_FEEDBACK_ENABLED, str(DEFAULT_EXPERIMENTAL_MEMORY_FEEDBACK_ENABLED)
+            ).lower()
+            in ("true", "1", "yes"),
+            experimental_trust_rerank_enabled=os.getenv(
+                ENV_EXPERIMENTAL_TRUST_RERANK_ENABLED, str(DEFAULT_EXPERIMENTAL_TRUST_RERANK_ENABLED)
+            ).lower()
+            in ("true", "1", "yes"),
+            experimental_entity_tools_enabled=os.getenv(
+                ENV_EXPERIMENTAL_ENTITY_TOOLS_ENABLED, str(DEFAULT_EXPERIMENTAL_ENTITY_TOOLS_ENABLED)
+            ).lower()
+            in ("true", "1", "yes"),
+            experimental_conflict_detection_enabled=os.getenv(
+                ENV_EXPERIMENTAL_CONFLICT_DETECTION_ENABLED, str(DEFAULT_EXPERIMENTAL_CONFLICT_DETECTION_ENABLED)
+            ).lower()
+            in ("true", "1", "yes"),
+            experimental_structural_retrieval_enabled=os.getenv(
+                ENV_EXPERIMENTAL_STRUCTURAL_RETRIEVAL_ENABLED,
+                str(DEFAULT_EXPERIMENTAL_STRUCTURAL_RETRIEVAL_ENABLED),
+            ).lower()
+            in ("true", "1", "yes"),
+            experimental_structural_shadow_enabled=os.getenv(
+                ENV_EXPERIMENTAL_STRUCTURAL_SHADOW_ENABLED, str(DEFAULT_EXPERIMENTAL_STRUCTURAL_SHADOW_ENABLED)
+            ).lower()
+            in ("true", "1", "yes"),
             recall_budget_function=_validate_recall_budget_function(
                 os.getenv(ENV_RECALL_BUDGET_FUNCTION, DEFAULT_RECALL_BUDGET_FUNCTION)
             ),

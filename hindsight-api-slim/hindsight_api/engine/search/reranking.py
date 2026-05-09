@@ -15,6 +15,7 @@ UTC = timezone.utc
 _RECENCY_ALPHA: float = 0.2
 _TEMPORAL_ALPHA: float = 0.2
 _PROOF_COUNT_ALPHA: float = 0.1  # Conservative: max ±5% for evidence strength
+_TRUST_ALPHA: float = 0.4  # Experimental: max ±20% trust adjustment
 
 
 def apply_combined_scoring(
@@ -23,6 +24,8 @@ def apply_combined_scoring(
     recency_alpha: float = _RECENCY_ALPHA,
     temporal_alpha: float = _TEMPORAL_ALPHA,
     proof_count_alpha: float = _PROOF_COUNT_ALPHA,
+    trust_alpha: float = _TRUST_ALPHA,
+    trust_rerank_enabled: bool = False,
     is_passthrough_reranker: bool = False,
 ) -> None:
     """Apply combined scoring to a list of ScoredResults in-place.
@@ -38,7 +41,8 @@ def apply_combined_scoring(
         recency_boost     = 1 + recency_alpha     * (recency     - 0.5)   # in [1-α/2, 1+α/2]
         temporal_boost    = 1 + temporal_alpha    * (temporal    - 0.5)   # in [1-α/2, 1+α/2]
         proof_count_boost = 1 + proof_count_alpha * (proof_norm  - 0.5)   # in [1-α/2, 1+α/2]
-        combined_score    = CE_normalized * recency_boost * temporal_boost * proof_count_boost
+        trust_boost       = 1 + trust_alpha       * (trust      - 0.5)   # in [1-α/2, 1+α/2]
+        combined_score    = CE_normalized * recency_boost * temporal_boost * proof_count_boost * trust_boost
 
     proof_norm maps proof_count using a smooth logarithmic curve centered at 0.5,
     clamped to [0, 1]:
@@ -57,6 +61,8 @@ def apply_combined_scoring(
         recency_alpha: Max relative recency adjustment (default 0.2 → ±10%).
         temporal_alpha: Max relative temporal adjustment (default 0.2 → ±10%).
         proof_count_alpha: Max relative proof count adjustment (default 0.1 → ±5%).
+        trust_alpha: Max relative trust adjustment (default 0.2 → ±10%).
+        trust_rerank_enabled: Whether to apply experimental trust scoring.
     """
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
@@ -126,7 +132,16 @@ def apply_combined_scoring(
         recency_boost = 1.0 + recency_alpha * (sr.recency - 0.5)
         temporal_boost = 1.0 + temporal_alpha * (sr.temporal - 0.5)
         proof_count_boost = 1.0 + proof_count_alpha * (proof_norm - 0.5)
-        sr.combined_score = sr.cross_encoder_score_normalized * recency_boost * temporal_boost * proof_count_boost
+        trust_score = sr.retrieval.trust_score if sr.retrieval.trust_score is not None else 0.5
+        trust_score = min(1.0, max(0.0, float(trust_score)))
+        trust_boost = 1.0
+        if trust_rerank_enabled:
+            trust_boost = 1.0 + trust_alpha * (trust_score - 0.5)
+            if trust_score < 0.25:
+                trust_boost *= 0.5
+        sr.combined_score = (
+            sr.cross_encoder_score_normalized * recency_boost * temporal_boost * proof_count_boost * trust_boost
+        )
         sr.weight = sr.combined_score
 
 

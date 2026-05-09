@@ -1,0 +1,171 @@
+cases:
+  - id: hindsight_fork_maintenance
+    description: Hindsight fork and OpenClaw daemon maintenance memories.
+    query: "For Hindsight OpenClaw maintenance, which Python version and recall injection settings should I use?"
+    max_injected_tokens: 220
+    expected_winning_variant: trust
+    expected_entities: ["Hindsight", "OpenClaw", "Python 3.13"]
+    expected_included_substrings:
+      - "Python 3.13"
+      - "external API mode"
+      - "compact injection"
+    forbidden_substrings:
+      - "should use Python 3.14"
+    corpus:
+      - id: h1
+        text: "Hindsight OpenClaw runs in external API mode on port 9077 and the plugin should not spawn a daemon in this mode."
+        fact_type: world
+        tags: ["hindsight", "openclaw"]
+        entities: ["Hindsight", "OpenClaw", "external API mode"]
+        event_date: "2026-05-05T12:00:00Z"
+        document_id: "hindsight-maintenance"
+      - id: h2
+        text: "The Hindsight daemon must use Python 3.13 because onnxruntime wheels are not available for Python 3.14."
+        fact_type: world
+        tags: ["hindsight", "python"]
+        entities: ["Hindsight", "Python 3.13", "onnxruntime"]
+        event_date: "2026-05-05T12:05:00Z"
+        document_id: "hindsight-maintenance"
+      - id: h3
+        text: "OpenClaw memory injection should stay compact and token-economical for long sessions."
+        fact_type: experience
+        tags: ["openclaw", "preference"]
+        entities: ["OpenClaw", "compact injection", "token economy"]
+        event_date: "2026-05-05T12:10:00Z"
+        document_id: "hindsight-maintenance"
+      - id: h4_stale
+        text: "Stale note: Hindsight should use Python 3.14 for the daemon venv."
+        fact_type: world
+        tags: ["hindsight", "stale"]
+        entities: ["Hindsight", "Python 3.14"]
+        event_date: "2026-04-01T09:00:00Z"
+        document_id: "stale-maintenance"
+        feedback:
+          rating: unhelpful
+          source: eval
+          reason: "Python 3.14 breaks onnxruntime in Igor's OpenClaw setup."
+
+  - id: production_incident_memory
+    description: Fraud detector incident response composition.
+    query: "fraud-detector VM preemption dashboard incident"
+    max_injected_tokens: 30
+    expected_winning_variant: entity_tools
+    expected_entities: ["fraud-detector", "Redis"]
+    expected_included_substrings:
+      - "VM preemption"
+      - "Redis"
+      - "watchdog scheduler"
+      - "trader dashboard"
+    forbidden_substrings:
+      - "restart OpenClaw"
+    corpus:
+      - id: p1
+        text: "Fraud-detector production incidents often start with VM preemption; check Pub/Sub subscriptions, Redis, NFS mounts, and the watchdog scheduler before the trader dashboard."
+        fact_type: experience
+        tags: ["fraud-detector", "incident"]
+        entities: ["fraud-detector", "VM preemption", "Pub/Sub", "Redis", "NFS", "watchdog scheduler", "trader dashboard"]
+        event_date: "2026-04-20T08:00:00Z"
+        document_id: "fraud-detector-runbook"
+      - id: p0_distractor
+        text: "Fraud-detector VM preemption note: restart OpenClaw and inspect a generic dashboard first."
+        fact_type: experience
+        tags: ["fraud-detector", "incident", "distractor"]
+        entities: ["fraud-detector", "VM preemption", "OpenClaw", "dashboard"]
+        event_date: "2026-04-20T08:01:00Z"
+        document_id: "fraud-detector-runbook"
+      - id: p2
+        text: "The trader dashboard depends on alerts flowing through Redis after the Pub/Sub consumer restarts."
+        fact_type: world
+        tags: ["fraud-detector", "redis"]
+        entities: ["trader dashboard", "Redis", "Pub/Sub"]
+        event_date: "2026-04-20T08:05:00Z"
+        document_id: "fraud-detector-runbook"
+
+  - id: home_automation
+    description: Homey and Homee automation state.
+    query: "Homey Salus garage automation status"
+    max_injected_tokens: 30
+    expected_winning_variant: entity_tools
+    expected_entities: ["Homey", "Qubino"]
+    expected_included_substrings:
+      - "Qubino"
+      - "3-Phase Smart Meter"
+      - "update stalls"
+      - "Homey"
+    forbidden_substrings:
+      - "fraud-detector"
+    corpus:
+      - id: a1
+        text: "Homey manages the Qubino 3-Phase Smart Meter; when values stall, restart the Homey Qubino app and reapply the association watchdog fix."
+        fact_type: experience
+        tags: ["homey", "qubino"]
+        entities: ["Homey", "Qubino", "3-Phase Smart Meter", "watchdog fix"]
+        event_date: "2026-04-15T19:00:00Z"
+        document_id: "home-automation"
+      - id: a2
+        text: "homee controls the Hormann garage doors and gate, while Salus thermostats provide bedroom temperature and humidity to Homey."
+        fact_type: world
+        tags: ["homee", "salus", "homey"]
+        entities: ["homee", "Hormann", "garage doors", "Salus", "Homey"]
+        event_date: "2026-04-15T19:10:00Z"
+        document_id: "home-automation"
+
+  - id: preference_correction
+    description: Igor's durable working preferences.
+    query: "How should you implement risky memory features for Igor?"
+    max_injected_tokens: 220
+    expected_winning_variant: trust
+    expected_entities: ["Igor", "feature toggles"]
+    expected_included_substrings:
+      - "feature toggles"
+      - "measurable evidence"
+      - "compact answers"
+    forbidden_substrings:
+      - "ship enabled by default"
+    corpus:
+      - id: c1
+        text: "Igor prefers token economy, compact answers, feature toggles for risky changes, and measurable evidence before enabling new memory behavior."
+        fact_type: world
+        tags: ["preference", "codex"]
+        entities: ["Igor", "token economy", "compact answers", "feature toggles", "measurable evidence"]
+        event_date: "2026-05-09T10:00:00Z"
+        document_id: "preferences"
+      - id: c2_stale
+        text: "Stale preference: experimental memory features can ship enabled by default without measurement."
+        fact_type: world
+        tags: ["preference", "stale"]
+        entities: ["Igor", "experimental memory"]
+        event_date: "2026-03-01T10:00:00Z"
+        document_id: "stale-preferences"
+        feedback:
+          rating: unhelpful
+          source: eval
+          reason: "Igor explicitly requires toggles and measurable evidence."
+
+  - id: entity_composition
+    description: Multi-entity queries that need AND semantics.
+    query: "Hindsight unit_entities memory_units architecture for OpenClaw"
+    max_injected_tokens: 30
+    expected_winning_variant: entity_tools
+    expected_entities: ["Hindsight", "OpenClaw"]
+    expected_included_substrings:
+      - "Hindsight"
+      - "OpenClaw"
+      - "compact"
+    forbidden_substrings:
+      - "Qubino"
+    corpus:
+      - id: e1
+        text: "Hindsight plus OpenClaw should inject compact memory snippets and log raw, deduped, injected, and token counts."
+        fact_type: experience
+        tags: ["hindsight", "openclaw"]
+        entities: ["Hindsight", "OpenClaw", "compact injection"]
+        event_date: "2026-05-09T11:00:00Z"
+        document_id: "entity-composition"
+      - id: e2
+        text: "Hindsight alone stores retained facts in memory_units and links entities in unit_entities."
+        fact_type: world
+        tags: ["hindsight"]
+        entities: ["Hindsight", "memory_units", "unit_entities"]
+        event_date: "2026-05-09T11:05:00Z"
+        document_id: "entity-composition"

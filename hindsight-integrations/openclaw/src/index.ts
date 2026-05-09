@@ -80,6 +80,16 @@ const banksWithMissionSet = new Set<string>();
 import type { RecallResponse } from "./types.js";
 const inflightRecalls = new Map<string, Promise<RecallResponse>>();
 
+type ExperimentalRecallVariant = NonNullable<PluginConfig["experimentalRecallVariant"]>;
+type RecallRequestParams = {
+  query: string;
+  maxTokens?: number;
+  budget?: "low" | "mid" | "high";
+  types?: Array<"world" | "experience" | "observation">;
+  experimentalVariant?: ExperimentalRecallVariant;
+  experimentalShadow?: boolean;
+};
+
 // Lightweight bank-scoped facade over HindsightClient. Created per-request via
 // getClientForContext() so hook bodies can keep their bankId-implicit style
 // without going back to a stateful setBankId pattern. Also bridges the
@@ -89,24 +99,11 @@ export interface BankScopedClient {
   readonly bankId: string;
   retain(req: RetainRequest): Promise<void>;
   recall(
-    req: {
-      query: string;
-      maxTokens?: number;
-      budget?: "low" | "mid" | "high";
-      types?: Array<"world" | "experience" | "observation">;
-    },
+    req: RecallRequestParams,
     timeoutMs?: number
   ): Promise<RecallResponse>;
   /** [FORK] Diversity-clustered recall with entity enrichment */
-  recallExp(
-    req: {
-      query: string;
-      maxTokens?: number;
-      budget?: "low" | "mid" | "high";
-      types?: Array<"world" | "experience" | "observation">;
-    },
-    timeoutMs?: number
-  ): Promise<RecallResponse>;
+  recallExp(req: RecallRequestParams, timeoutMs?: number): Promise<RecallResponse>;
   setMission(mission: string): Promise<void>;
 }
 
@@ -154,6 +151,8 @@ function scopeClient(c: HindsightClient, bankId: string): BankScopedClient {
         max_tokens: req.maxTokens,
         budget: req.budget,
         types: req.types,
+        experimental_variant: req.experimentalVariant,
+        experimental_shadow: req.experimentalShadow,
       });
       const controller = new AbortController();
       const timer = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
@@ -1311,6 +1310,46 @@ export function normalizeRetainTags(value: unknown): string[] {
   return normalized;
 }
 
+const EXPERIMENTAL_RECALL_VARIANTS: ExperimentalRecallVariant[] = [
+  "baseline",
+  "entity_tools",
+  "trust",
+  "structural",
+];
+
+export function resolveExperimentalRecallSettings(config: PluginConfig): {
+  enabled: boolean;
+  shadow: boolean;
+  variant: ExperimentalRecallVariant;
+} {
+  const enabled = config.experimentalHolographicEnhancements === true;
+  const requested = config.experimentalRecallVariant;
+  const variant =
+    requested && EXPERIMENTAL_RECALL_VARIANTS.includes(requested) ? requested : "baseline";
+  return {
+    enabled,
+    shadow: enabled && config.experimentalRecallShadow === true && variant !== "baseline",
+    variant: enabled ? variant : "baseline",
+  };
+}
+
+export function estimateRecallInjectionTokens(formattedMemories: string): number {
+  const trimmed = formattedMemories.trim();
+  if (!trimmed) return 0;
+  return trimmed.split(/\s+/).length;
+}
+
+export function formatRecallInjectionLog(input: {
+  bankId: string;
+  variant: ExperimentalRecallVariant;
+  raw: number;
+  deduped: number;
+  injected: number;
+  tokens: number;
+}): string {
+  return `injecting ${input.injected} memories into context (bank: ${input.bankId}, variant: ${input.variant}, raw: ${input.raw}, deduped: ${input.deduped}, tokens: ${input.tokens})`;
+}
+
 function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
   const config = api.config.plugins?.entries?.["hindsight-openclaw"]?.config || {};
   const defaultMission =
@@ -1390,6 +1429,13 @@ function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
       ["prepend", "append", "user"].includes(config.recallInjectionPosition)
         ? (config.recallInjectionPosition as PluginConfig["recallInjectionPosition"])
         : undefined,
+    experimentalHolographicEnhancements: config.experimentalHolographicEnhancements === true,
+    experimentalRecallShadow: config.experimentalRecallShadow === true,
+    experimentalRecallVariant:
+      typeof config.experimentalRecallVariant === "string" &&
+      EXPERIMENTAL_RECALL_VARIANTS.includes(config.experimentalRecallVariant as ExperimentalRecallVariant)
+        ? (config.experimentalRecallVariant as ExperimentalRecallVariant)
+        : "baseline",
     recallTimeoutMs:
       typeof config.recallTimeoutMs === "number" && config.recallTimeoutMs >= 1000
         ? config.recallTimeoutMs
@@ -2017,7 +2063,8 @@ export default function (api: MoltbotPluginAPI) {
         // Recall with deduplication: reuse in-flight request for same bank
         const normalizedPrompt = prompt.trim().toLowerCase().replace(/\s+/g, " ");
         const queryHash = createHash("sha256").update(normalizedPrompt).digest("hex").slice(0, 16);
-        const recallKey = `${bankId}::${queryHash}`;
+        const recallSettings = resolveExperimentalRecallSettings(pluginConfig);
+        const recallKey = `${bankId}::${queryHash}::${recallSettings.variant}::${recallSettings.shadow ? "shadow" : "active"}`;
         const existing = inflightRecalls.get(recallKey);
         let recallPromise: Promise<RecallResponse>;
         if (existing) {
@@ -2025,17 +2072,45 @@ export default function (api: MoltbotPluginAPI) {
           recallPromise = existing;
         } else {
           const recallTimeoutMs = pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS;
-          const recallParams = {
+          const recallParams: RecallRequestParams = {
             query: prompt,
             maxTokens: pluginConfig.recallMaxTokens || 2048,
             budget: pluginConfig.recallBudget,
             types: pluginConfig.recallTypes,
           };
-          // [FORK] Try recall_exp (diversity clustering) with fallback to regular recall
-          recallPromise = client.recallExp(recallParams, recallTimeoutMs).catch((err: unknown) => {
-            debug(`[Hindsight] recall_exp failed, falling back: ${err}`);
-            return client.recall(recallParams, recallTimeoutMs);
-          });
+          const callRecall = (
+            variant: ExperimentalRecallVariant,
+            shadow: boolean
+          ): Promise<RecallResponse> => {
+            const params = recallSettings.enabled
+              ? { ...recallParams, experimentalVariant: variant, experimentalShadow: shadow }
+              : recallParams;
+            // [FORK] Try recall_exp (diversity clustering) with fallback to regular recall
+            return client.recallExp(params, recallTimeoutMs).catch((err: unknown) => {
+              debug(`[Hindsight] recall_exp failed, falling back: ${err}`);
+              return client.recall(params, recallTimeoutMs);
+            });
+          };
+
+          if (recallSettings.shadow) {
+            recallPromise = callRecall("baseline", false);
+            void callRecall(recallSettings.variant, true)
+              .then((shadowResponse) => {
+                debug(
+                  `[Hindsight] Shadow recall variant=${recallSettings.variant} raw=${shadowResponse.results?.length ?? 0}`
+                );
+                log.info(
+                  `shadow recall completed (bank: ${bankId}, variant: ${recallSettings.variant}, raw: ${shadowResponse.results?.length ?? 0})`
+                );
+              })
+              .catch((err: unknown) => {
+                log.warn(
+                  `shadow recall failed (bank: ${bankId}, variant: ${recallSettings.variant}): ${err}`
+                );
+              });
+          } else {
+            recallPromise = callRecall(recallSettings.variant, false);
+          }
           inflightRecalls.set(recallKey, recallPromise);
           void recallPromise.catch(() => {}).finally(() => inflightRecalls.delete(recallKey));
         }
@@ -2063,6 +2138,11 @@ export default function (api: MoltbotPluginAPI) {
 
         // [FORK] Use compact formatting (one line per memory, relative dates, no markdown)
         const memoriesFormatted = formatMemoriesCompact(results);
+        const injectedTokenCount = estimateRecallInjectionTokens(memoriesFormatted);
+
+        debug(
+          `[Hindsight] Recall stats variant=${recallSettings.variant} shadow=${recallSettings.shadow} raw=${response.results.length} deduped=${dedupedResults.length} injected=${results.length} tokens=${injectedTokenCount}`
+        );
 
         const contextMessage = `<hindsight_memories>
 ${pluginConfig.recallPromptPreamble || DEFAULT_RECALL_PROMPT_PREAMBLE}
@@ -2072,7 +2152,16 @@ ${memoriesFormatted}
 </hindsight_memories>`;
 
         debug(`[Hindsight] Auto-recall: Injecting ${results.length} memories from bank ${bankId}`);
-        log.info(`injecting ${results.length} memories into context (bank: ${bankId})`);
+        log.info(
+          formatRecallInjectionLog({
+            bankId,
+            variant: recallSettings.variant,
+            raw: response.results.length,
+            deduped: dedupedResults.length,
+            injected: results.length,
+            tokens: injectedTokenCount,
+          })
+        );
         log.trackRecall(bankId, results.length);
 
         // Inject recalled memories. Position is configurable to preserve prompt caching

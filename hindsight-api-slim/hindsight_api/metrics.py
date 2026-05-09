@@ -208,6 +208,32 @@ class MetricsCollectorBase:
         """Set the database pool for metrics collection."""
         pass
 
+    def record_memory_feedback(self, rating: str, source: str, bank_id: str, trust_score: float | None = None):
+        """Record memory feedback and optional trust score."""
+        raise NotImplementedError
+
+    def record_trust_rerank_applied(self, count: int, bank_id: str):
+        """Record trust rerank applications."""
+        raise NotImplementedError
+
+    def record_entity_probe(self, matched: bool, bank_id: str):
+        """Record entity probe usage."""
+        raise NotImplementedError
+
+    def record_entity_reason(self, entity_count: int, matched: bool, bank_id: str):
+        """Record entity reason usage."""
+        raise NotImplementedError
+
+    def record_memory_conflicts(self, detected: int, open_count: int, bank_id: str):
+        """Record memory conflict detection counts."""
+        raise NotImplementedError
+
+    def record_structural_retrieval(
+        self, duration: float, candidates: int, rrf_contribution: int, bank_id: str
+    ):
+        """Record structural retrieval timing and contribution."""
+        raise NotImplementedError
+
 
 class NoOpMetricsCollector(MetricsCollectorBase):
     """No-op metrics collector that does nothing. Used when metrics are disabled."""
@@ -241,6 +267,26 @@ class NoOpMetricsCollector(MetricsCollectorBase):
     def record_http_request(self, method: str, endpoint: str, status_code_getter: Callable[[], int]):
         """No-op HTTP request recording."""
         yield
+
+    def record_memory_feedback(self, rating: str, source: str, bank_id: str, trust_score: float | None = None):
+        pass
+
+    def record_trust_rerank_applied(self, count: int, bank_id: str):
+        pass
+
+    def record_entity_probe(self, matched: bool, bank_id: str):
+        pass
+
+    def record_entity_reason(self, entity_count: int, matched: bool, bank_id: str):
+        pass
+
+    def record_memory_conflicts(self, detected: int, open_count: int, bank_id: str):
+        pass
+
+    def record_structural_retrieval(
+        self, duration: float, candidates: int, rrf_contribution: int, bank_id: str
+    ):
+        pass
 
 
 class MetricsCollector(MetricsCollectorBase):
@@ -302,6 +348,57 @@ class MetricsCollector(MetricsCollectorBase):
             unit="requests",
         )
 
+        self.memory_feedback_total = self.meter.create_counter(
+            name="hindsight.memory_feedback.total",
+            description="Total memory feedback events",
+            unit="events",
+        )
+        self.memory_trust_rerank_applied_total = self.meter.create_counter(
+            name="hindsight.memory_trust_rerank.applied_total",
+            description="Number of candidates adjusted by experimental trust rerank",
+            unit="candidates",
+        )
+        self.memory_trust_score_histogram = self.meter.create_histogram(
+            name="hindsight.memory_trust_score.histogram",
+            description="Observed memory trust scores after feedback updates",
+            unit="score",
+        )
+        self.entity_probe_total = self.meter.create_counter(
+            name="hindsight.entity_probe.total",
+            description="Experimental entity probe requests",
+            unit="requests",
+        )
+        self.entity_reason_total = self.meter.create_counter(
+            name="hindsight.entity_reason.total",
+            description="Experimental entity reason requests",
+            unit="requests",
+        )
+        self.memory_conflicts_detected_total = self.meter.create_counter(
+            name="hindsight.memory_conflicts.detected_total",
+            description="Memory conflicts detected by experimental detector",
+            unit="conflicts",
+        )
+        self.memory_conflicts_open_total = self.meter.create_up_down_counter(
+            name="hindsight.memory_conflicts.open_total",
+            description="Open experimental memory conflicts",
+            unit="conflicts",
+        )
+        self.structural_retrieval_candidates_total = self.meter.create_counter(
+            name="hindsight.structural_retrieval.candidates_total",
+            description="Structural retrieval candidates generated",
+            unit="candidates",
+        )
+        self.structural_retrieval_duration = self.meter.create_histogram(
+            name="hindsight.structural_retrieval.duration",
+            description="Structural retrieval duration",
+            unit="s",
+        )
+        self.structural_retrieval_rrf_contribution_total = self.meter.create_counter(
+            name="hindsight.structural_retrieval.rrf_contribution_total",
+            description="Structural candidates that contributed to active RRF",
+            unit="candidates",
+        )
+
         # Process metrics (observable gauges - collected on scrape)
         self._setup_process_metrics()
 
@@ -360,6 +457,47 @@ class MetricsCollector(MetricsCollectorBase):
 
             # Record operation count
             self.operation_total.add(1, attributes)
+
+    def _experimental_attrs(self, bank_id: str, **extra: object) -> dict[str, str]:
+        attributes = {"tenant": _get_tenant()}
+        if self._include_bank_id:
+            attributes["bank_id"] = bank_id
+        for key, value in extra.items():
+            attributes[key] = str(value).lower() if isinstance(value, bool) else str(value)
+        return attributes
+
+    def record_memory_feedback(self, rating: str, source: str, bank_id: str, trust_score: float | None = None):
+        attributes = self._experimental_attrs(bank_id, rating=rating, source=source)
+        self.memory_feedback_total.add(1, attributes)
+        if trust_score is not None:
+            self.memory_trust_score_histogram.record(float(trust_score), attributes)
+
+    def record_trust_rerank_applied(self, count: int, bank_id: str):
+        if count > 0:
+            self.memory_trust_rerank_applied_total.add(count, self._experimental_attrs(bank_id))
+
+    def record_entity_probe(self, matched: bool, bank_id: str):
+        self.entity_probe_total.add(1, self._experimental_attrs(bank_id, matched=matched))
+
+    def record_entity_reason(self, entity_count: int, matched: bool, bank_id: str):
+        self.entity_reason_total.add(
+            1, self._experimental_attrs(bank_id, entity_count=entity_count, matched=matched)
+        )
+
+    def record_memory_conflicts(self, detected: int, open_count: int, bank_id: str):
+        if detected > 0:
+            self.memory_conflicts_detected_total.add(detected, self._experimental_attrs(bank_id))
+        self.memory_conflicts_open_total.add(open_count, self._experimental_attrs(bank_id))
+
+    def record_structural_retrieval(
+        self, duration: float, candidates: int, rrf_contribution: int, bank_id: str
+    ):
+        attributes = self._experimental_attrs(bank_id)
+        self.structural_retrieval_duration.record(duration, attributes)
+        if candidates > 0:
+            self.structural_retrieval_candidates_total.add(candidates, attributes)
+        if rrf_contribution > 0:
+            self.structural_retrieval_rrf_contribution_total.add(rrf_contribution, attributes)
 
     def record_llm_call(
         self,

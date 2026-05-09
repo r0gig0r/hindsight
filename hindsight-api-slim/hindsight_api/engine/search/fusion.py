@@ -33,7 +33,7 @@ def reciprocal_rank_fusion(result_lists: list[list[RetrievalResult]], k: int = 6
     source_ranks = {}  # Track rank from each source for each doc_id
     all_retrievals = {}  # Store the actual RetrievalResult (use first occurrence)
 
-    source_names = ["semantic", "bm25", "graph", "temporal"]
+    source_names = ["semantic", "bm25", "graph", "temporal", "structural"]
 
     for source_idx, results in enumerate(result_lists):
         source_name = source_names[source_idx] if source_idx < len(source_names) else f"source_{source_idx}"

@@ -90,6 +90,9 @@ export interface PluginConfig {
   recallMaxQueryChars?: number; // Max chars for composed recall query. Default: 800
   recallPromptPreamble?: string; // Prompt preamble placed above recalled memories. Default: built-in guidance text.
   recallInjectionPosition?: "prepend" | "append" | "user"; // Where to inject recalled memories. 'prepend' = start of system prompt (default), 'append' = end of system prompt (preserves prompt cache), 'user' = before user message.
+  experimentalHolographicEnhancements?: boolean; // Enable experimental holographic-inspired recall controls. Default: false.
+  experimentalRecallShadow?: boolean; // When true, run enhanced recall but inject baseline memories. Default: false.
+  experimentalRecallVariant?: "baseline" | "entity_tools" | "trust" | "structural"; // Experimental recall variant. Default: "baseline".
   ignoreSessionPatterns?: string[]; // Session key glob patterns to skip entirely (no recall, no retain). E.g. ["agent:main:**", "agent:*:cron:**"]
   statelessSessionPatterns?: string[]; // Session key glob patterns for read-only sessions (recall allowed, retain skipped). E.g. ["agent:*:subagent:**"]
   skipStatelessSessions?: boolean; // When true (default), stateless sessions also skip recall. When false, they recall but never retain.

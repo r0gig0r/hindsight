@@ -13,6 +13,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -96,6 +97,9 @@ _PROTECTED_TABLES = frozenset(
         "chunks",
         "async_operations",
         "file_storage",
+        "memory_feedback_events",
+        "memory_conflicts",
+        "memory_structural_vectors",
     ]
 )
 
@@ -2813,6 +2817,7 @@ class MemoryEngine(MemoryEngineInterface):
                             include_source_facts=include_source_facts,
                             max_source_facts_tokens=max_source_facts_tokens,
                             max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,
+                            feature_flags=budget_config_dict,
                         )
                         break  # Success - exit retry loop
                     except Exception as e:
@@ -2918,6 +2923,501 @@ class MemoryEngine(MemoryEngineInterface):
         finally:
             recall_span_context.__exit__(None, None, None)
 
+    def _feature_enabled(self, feature_flags: dict[str, Any] | None, key: str) -> bool:
+        if not feature_flags:
+            return False
+        return bool(feature_flags.get(key, False))
+
+    async def _resolved_feature_flags(self, bank_id: str, request_context: "RequestContext") -> dict[str, Any]:
+        return await self._config_resolver.get_bank_config(bank_id, request_context)
+
+    async def add_memory_feedback(
+        self,
+        bank_id: str,
+        memory_id: str,
+        rating: str,
+        source: str,
+        reason: str | None,
+        *,
+        request_context: "RequestContext",
+    ) -> dict[str, Any]:
+        """Record optional feedback and update experimental trust fields."""
+        from hindsight_api.extensions import OperationValidationError
+
+        await self._authenticate_tenant(request_context)
+        flags = await self._resolved_feature_flags(bank_id, request_context)
+        if not self._feature_enabled(flags, "experimental_memory_feedback_enabled"):
+            return {
+                "enabled": False,
+                "updated": False,
+                "message": "experimental_memory_feedback_enabled is disabled for this bank",
+            }
+
+        if rating not in {"helpful", "unhelpful"}:
+            raise OperationValidationError("rating must be helpful or unhelpful", 400)
+        if source not in {"user", "agent", "eval"}:
+            raise OperationValidationError("source must be user, agent, or eval", 400)
+
+        memory_uuid = uuid.UUID(memory_id)
+        pool = await self._get_pool()
+        async with acquire_with_retry(pool) as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"""
+                    SELECT id
+                    FROM {fq_table("memory_units")}
+                    WHERE bank_id = $1 AND id = $2
+                    """,
+                    bank_id,
+                    memory_uuid,
+                )
+                if not row:
+                    raise OperationValidationError("memory not found in bank", 404)
+
+                await conn.execute(
+                    f"""
+                    INSERT INTO {fq_table("memory_feedback_events")}
+                        (bank_id, memory_unit_id, rating, source, reason)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    bank_id,
+                    memory_uuid,
+                    rating,
+                    source,
+                    reason,
+                )
+
+                helpful_delta = 1 if rating == "helpful" else 0
+                unhelpful_delta = 1 if rating == "unhelpful" else 0
+                updated = await conn.fetchrow(
+                    f"""
+                    UPDATE {fq_table("memory_units")}
+                    SET helpful_count = COALESCE(helpful_count, 0) + $3,
+                        unhelpful_count = COALESCE(unhelpful_count, 0) + $4,
+                        trust_score = LEAST(
+                            0.95,
+                            GREATEST(
+                                0.05,
+                                0.5 + (
+                                    (COALESCE(helpful_count, 0) + $3)
+                                    - (COALESCE(unhelpful_count, 0) + $4)
+                                ) * 0.3
+                            )
+                        ),
+                        updated_at = now()
+                    WHERE bank_id = $1 AND id = $2
+                    RETURNING id, trust_score, helpful_count, unhelpful_count
+                    """,
+                    bank_id,
+                    memory_uuid,
+                    helpful_delta,
+                    unhelpful_delta,
+                )
+
+        metrics = get_metrics_collector()
+        metrics.record_memory_feedback(rating, source, bank_id, float(updated["trust_score"]))
+        return {
+            "enabled": True,
+            "updated": True,
+            "memory_id": str(updated["id"]),
+            "trust_score": float(updated["trust_score"]),
+            "helpful_count": updated["helpful_count"],
+            "unhelpful_count": updated["unhelpful_count"],
+        }
+
+    async def _resolve_entity(self, conn: asyncpg.Connection, bank_id: str, entity: str) -> dict[str, Any] | None:
+        row = await conn.fetchrow(
+            f"""
+            SELECT e.id, e.canonical_name, COUNT(ue.unit_id) AS fact_count
+            FROM {fq_table("entities")} e
+            LEFT JOIN {fq_table("unit_entities")} ue ON ue.entity_id = e.id
+            WHERE e.bank_id = $1
+              AND (
+                  LOWER(e.canonical_name) = LOWER($2)
+                  OR LOWER(e.canonical_name) LIKE '%' || LOWER($2) || '%'
+                  OR LOWER($2) LIKE '%' || LOWER(e.canonical_name) || '%'
+              )
+            GROUP BY e.id, e.canonical_name
+            ORDER BY (LOWER(e.canonical_name) = LOWER($2)) DESC,
+                     LENGTH(e.canonical_name) ASC,
+                     COUNT(ue.unit_id) DESC
+            LIMIT 1
+            """,
+            bank_id,
+            entity,
+        )
+        return dict(row) if row else None
+
+    @staticmethod
+    def _entity_memory_row(row: asyncpg.Record, source_label: str) -> dict[str, Any]:
+        return {
+            "id": str(row["id"]),
+            "text": row["text"],
+            "fact_type": row["fact_type"],
+            "context": row["context"],
+            "occurred_start": row["occurred_start"].isoformat() if row["occurred_start"] else None,
+            "occurred_end": row["occurred_end"].isoformat() if row["occurred_end"] else None,
+            "mentioned_at": row["mentioned_at"].isoformat() if row["mentioned_at"] else None,
+            "document_id": row["document_id"],
+            "chunk_id": str(row["chunk_id"]) if row["chunk_id"] else None,
+            "tags": row["tags"],
+            "metadata": row.get("metadata") if hasattr(row, "get") else dict(row).get("metadata"),
+            "trust_score": float(row["trust_score"]) if row["trust_score"] is not None else None,
+            "source_label": source_label,
+        }
+
+    async def entity_probe(
+        self,
+        bank_id: str,
+        entity: str,
+        *,
+        request_context: "RequestContext",
+        limit: int = 20,
+        fact_types: list[str] | None = None,
+    ) -> dict[str, Any]:
+        await self._authenticate_tenant(request_context)
+        flags = await self._resolved_feature_flags(bank_id, request_context)
+        if not self._feature_enabled(flags, "experimental_entity_tools_enabled"):
+            return {"enabled": False, "matched": False, "results": [], "message": "experimental_entity_tools_enabled is disabled for this bank"}
+
+        pool = await self._get_pool()
+        fact_types = fact_types or ["world", "experience", "observation"]
+        async with acquire_with_retry(pool) as conn:
+            resolved = await self._resolve_entity(conn, bank_id, entity)
+            if not resolved:
+                get_metrics_collector().record_entity_probe(False, bank_id)
+                return {"enabled": True, "matched": False, "entity": None, "results": []}
+            rows = await conn.fetch(
+                f"""
+                SELECT DISTINCT ON (mu.id)
+                    mu.id, mu.text, mu.fact_type, mu.context, mu.occurred_start,
+                    mu.occurred_end, mu.mentioned_at, mu.document_id, mu.chunk_id,
+                    mu.tags, mu.metadata, mu.trust_score
+                FROM {fq_table("unit_entities")} ue
+                JOIN {fq_table("memory_units")} mu ON mu.id = ue.unit_id
+                WHERE ue.entity_id = $1
+                  AND mu.bank_id = $2
+                  AND mu.fact_type = ANY($3::text[])
+                ORDER BY mu.id, COALESCE(mu.mentioned_at, mu.occurred_start, mu.updated_at) DESC NULLS LAST
+                LIMIT $4
+                """,
+                resolved["id"],
+                bank_id,
+                fact_types,
+                limit,
+            )
+
+        get_metrics_collector().record_entity_probe(True, bank_id)
+        return {
+            "enabled": True,
+            "matched": True,
+            "entity": {"id": str(resolved["id"]), "canonical_name": resolved["canonical_name"]},
+            "results": [self._entity_memory_row(row, "entity_probe") for row in rows],
+        }
+
+    async def entity_reason(
+        self,
+        bank_id: str,
+        entities: list[str],
+        *,
+        request_context: "RequestContext",
+        limit: int = 20,
+        fact_types: list[str] | None = None,
+    ) -> dict[str, Any]:
+        await self._authenticate_tenant(request_context)
+        flags = await self._resolved_feature_flags(bank_id, request_context)
+        if not self._feature_enabled(flags, "experimental_entity_tools_enabled"):
+            return {"enabled": False, "matched": False, "results": [], "message": "experimental_entity_tools_enabled is disabled for this bank"}
+
+        pool = await self._get_pool()
+        fact_types = fact_types or ["world", "experience", "observation"]
+        async with acquire_with_retry(pool) as conn:
+            resolved = []
+            for entity in entities:
+                row = await self._resolve_entity(conn, bank_id, entity)
+                if row:
+                    resolved.append(row)
+            if len(resolved) != len(entities):
+                get_metrics_collector().record_entity_reason(len(entities), False, bank_id)
+                return {
+                    "enabled": True,
+                    "matched": False,
+                    "entities": [{"id": str(r["id"]), "canonical_name": r["canonical_name"]} for r in resolved],
+                    "results": [],
+                }
+
+            entity_ids = [r["id"] for r in resolved]
+            rows = await conn.fetch(
+                f"""
+                WITH matched_units AS (
+                    SELECT ue.unit_id, COUNT(DISTINCT ue.entity_id) AS entity_match_count
+                    FROM {fq_table("unit_entities")} ue
+                    WHERE ue.entity_id = ANY($1::uuid[])
+                    GROUP BY ue.unit_id
+                    HAVING COUNT(DISTINCT ue.entity_id) = $2
+                )
+                SELECT mu.id, mu.text, mu.fact_type, mu.context, mu.occurred_start,
+                       mu.occurred_end, mu.mentioned_at, mu.document_id, mu.chunk_id,
+                       mu.tags, mu.metadata, mu.trust_score, matched_units.entity_match_count
+                FROM matched_units
+                JOIN {fq_table("memory_units")} mu ON mu.id = matched_units.unit_id
+                WHERE mu.bank_id = $3
+                  AND mu.fact_type = ANY($4::text[])
+                ORDER BY matched_units.entity_match_count DESC,
+                         COALESCE(mu.mentioned_at, mu.occurred_start, mu.updated_at) DESC NULLS LAST
+                LIMIT $5
+                """,
+                entity_ids,
+                len(entity_ids),
+                bank_id,
+                fact_types,
+                limit,
+            )
+
+        get_metrics_collector().record_entity_reason(len(entities), bool(rows), bank_id)
+        return {
+            "enabled": True,
+            "matched": bool(rows),
+            "entities": [{"id": str(r["id"]), "canonical_name": r["canonical_name"]} for r in resolved],
+            "results": [self._entity_memory_row(row, "entity_reason") for row in rows],
+        }
+
+    @staticmethod
+    def _text_conflict_score(left: str, right: str) -> float:
+        use_python_pattern = re.compile(r"\b(?:use|uses|using|with)\s+python\s*(\d+\.\d+)\b", re.IGNORECASE)
+        left_preferred = use_python_pattern.findall(left)
+        right_preferred = use_python_pattern.findall(right)
+        if left_preferred and right_preferred and left_preferred[0] != right_preferred[0]:
+            return 0.98
+
+        version_pattern = re.compile(r"\b(?:python\s*)?(\d+\.\d+)\b", re.IGNORECASE)
+        left_versions = set(version_pattern.findall(left))
+        right_versions = set(version_pattern.findall(right))
+        if left_versions and right_versions and left_versions.isdisjoint(right_versions):
+            shared = set(left.lower().split()) & set(right.lower().split())
+            if {"python", "use"} & shared or "python" in left.lower() + right.lower():
+                return 0.95
+        pairs = (("enabled", "disabled"), ("enable", "disable"), ("must", "must not"), ("should", "should not"))
+        joined_left = left.lower()
+        joined_right = right.lower()
+        for positive, negative in pairs:
+            if positive in joined_left and negative in joined_right:
+                return 0.85
+            if negative in joined_left and positive in joined_right:
+                return 0.85
+        return 0.0
+
+    async def memory_conflicts(
+        self,
+        bank_id: str,
+        *,
+        request_context: "RequestContext",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        await self._authenticate_tenant(request_context)
+        flags = await self._resolved_feature_flags(bank_id, request_context)
+        if not self._feature_enabled(flags, "experimental_conflict_detection_enabled"):
+            return {"enabled": False, "conflicts": [], "message": "experimental_conflict_detection_enabled is disabled for this bank"}
+
+        pool = await self._get_pool()
+        detected = 0
+        async with acquire_with_retry(pool) as conn:
+            candidate_rows = await conn.fetch(
+                f"""
+                WITH pairs AS (
+                    SELECT
+                        LEAST(a.id::text, b.id::text)::uuid AS unit_a_id,
+                        GREATEST(a.id::text, b.id::text)::uuid AS unit_b_id,
+                        ARRAY_AGG(DISTINCT ue1.entity_id) AS shared_entity_ids,
+                        MAX(COALESCE(a.mentioned_at, a.updated_at)) AS a_seen,
+                        MAX(COALESCE(b.mentioned_at, b.updated_at)) AS b_seen
+                    FROM {fq_table("unit_entities")} ue1
+                    JOIN {fq_table("unit_entities")} ue2
+                      ON ue1.entity_id = ue2.entity_id
+                     AND ue1.unit_id::text < ue2.unit_id::text
+                    JOIN {fq_table("memory_units")} a ON a.id = ue1.unit_id
+                    JOIN {fq_table("memory_units")} b ON b.id = ue2.unit_id
+                    WHERE a.bank_id = $1
+                      AND b.bank_id = $1
+                      AND a.fact_type IN ('world', 'experience')
+                      AND b.fact_type IN ('world', 'experience')
+                    GROUP BY a.id, b.id
+                    ORDER BY GREATEST(MAX(COALESCE(a.mentioned_at, a.updated_at)), MAX(COALESCE(b.mentioned_at, b.updated_at))) DESC
+                    LIMIT $2
+                )
+                SELECT pairs.unit_a_id, pairs.unit_b_id, pairs.shared_entity_ids,
+                       a.text AS text_a, b.text AS text_b,
+                       CASE
+                           WHEN a.embedding IS NULL OR b.embedding IS NULL THEN NULL
+                           ELSE 1 - (a.embedding <=> b.embedding)
+                       END AS embedding_similarity
+                FROM pairs
+                JOIN {fq_table("memory_units")} a ON a.id = pairs.unit_a_id
+                JOIN {fq_table("memory_units")} b ON b.id = pairs.unit_b_id
+                """,
+                bank_id,
+                max(limit * 10, 100),
+            )
+            for row in candidate_rows:
+                heuristic = self._text_conflict_score(row["text_a"], row["text_b"])
+                embedding_similarity = row["embedding_similarity"]
+                embedding_gap = 1.0 - float(embedding_similarity) if embedding_similarity is not None else 0.0
+                score = max(heuristic, embedding_gap if heuristic >= 0.5 else 0.0)
+                if score < 0.75:
+                    continue
+                await conn.execute(
+                    f"""
+                    INSERT INTO {fq_table("memory_conflicts")} AS mc
+                        (bank_id, unit_a_id, unit_b_id, shared_entity_ids, conflict_score, status, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, 'open', now())
+                    ON CONFLICT (bank_id, unit_a_id, unit_b_id)
+                    DO UPDATE SET shared_entity_ids = EXCLUDED.shared_entity_ids,
+                                  conflict_score = GREATEST(mc.conflict_score, EXCLUDED.conflict_score),
+                                  updated_at = now()
+                    """,
+                    bank_id,
+                    row["unit_a_id"],
+                    row["unit_b_id"],
+                    row["shared_entity_ids"],
+                    score,
+                )
+                detected += 1
+
+            conflicts = await conn.fetch(
+                f"""
+                SELECT mc.id, mc.unit_a_id, mc.unit_b_id, mc.shared_entity_ids,
+                       mc.conflict_score, mc.status, mc.created_at, mc.updated_at,
+                       a.text AS text_a, b.text AS text_b
+                FROM {fq_table("memory_conflicts")} mc
+                JOIN {fq_table("memory_units")} a ON a.id = mc.unit_a_id
+                JOIN {fq_table("memory_units")} b ON b.id = mc.unit_b_id
+                WHERE mc.bank_id = $1
+                ORDER BY mc.status = 'open' DESC, mc.conflict_score DESC, mc.updated_at DESC
+                LIMIT $2
+                """,
+                bank_id,
+                limit,
+            )
+            open_count = await conn.fetchval(
+                f"SELECT COUNT(*) FROM {fq_table('memory_conflicts')} WHERE bank_id = $1 AND status = 'open'",
+                bank_id,
+            )
+
+        get_metrics_collector().record_memory_conflicts(detected, int(open_count or 0), bank_id)
+        return {
+            "enabled": True,
+            "detected": detected,
+            "open_count": int(open_count or 0),
+            "conflicts": [
+                {
+                    "id": str(row["id"]),
+                    "unit_a_id": str(row["unit_a_id"]),
+                    "unit_b_id": str(row["unit_b_id"]),
+                    "shared_entity_ids": [str(eid) for eid in row["shared_entity_ids"]],
+                    "conflict_score": float(row["conflict_score"]),
+                    "status": row["status"],
+                    "text_a": row["text_a"],
+                    "text_b": row["text_b"],
+                    "created_at": row["created_at"].isoformat(),
+                    "updated_at": row["updated_at"].isoformat(),
+                }
+                for row in conflicts
+            ],
+        }
+
+    async def _retrieve_structural_candidates(
+        self,
+        conn: asyncpg.Connection,
+        bank_id: str,
+        query: str,
+        fact_types: list[str],
+        *,
+        limit: int,
+    ) -> list["RetrievalResult"]:
+        from .search.structural import cosine_similarity, encode_roles, temporal_bucket, tokenize_structure_text
+        from .search.types import RetrievalResult
+
+        matched_entities = await conn.fetch(
+            f"""
+            SELECT canonical_name
+            FROM {fq_table("entities")}
+            WHERE bank_id = $1
+              AND LENGTH(canonical_name) >= 3
+              AND POSITION(LOWER(canonical_name) IN LOWER($2)) > 0
+            ORDER BY LENGTH(canonical_name) DESC
+            LIMIT 12
+            """,
+            bank_id,
+            query,
+        )
+        query_entity_names = [row["canonical_name"] for row in matched_entities]
+        query_roles = {"entities": query_entity_names, "query_terms": tokenize_structure_text(query)}
+        query_vector = encode_roles(query_roles)
+
+        rows = await conn.fetch(
+            f"""
+            SELECT mu.id, mu.text, mu.context, mu.event_date, mu.occurred_start,
+                   mu.occurred_end, mu.mentioned_at, mu.fact_type, mu.document_id,
+                   mu.chunk_id, mu.tags, mu.metadata, mu.proof_count, mu.trust_score,
+                   mu.helpful_count, mu.unhelpful_count,
+                   COALESCE(ARRAY_AGG(DISTINCT e.canonical_name) FILTER (WHERE e.id IS NOT NULL), ARRAY[]::text[]) AS entity_names
+            FROM {fq_table("memory_units")} mu
+            LEFT JOIN {fq_table("unit_entities")} ue ON ue.unit_id = mu.id
+            LEFT JOIN {fq_table("entities")} e ON e.id = ue.entity_id
+            WHERE mu.bank_id = $1
+              AND mu.fact_type = ANY($2::text[])
+            GROUP BY mu.id
+            ORDER BY COALESCE(mu.mentioned_at, mu.occurred_start, mu.updated_at) DESC NULLS LAST
+            LIMIT $3
+            """,
+            bank_id,
+            fact_types,
+            max(limit * 6, 120),
+        )
+
+        scored: list[tuple[float, asyncpg.Record, dict[str, Any], list[float]]] = []
+        for row in rows:
+            roles = {
+                "entities": row["entity_names"] or [],
+                "fact_type": row["fact_type"],
+                "tags": row["tags"] or [],
+                "temporal_bucket": temporal_bucket(row["occurred_start"] or row["mentioned_at"]),
+                "document_id": row["document_id"],
+            }
+            vector = encode_roles(roles)
+            score = cosine_similarity(query_vector, vector)
+            if query_entity_names:
+                row_entities = {name.lower() for name in row["entity_names"] or []}
+                matched = sum(1 for name in query_entity_names if name.lower() in row_entities)
+                score += matched / max(1, len(query_entity_names))
+            if score <= 0.0:
+                continue
+            scored.append((score, row, roles, vector))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        results: list[RetrievalResult] = []
+        for score, row, roles, vector in scored[:limit]:
+            await conn.execute(
+                f"""
+                INSERT INTO {fq_table("memory_structural_vectors")}
+                    (memory_unit_id, bank_id, roles, vector, updated_at)
+                VALUES ($1, $2, $3::jsonb, $4::jsonb, now())
+                ON CONFLICT (memory_unit_id)
+                DO UPDATE SET roles = EXCLUDED.roles,
+                              vector = EXCLUDED.vector,
+                              updated_at = now()
+                """,
+                row["id"],
+                bank_id,
+                json.dumps(roles),
+                json.dumps(vector),
+            )
+            result = RetrievalResult.from_db_row(dict(row))
+            result.activation = score
+            result.source_label = "structural"
+            results.append(result)
+        return results
+
     async def _search_with_retries(
         self,
         bank_id: str,
@@ -2941,6 +3441,7 @@ class MemoryEngine(MemoryEngineInterface):
         include_source_facts: bool = False,
         max_source_facts_tokens: int = 4096,
         max_source_facts_tokens_per_observation: int = -1,
+        feature_flags: dict[str, Any] | None = None,
     ) -> RecallResultModel:
         """
         Search implementation with modular retrieval and reranking.
@@ -2979,6 +3480,12 @@ class MemoryEngine(MemoryEngineInterface):
 
         pool = await self._get_pool()
         recall_start = time.time()
+        feature_flags = feature_flags or {}
+        trust_rerank_enabled = self._feature_enabled(feature_flags, "experimental_trust_rerank_enabled")
+        structural_active = self._feature_enabled(
+            feature_flags, "experimental_structural_retrieval_enabled"
+        )
+        structural_shadow = self._feature_enabled(feature_flags, "experimental_structural_shadow_enabled")
 
         # Buffer logs for clean output in concurrent scenarios.
         # Include a uuid suffix so two recalls on the same bank within the
@@ -3070,12 +3577,14 @@ class MemoryEngine(MemoryEngineInterface):
             bm25_results = []
             graph_results = []
             temporal_results = []
+            structural_results = []
             aggregated_timings = {
                 "semantic": 0.0,
                 "bm25": 0.0,
                 "graph": 0.0,
                 "temporal": 0.0,
                 "temporal_extraction": 0.0,
+                "structural": 0.0,
             }
             all_graph_timings = []
 
@@ -3117,6 +3626,28 @@ class MemoryEngine(MemoryEngineInterface):
                     key=lambda r: r.combined_score if hasattr(r, "combined_score") else 0, reverse=True
                 )
 
+            if structural_active or structural_shadow:
+                structural_start = time.time()
+                try:
+                    async with acquire_with_retry(pool) as structural_conn:
+                        structural_results = await self._retrieve_structural_candidates(
+                            structural_conn,
+                            bank_id,
+                            query,
+                            fact_type,
+                            limit=min(max(thinking_budget // 2, 20), 100),
+                        )
+                except Exception as exc:
+                    logger.warning(f"[RECALL {recall_id}] Structural retrieval failed in experimental mode: {exc}")
+                    structural_results = []
+                aggregated_timings["structural"] = time.time() - structural_start
+                get_metrics_collector().record_structural_retrieval(
+                    aggregated_timings["structural"],
+                    len(structural_results),
+                    len(structural_results) if structural_active else 0,
+                    bank_id,
+                )
+
             retrieval_duration = time.time() - retrieval_start
 
             step_duration = time.time() - step_start
@@ -3134,6 +3665,11 @@ class MemoryEngine(MemoryEngineInterface):
                 temporal_count = len(temporal_results) if temporal_results else 0
                 timing_parts.append(f"temporal={temporal_count}({aggregated_timings['temporal']:.3f}s)")
                 temporal_info = f" | temporal_range={start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')}"
+            if structural_active or structural_shadow:
+                mode = "active" if structural_active else "shadow"
+                timing_parts.append(
+                    f"structural={len(structural_results)}({aggregated_timings['structural']:.3f}s,{mode})"
+                )
             log_buffer.append(
                 f"  [2] Parallel retrieval ({len(fact_type)} fact_types): {', '.join(timing_parts)} in {parallel_duration:.3f}s{temporal_info}"
             )
@@ -3231,6 +3767,15 @@ class MemoryEngine(MemoryEngineInterface):
                             fact_type=ft_name,
                         )
 
+                if structural_active or structural_shadow:
+                    tracer.add_retrieval_results(
+                        method_name="structural",
+                        results=to_tuple_format(structural_results),
+                        duration_seconds=aggregated_timings.get("structural", 0.0),
+                        score_field="activation",
+                        metadata={"mode": "active" if structural_active else "shadow"},
+                    )
+
                 # Record entry points (from semantic results) for legacy graph view
                 for rank, retrieval in enumerate(semantic_results[:10], start=1):  # Top 10 as entry points
                     tracer.add_entry_point(retrieval.id, retrieval.text, retrieval.similarity or 0.0, rank)
@@ -3243,6 +3788,9 @@ class MemoryEngine(MemoryEngineInterface):
                         "bm25_count": len(bm25_results),
                         "graph_count": len(graph_results),
                         "temporal_count": len(temporal_results) if temporal_results else 0,
+                        "structural_count": len(structural_results),
+                        "structural_active": structural_active,
+                        "structural_shadow": structural_shadow,
                     },
                 )
                 # Also expose each retrieval method as its own phase so
@@ -3263,13 +3811,14 @@ class MemoryEngine(MemoryEngineInterface):
             fusion_span.set_attribute("hindsight.temporal_count", len(temporal_results) if temporal_results else 0)
 
             try:
-                # Merge 3 or 4 result lists depending on temporal constraint
+                rrf_inputs = [semantic_results, bm25_results, graph_results]
                 if temporal_results:
-                    merged_candidates = reciprocal_rank_fusion(
-                        [semantic_results, bm25_results, graph_results, temporal_results]
-                    )
-                else:
-                    merged_candidates = reciprocal_rank_fusion([semantic_results, bm25_results, graph_results])
+                    rrf_inputs.append(temporal_results)
+                elif structural_active and structural_results:
+                    rrf_inputs.append([])
+                if structural_active and structural_results:
+                    rrf_inputs.append(structural_results)
+                merged_candidates = reciprocal_rank_fusion(rrf_inputs)
 
                 step_duration = time.time() - step_start
                 log_buffer.append(
@@ -3282,7 +3831,7 @@ class MemoryEngine(MemoryEngineInterface):
             if tracer:
                 # Convert MergedCandidate to old tuple format for tracer
                 tracer_merged = [
-                    (mc.id, mc.retrieval.__dict__, {"rrf_score": mc.rrf_score, **mc.source_ranks})
+                    (mc.id, mc.retrieval.__dict__, {"rrf_score": mc.rrf_score, "source_ranks": mc.source_ranks})
                     for mc in merged_candidates
                 ]
                 tracer.add_rrf_merged(tracer_merged)
@@ -3333,15 +3882,25 @@ class MemoryEngine(MemoryEngineInterface):
             if scored_results:
                 ce = reranker_instance.cross_encoder
                 is_passthrough = ce is not None and ce.provider_name == "rrf"
-                apply_combined_scoring(scored_results, now=utcnow(), is_passthrough_reranker=is_passthrough)
+                apply_combined_scoring(
+                    scored_results,
+                    now=utcnow(),
+                    is_passthrough_reranker=is_passthrough,
+                    trust_rerank_enabled=trust_rerank_enabled,
+                )
+                if trust_rerank_enabled:
+                    get_metrics_collector().record_trust_rerank_applied(len(scored_results), bank_id)
                 scored_results.sort(key=lambda x: x.weight, reverse=True)
-                log_buffer.append("  [4.6] Combined scoring: ce * recency_boost(0.2) * temporal_boost(0.2)")
+                trust_note = " * trust_boost(0.4)" if trust_rerank_enabled else ""
+                log_buffer.append(
+                    f"  [4.6] Combined scoring: ce * recency_boost(0.2) * temporal_boost(0.2){trust_note}"
+                )
 
             # Add reranked results to tracer AFTER combined scoring (so normalized values are included)
             if tracer:
                 results_dict = [sr.to_dict() for sr in scored_results]
                 tracer_merged = [
-                    (mc.id, mc.retrieval.__dict__, {"rrf_score": mc.rrf_score, **mc.source_ranks})
+                    (mc.id, mc.retrieval.__dict__, {"rrf_score": mc.rrf_score, "source_ranks": mc.source_ranks})
                     for mc in merged_candidates
                 ]
                 tracer.add_reranked(results_dict, tracer_merged)
