@@ -48,6 +48,7 @@ class RetrievalResult:
     chunk_id: str | None = None
     tags: list[str] | None = None  # Visibility scope tags
     metadata: dict[str, str] | None = None  # User-provided metadata
+    embedding: Any | None = None  # Optional vector used by recall_exp diversity clustering
     proof_count: int | None = None  # Number of supporting memories (observations only)
     trust_score: float | None = None  # Experimental feedback-derived trust score
     helpful_count: int | None = None
@@ -77,6 +78,7 @@ class RetrievalResult:
             chunk_id=row.get("chunk_id"),
             tags=row.get("tags"),
             metadata=row.get("metadata"),
+            embedding=row.get("embedding"),
             proof_count=row.get("proof_count"),
             trust_score=row.get("trust_score"),
             helpful_count=row.get("helpful_count"),
