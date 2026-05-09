@@ -188,6 +188,14 @@ class RecallRequest(BaseModel):
         return self
 
 
+class RecallExpRequest(RecallRequest):
+    """Request model for experimental recall variants used by OpenClaw."""
+
+    experimental_variant: Literal["baseline", "entity_tools", "trust", "structural"] = "baseline"
+    experimental_shadow: bool = False
+    cluster_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
+
+
 class MemoryFeedbackRequest(BaseModel):
     rating: Literal["helpful", "unhelpful"]
     source: Literal["user", "agent", "eval"]
@@ -3281,6 +3289,124 @@ def _register_routes(app: FastAPI):
             error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.error(
                 f"[RECALL ERROR] bank={bank_id} handler_duration={handler_duration:.3f}s error={str(e)}\n{error_detail}"
+            )
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/memories/recall_exp",
+        response_model=RecallResponse,
+        summary="Recall memory with an experimental variant",
+        description="Compatibility endpoint used by integrations to request optional recall variants.",
+        operation_id="recall_memories_experimental",
+        tags=["Memory"],
+    )
+    @audited("recall_exp")
+    async def api_recall_exp(
+        bank_id: str,
+        request: RecallExpRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Run baseline recall or an explicitly requested experimental recall variant."""
+        import time
+
+        handler_start = time.time()
+        metrics = get_metrics_collector()
+
+        max_query_tokens = get_config().recall_max_query_tokens
+        encoding = _get_tiktoken_encoding()
+        query_tokens = len(encoding.encode(request.query))
+        if query_tokens > max_query_tokens:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Query too long: {query_tokens} tokens exceeds maximum of {max_query_tokens}. Please shorten your query.",
+            )
+
+        try:
+            fact_types = request.types if request.types else list(VALID_RECALL_FACT_TYPES)
+
+            def _fact_to_result(fact: "MemoryFact") -> RecallResult:
+                return RecallResult(
+                    id=fact.id,
+                    text=fact.text,
+                    type=fact.fact_type,
+                    entities=fact.entities,
+                    context=fact.context,
+                    occurred_start=fact.occurred_start,
+                    occurred_end=fact.occurred_end,
+                    mentioned_at=fact.mentioned_at,
+                    document_id=fact.document_id,
+                    metadata=fact.metadata,
+                    chunk_id=fact.chunk_id,
+                    tags=fact.tags,
+                    source_fact_ids=fact.source_fact_ids,
+                )
+
+            with metrics.record_operation(
+                "recall_exp",
+                bank_id=bank_id,
+                source="api",
+                variant=request.experimental_variant,
+                shadow=request.experimental_shadow,
+                max_tokens=request.max_tokens,
+            ):
+                if request.experimental_variant == "entity_tools":
+                    core_result = await app.state.memory.recall_exp_async(
+                        bank_id=bank_id,
+                        query=request.query,
+                        max_tokens=request.max_tokens,
+                        fact_type=fact_types,
+                        request_context=request_context,
+                        tags=request.tags,
+                        tags_match=request.tags_match,
+                        cluster_threshold=request.cluster_threshold,
+                    )
+                else:
+                    core_result = await app.state.memory.recall_async(
+                        bank_id=bank_id,
+                        query=request.query,
+                        budget=request.budget,
+                        max_tokens=request.max_tokens,
+                        enable_trace=request.trace,
+                        fact_type=fact_types,
+                        request_context=request_context,
+                        tags=request.tags,
+                        tags_match=request.tags_match,
+                        tag_groups=request.tag_groups,
+                    )
+
+            recall_results = [_fact_to_result(fact) for fact in core_result.results]
+            handler_duration = time.time() - handler_start
+            if handler_duration > 1.0:
+                logging.info(
+                    f"[RECALL_EXP HTTP] bank={bank_id} variant={request.experimental_variant} "
+                    f"shadow={request.experimental_shadow} duration={handler_duration:.3f}s "
+                    f"results={len(recall_results)}"
+                )
+            return RecallResponse(results=recall_results, trace=core_result.trace)
+        except HTTPException:
+            raise
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except (asyncio.TimeoutError, TimeoutError):
+            handler_duration = time.time() - handler_start
+            logger.error(
+                f"[RECALL_EXP TIMEOUT] bank={bank_id} handler_duration={handler_duration:.3f}s "
+                f"variant={request.experimental_variant}"
+            )
+            raise HTTPException(
+                status_code=504,
+                detail="Request timed out while searching memories. Try a shorter or more specific query.",
+            )
+        except Exception as e:
+            import traceback
+
+            handler_duration = time.time() - handler_start
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(
+                f"[RECALL_EXP ERROR] bank={bank_id} handler_duration={handler_duration:.3f}s "
+                f"variant={request.experimental_variant} error={str(e)}\n{error_detail}"
             )
             raise HTTPException(status_code=500, detail=str(e))
 
