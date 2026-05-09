@@ -3345,8 +3345,7 @@ def _register_routes(app: FastAPI):
                 "recall_exp",
                 bank_id=bank_id,
                 source="api",
-                variant=request.experimental_variant,
-                shadow=request.experimental_shadow,
+                budget=request.budget.value,
                 max_tokens=request.max_tokens,
             ):
                 if request.experimental_variant == "entity_tools":
