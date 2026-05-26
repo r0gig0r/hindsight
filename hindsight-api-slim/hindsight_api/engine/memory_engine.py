@@ -766,6 +766,7 @@ class MemoryEngine(MemoryEngineInterface):
                     api_key=primary_api_key,
                     base_url=primary_base_url,
                     model=primary_model,
+                    extra_body=config.primary_llm_extra_body,
                 )
                 setattr(
                     self,
@@ -3944,6 +3945,7 @@ class MemoryEngine(MemoryEngineInterface):
             if structural_active or structural_shadow:
                 structural_start = time.time()
                 try:
+                    pool = await self._get_pool()
                     async with acquire_with_retry(pool) as structural_conn:
                         structural_results = await self._retrieve_structural_candidates(
                             structural_conn,

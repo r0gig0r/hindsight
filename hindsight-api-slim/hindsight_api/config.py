@@ -407,6 +407,7 @@ ENV_PRIMARY_LLM_API_KEY = "HINDSIGHT_API_PRIMARY_LLM_API_KEY"
 ENV_PRIMARY_LLM_BASE_URL = "HINDSIGHT_API_PRIMARY_LLM_BASE_URL"
 ENV_PRIMARY_LLM_FAILURE_THRESHOLD = "HINDSIGHT_API_PRIMARY_LLM_FAILURE_THRESHOLD"
 ENV_PRIMARY_LLM_COOLDOWN_SECONDS = "HINDSIGHT_API_PRIMARY_LLM_COOLDOWN_SECONDS"
+ENV_PRIMARY_LLM_EXTRA_BODY = "HINDSIGHT_API_PRIMARY_LLM_EXTRA_BODY"
 
 # Database migrations
 ENV_RUN_MIGRATIONS_ON_STARTUP = "HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP"
@@ -669,6 +670,9 @@ DEFAULT_MAX_OBSERVATIONS_PER_SCOPE = -1  # Max observations per tag scope (-1 = 
 DEFAULT_PRIMARY_LLM_ENABLED = False
 DEFAULT_PRIMARY_LLM_FAILURE_THRESHOLD = 3
 DEFAULT_PRIMARY_LLM_COOLDOWN_SECONDS = 300
+DEFAULT_PRIMARY_LLM_EXTRA_BODY: dict | None = (
+    None  # JSON dict merged into primary LLM extra_body (e.g. {"chat_template_kwargs":{"enable_thinking":false}})
+)
 
 # Database migrations
 DEFAULT_RUN_MIGRATIONS_ON_STARTUP = True
@@ -1193,6 +1197,7 @@ class HindsightConfig:
     primary_llm_base_url: str | None
     primary_llm_failure_threshold: int
     primary_llm_cooldown_seconds: int
+    primary_llm_extra_body: dict | None
 
     # Database migrations
     run_migrations_on_startup: bool
@@ -1770,6 +1775,7 @@ class HindsightConfig:
             primary_llm_cooldown_seconds=int(
                 os.getenv(ENV_PRIMARY_LLM_COOLDOWN_SECONDS, str(DEFAULT_PRIMARY_LLM_COOLDOWN_SECONDS))
             ),
+            primary_llm_extra_body=json.loads(os.getenv(ENV_PRIMARY_LLM_EXTRA_BODY, "null")),
             # Retain settings
             retain_max_completion_tokens=int(
                 os.getenv(ENV_RETAIN_MAX_COMPLETION_TOKENS, str(DEFAULT_RETAIN_MAX_COMPLETION_TOKENS))
