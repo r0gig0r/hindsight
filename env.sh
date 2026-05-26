@@ -15,6 +15,13 @@ export LLM_KEY="dummy"   # local server usually accepts anything; OpenAI SDK req
 export LLM_OUT="/tmp/nemotron-test"
 mkdir -p "$LLM_OUT"
 
+# -------- Claude Code session metadata paths (avoid repeating in commands) --------
+# why: the harness's per-session cwd shadow lives under /private/tmp/claude-501/...
+# Long, repeated, useless to re-type. Bind once if you ever need to reference it.
+# (Lesson learned 2026-04-24: a deleted worktree under this root wedged the Bash
+# tool for the rest of the session — use main checkout going forward.)
+export CCD_SESSION_ROOT="/private/tmp/claude-501"
+
 # -------- universal quieting --------
 export NO_COLOR=1 CLICOLOR=0 PAGER=cat
 export CI="${CI:-true}"

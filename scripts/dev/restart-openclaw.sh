@@ -23,6 +23,8 @@ set -euo pipefail
 
 PLIST="$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"
 LABEL="ai.openclaw.gateway"
+HINDSIGHT_PLIST="$HOME/Library/LaunchAgents/ai.openclaw.hindsight-daemon.plist"
+HINDSIGHT_LABEL="ai.openclaw.hindsight-daemon"
 DAEMON_PORT=9077
 GATEWAY_PORT=18789
 REPO_DIR="$HOME/hindsight"
@@ -131,7 +133,15 @@ fi
 
 # --- Step 3: Kill the hindsight daemon ---
 step "Stopping hindsight daemon..."
+if [[ -f "$HINDSIGHT_PLIST" ]] && launchctl list "$HINDSIGHT_LABEL" &>/dev/null; then
+    run launchctl bootout "gui/$(id -u)/$HINDSIGHT_LABEL" 2>/dev/null || true
+    sleep 1
+fi
 DAEMON_PIDS=$(pgrep -f "hindsight-api.*--daemon" 2>/dev/null || true)
+FOREGROUND_DAEMON_PIDS=$(pgrep -f "hindsight-api.*--host 127\\.0\\.0\\.1.*--port ${DAEMON_PORT}" 2>/dev/null || true)
+if [[ -n "$FOREGROUND_DAEMON_PIDS" ]]; then
+    DAEMON_PIDS="${DAEMON_PIDS} ${FOREGROUND_DAEMON_PIDS}"
+fi
 if [[ -n "$DAEMON_PIDS" ]]; then
     for pid in $DAEMON_PIDS; do
         if $FORCE_KILL; then
@@ -142,15 +152,16 @@ if [[ -n "$DAEMON_PIDS" ]]; then
     done
     # Wait up to 5s for graceful shutdown
     for i in {1..5}; do
-        if ! pgrep -f "hindsight-api.*--daemon" &>/dev/null; then
+        if ! pgrep -f "hindsight-api.*--daemon" &>/dev/null && ! pgrep -f "hindsight-api.*--host 127\\.0\\.0\\.1.*--port ${DAEMON_PORT}" &>/dev/null; then
             break
         fi
         sleep 1
     done
     # Force kill if still alive
-    if pgrep -f "hindsight-api.*--daemon" &>/dev/null; then
+    if pgrep -f "hindsight-api.*--daemon" &>/dev/null || pgrep -f "hindsight-api.*--host 127\\.0\\.0\\.1.*--port ${DAEMON_PORT}" &>/dev/null; then
         warn "Daemon didn't stop gracefully, force-killing..."
         run pkill -9 -f "hindsight-api.*--daemon" 2>/dev/null || true
+        run pkill -9 -f "hindsight-api.*--host 127\\.0\\.0\\.1.*--port ${DAEMON_PORT}" 2>/dev/null || true
         sleep 1
     fi
     ok "Daemon stopped"
@@ -213,6 +224,23 @@ else
     fi
 fi
 
+# --- Step 4.5: Start Hindsight daemon ---
+if [[ -f "$HINDSIGHT_PLIST" ]]; then
+    step "Starting Hindsight daemon LaunchAgent..."
+    run launchctl bootstrap "gui/$(id -u)" "$HINDSIGHT_PLIST"
+    sleep 2
+    if ! $DRY_RUN; then
+        if launchctl list "$HINDSIGHT_LABEL" &>/dev/null; then
+            ok "Hindsight daemon service loaded"
+        else
+            fail "Hindsight daemon failed to load"
+            exit 1
+        fi
+    fi
+else
+    warn "Hindsight daemon LaunchAgent plist not found, relying on gateway/plugin startup"
+fi
+
 # --- Step 5: Bootstrap gateway ---
 step "Starting gateway LaunchAgent..."
 run launchctl bootstrap "gui/$(id -u)" "$PLIST"
@@ -259,12 +287,26 @@ echo -e "${GREEN}═════════════════════
 
 if ! $DRY_RUN; then
     # Gateway status
-    GW_INFO=$(launchctl list "$LABEL" 2>/dev/null | head -1 || echo "unknown")
-    GW_PID=$(echo "$GW_INFO" | awk '{print $1}')
+    GW_PID=$(launchctl list "$LABEL" 2>/dev/null | awk -F'= ' '
+        /"PID"/ {
+            gsub(/[^0-9]/, "", $2)
+            print $2
+            exit
+        }
+        NR == 1 && $1 ~ /^[0-9]+$/ {
+            print $1
+            exit
+        }
+    ' || true)
+    GW_PID=${GW_PID:-unknown}
     echo -e "  Gateway:  pid ${CYAN}${GW_PID}${NC} on :${GATEWAY_PORT}"
 
     # Daemon status
-    DAEMON_PID=$(pgrep -f "hindsight-api.*--daemon" 2>/dev/null | head -1 || echo "none")
+    DAEMON_PID=$(pgrep -f "hindsight-api.*--daemon" 2>/dev/null | head -1 || true)
+    if [[ -z "$DAEMON_PID" ]]; then
+        DAEMON_PID=$(pgrep -f "hindsight-api.*--host 127\\.0\\.0\\.1.*--port ${DAEMON_PORT}" 2>/dev/null | head -1 || true)
+    fi
+    DAEMON_PID=${DAEMON_PID:-none}
     DAEMON_PY=$("$REPO_DIR/.venv/bin/python" --version 2>&1 || echo "unknown")
     echo -e "  Daemon:   pid ${CYAN}${DAEMON_PID}${NC} on :${DAEMON_PORT} (${DAEMON_PY})"
 
