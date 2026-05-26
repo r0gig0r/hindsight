@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-05-09T16:27:30.146710+03:00",
+  "generated_at": "2026-05-09T19:10:31.992475+03:00",
   "cases": [
     {
       "case_id": "hindsight_fork_maintenance",
@@ -14,7 +14,29 @@
           "injected_token_count": 89,
           "injected_count": 4,
           "duplicate_jaccard_redundancy": 0.13738721055925357,
-          "latency_ms": 165.32320802798495,
+          "latency_ms": 170.42608303017914,
+          "source_contribution": {
+            "baseline": 4,
+            "semantic": 4,
+            "bm25": 4
+          },
+          "injected_texts": [
+            "The Hindsight daemon must use Python 3.13 because onnxruntime wheels are not available for Python 3.14.",
+            "OpenClaw memory injection should stay compact and token-economical for long sessions.",
+            "Stale note: Hindsight should use Python 3.14 for the daemon venv.",
+            "Hindsight OpenClaw runs in external API mode on port 9077 and the plugin should not spawn a daemon in this mode."
+          ]
+        },
+        "entity_labels": {
+          "variant": "entity_labels",
+          "precision_at_k": 0.5,
+          "forbidden_hit_count": 1,
+          "expected_include_hit_count": 2,
+          "expected_include_total": 3,
+          "injected_token_count": 89,
+          "injected_count": 4,
+          "duplicate_jaccard_redundancy": 0.13738721055925357,
+          "latency_ms": 124.43479202920571,
           "source_contribution": {
             "baseline": 4,
             "semantic": 4,
@@ -36,7 +58,30 @@
           "injected_token_count": 89,
           "injected_count": 4,
           "duplicate_jaccard_redundancy": 0.13738721055925357,
-          "latency_ms": 125.07112498860806,
+          "latency_ms": 123.74162499327213,
+          "source_contribution": {
+            "entity_reason": 1,
+            "baseline": 3,
+            "semantic": 4,
+            "bm25": 4
+          },
+          "injected_texts": [
+            "Hindsight OpenClaw runs in external API mode on port 9077 and the plugin should not spawn a daemon in this mode.",
+            "The Hindsight daemon must use Python 3.13 because onnxruntime wheels are not available for Python 3.14.",
+            "OpenClaw memory injection should stay compact and token-economical for long sessions.",
+            "Stale note: Hindsight should use Python 3.14 for the daemon venv."
+          ]
+        },
+        "entity_labels_entity_tools": {
+          "variant": "entity_labels_entity_tools",
+          "precision_at_k": 0.5,
+          "forbidden_hit_count": 1,
+          "expected_include_hit_count": 2,
+          "expected_include_total": 3,
+          "injected_token_count": 89,
+          "injected_count": 4,
+          "duplicate_jaccard_redundancy": 0.13738721055925357,
+          "latency_ms": 122.97595798736438,
           "source_contribution": {
             "entity_reason": 1,
             "baseline": 3,
@@ -59,7 +104,7 @@
           "injected_token_count": 89,
           "injected_count": 4,
           "duplicate_jaccard_redundancy": 0.13738721055925357,
-          "latency_ms": 118.67912497837096,
+          "latency_ms": 122.70841602003202,
           "source_contribution": {
             "baseline": 4,
             "semantic": 4,
@@ -81,7 +126,7 @@
           "injected_token_count": 89,
           "injected_count": 4,
           "duplicate_jaccard_redundancy": 0.13738721055925357,
-          "latency_ms": 122.70108301891014,
+          "latency_ms": 126.58616696717218,
           "source_contribution": {
             "baseline": 4,
             "semantic": 4,
@@ -110,7 +155,26 @@
           "injected_token_count": 20,
           "injected_count": 1,
           "duplicate_jaccard_redundancy": 0.0,
-          "latency_ms": 109.8326250212267,
+          "latency_ms": 114.27029204787686,
+          "source_contribution": {
+            "baseline": 1,
+            "semantic": 1,
+            "bm25": 1
+          },
+          "injected_texts": [
+            "Fraud-detector VM preemption note: restart OpenClaw and inspect a generic dashboard first."
+          ]
+        },
+        "entity_labels": {
+          "variant": "entity_labels",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 1,
+          "expected_include_hit_count": 1,
+          "expected_include_total": 4,
+          "injected_token_count": 20,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 90.11741704307497,
           "source_contribution": {
             "baseline": 1,
             "semantic": 1,
@@ -129,7 +193,26 @@
           "injected_token_count": 32,
           "injected_count": 1,
           "duplicate_jaccard_redundancy": 0.0,
-          "latency_ms": 81.96037501329556,
+          "latency_ms": 84.79945902945474,
+          "source_contribution": {
+            "entity_reason": 1,
+            "semantic": 1,
+            "bm25": 1
+          },
+          "injected_texts": [
+            "Fraud-detector production incidents often start with VM preemption; check Pub/Sub subscriptions, Redis, NFS mounts, and the watchdog scheduler before the trader dashboard."
+          ]
+        },
+        "entity_labels_entity_tools": {
+          "variant": "entity_labels_entity_tools",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 0,
+          "expected_include_hit_count": 4,
+          "expected_include_total": 4,
+          "injected_token_count": 32,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 85.5958330212161,
           "source_contribution": {
             "entity_reason": 1,
             "semantic": 1,
@@ -148,7 +231,7 @@
           "injected_token_count": 20,
           "injected_count": 1,
           "duplicate_jaccard_redundancy": 0.0,
-          "latency_ms": 80.37408400559798,
+          "latency_ms": 81.96695795049891,
           "source_contribution": {
             "baseline": 1,
             "semantic": 1,
@@ -167,7 +250,7 @@
           "injected_token_count": 20,
           "injected_count": 1,
           "duplicate_jaccard_redundancy": 0.0,
-          "latency_ms": 82.81125000212342,
+          "latency_ms": 84.85270803794265,
           "source_contribution": {
             "baseline": 1,
             "semantic": 1,
@@ -193,7 +276,26 @@
           "injected_token_count": 26,
           "injected_count": 1,
           "duplicate_jaccard_redundancy": 0.0,
-          "latency_ms": 118.98766597732902,
+          "latency_ms": 131.41537498449907,
+          "source_contribution": {
+            "baseline": 1,
+            "semantic": 1,
+            "bm25": 1
+          },
+          "injected_texts": [
+            "homee controls the Hormann garage doors and gate, while Salus thermostats provide bedroom temperature and humidity to Homey."
+          ]
+        },
+        "entity_labels": {
+          "variant": "entity_labels",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 0,
+          "expected_include_hit_count": 1,
+          "expected_include_total": 4,
+          "injected_token_count": 26,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 100.33899999689311,
           "source_contribution": {
             "baseline": 1,
             "semantic": 1,
@@ -212,7 +314,26 @@
           "injected_token_count": 34,
           "injected_count": 1,
           "duplicate_jaccard_redundancy": 0.0,
-          "latency_ms": 99.18074996676296,
+          "latency_ms": 102.35858301166445,
+          "source_contribution": {
+            "entity_reason": 1,
+            "semantic": 1,
+            "bm25": 1
+          },
+          "injected_texts": [
+            "Homey manages the Qubino 3-Phase Smart Meter; when values stall, restart the Homey Qubino app and reapply the association watchdog fix."
+          ]
+        },
+        "entity_labels_entity_tools": {
+          "variant": "entity_labels_entity_tools",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 0,
+          "expected_include_hit_count": 3,
+          "expected_include_total": 4,
+          "injected_token_count": 34,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 104.52862497186288,
           "source_contribution": {
             "entity_reason": 1,
             "semantic": 1,
@@ -231,7 +352,7 @@
           "injected_token_count": 26,
           "injected_count": 1,
           "duplicate_jaccard_redundancy": 0.0,
-          "latency_ms": 93.2790000224486,
+          "latency_ms": 101.09458299120888,
           "source_contribution": {
             "baseline": 1,
             "semantic": 1,
@@ -250,7 +371,7 @@
           "injected_token_count": 26,
           "injected_count": 1,
           "duplicate_jaccard_redundancy": 0.0,
-          "latency_ms": 99.8356249765493,
+          "latency_ms": 101.28295799950138,
           "source_contribution": {
             "baseline": 1,
             "semantic": 1,
@@ -276,7 +397,27 @@
           "injected_token_count": 40,
           "injected_count": 2,
           "duplicate_jaccard_redundancy": 0.03333333333333333,
-          "latency_ms": 116.78258399479091,
+          "latency_ms": 114.92195801110938,
+          "source_contribution": {
+            "baseline": 2,
+            "semantic": 2,
+            "bm25": 2
+          },
+          "injected_texts": [
+            "Igor prefers token economy, compact answers, feature toggles for risky changes, and measurable evidence before enabling new memory behavior.",
+            "Stale preference: experimental memory features can ship enabled by default without measurement."
+          ]
+        },
+        "entity_labels": {
+          "variant": "entity_labels",
+          "precision_at_k": 0.5,
+          "forbidden_hit_count": 1,
+          "expected_include_hit_count": 3,
+          "expected_include_total": 3,
+          "injected_token_count": 40,
+          "injected_count": 2,
+          "duplicate_jaccard_redundancy": 0.03333333333333333,
+          "latency_ms": 102.67041699262336,
           "source_contribution": {
             "baseline": 2,
             "semantic": 2,
@@ -296,7 +437,28 @@
           "injected_token_count": 40,
           "injected_count": 2,
           "duplicate_jaccard_redundancy": 0.03333333333333333,
-          "latency_ms": 108.72454103082418,
+          "latency_ms": 108.10629097977653,
+          "source_contribution": {
+            "entity_reason": 1,
+            "baseline": 1,
+            "semantic": 2,
+            "bm25": 2
+          },
+          "injected_texts": [
+            "Igor prefers token economy, compact answers, feature toggles for risky changes, and measurable evidence before enabling new memory behavior.",
+            "Stale preference: experimental memory features can ship enabled by default without measurement."
+          ]
+        },
+        "entity_labels_entity_tools": {
+          "variant": "entity_labels_entity_tools",
+          "precision_at_k": 0.5,
+          "forbidden_hit_count": 1,
+          "expected_include_hit_count": 3,
+          "expected_include_total": 3,
+          "injected_token_count": 40,
+          "injected_count": 2,
+          "duplicate_jaccard_redundancy": 0.03333333333333333,
+          "latency_ms": 108.00266696605831,
           "source_contribution": {
             "entity_reason": 1,
             "baseline": 1,
@@ -317,7 +479,7 @@
           "injected_token_count": 40,
           "injected_count": 2,
           "duplicate_jaccard_redundancy": 0.03333333333333333,
-          "latency_ms": 102.90325002279133,
+          "latency_ms": 105.53199995774776,
           "source_contribution": {
             "baseline": 2,
             "semantic": 2,
@@ -337,7 +499,7 @@
           "injected_token_count": 40,
           "injected_count": 2,
           "duplicate_jaccard_redundancy": 0.03333333333333333,
-          "latency_ms": 104.0067920112051,
+          "latency_ms": 104.232374986168,
           "source_contribution": {
             "baseline": 2,
             "semantic": 2,
@@ -364,7 +526,26 @@
           "injected_token_count": 25,
           "injected_count": 1,
           "duplicate_jaccard_redundancy": 0.0,
-          "latency_ms": 132.30529200518504,
+          "latency_ms": 132.5581669807434,
+          "source_contribution": {
+            "baseline": 1,
+            "semantic": 1,
+            "bm25": 1
+          },
+          "injected_texts": [
+            "Hindsight plus OpenClaw should inject compact memory snippets and log raw, deduped, injected, and token counts."
+          ]
+        },
+        "entity_labels": {
+          "variant": "entity_labels",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 0,
+          "expected_include_hit_count": 3,
+          "expected_include_total": 3,
+          "injected_token_count": 25,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 106.5157080302015,
           "source_contribution": {
             "baseline": 1,
             "semantic": 1,
@@ -383,7 +564,26 @@
           "injected_token_count": 25,
           "injected_count": 1,
           "duplicate_jaccard_redundancy": 0.0,
-          "latency_ms": 100.45766702387482,
+          "latency_ms": 103.5815830109641,
+          "source_contribution": {
+            "entity_reason": 1,
+            "semantic": 1,
+            "bm25": 1
+          },
+          "injected_texts": [
+            "Hindsight plus OpenClaw should inject compact memory snippets and log raw, deduped, injected, and token counts."
+          ]
+        },
+        "entity_labels_entity_tools": {
+          "variant": "entity_labels_entity_tools",
+          "precision_at_k": 1.0,
+          "forbidden_hit_count": 0,
+          "expected_include_hit_count": 3,
+          "expected_include_total": 3,
+          "injected_token_count": 25,
+          "injected_count": 1,
+          "duplicate_jaccard_redundancy": 0.0,
+          "latency_ms": 101.41912498511374,
           "source_contribution": {
             "entity_reason": 1,
             "semantic": 1,
@@ -402,7 +602,7 @@
           "injected_token_count": 25,
           "injected_count": 1,
           "duplicate_jaccard_redundancy": 0.0,
-          "latency_ms": 98.6363340052776,
+          "latency_ms": 99.56416697241366,
           "source_contribution": {
             "baseline": 1,
             "semantic": 1,
@@ -421,7 +621,7 @@
           "injected_token_count": 25,
           "injected_count": 1,
           "duplicate_jaccard_redundancy": 0.0,
-          "latency_ms": 101.77216597367078,
+          "latency_ms": 102.12575003970414,
           "source_contribution": {
             "baseline": 1,
             "semantic": 1,
@@ -441,6 +641,8 @@
     "trust_feedback_demoted_python_314": true,
     "entity_reason_multi_entity_hit": true,
     "structural_active_win_without_latency_regression": false,
+    "entity_labels_improved_scenarios": 0,
+    "entity_labels_plus_entity_tools_improved_scenarios": 0,
     "passed": true
   }
 }
