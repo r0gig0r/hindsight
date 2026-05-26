@@ -14,8 +14,6 @@ import re
 import time
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
-import tiktoken
-
 from .models import DirectiveInfo, LLMCall, ReflectAgentResult, TokenUsageSummary, ToolCall
 from .prompts import (
     _extract_directive_rules,
@@ -23,6 +21,7 @@ from .prompts import (
     build_final_system_prompt,
     build_system_prompt_for_tools,
 )
+from .tokenization import count_cl100k_tokens
 from .tools_schema import get_reflect_tools
 
 
@@ -266,25 +265,22 @@ OUTPUT:"""
         return None, 0, 0
 
 
-_TIKTOKEN_ENCODING = tiktoken.get_encoding("cl100k_base")
-
-
 def _count_messages_tokens(messages: list[dict[str, Any]]) -> int:
     """Estimate the token count of the messages list using cl100k_base encoding."""
     total = 0
     for msg in messages:
         content = msg.get("content") or ""
         if isinstance(content, str):
-            total += len(_TIKTOKEN_ENCODING.encode(content))
+            total += count_cl100k_tokens(content)
         elif isinstance(content, list):
             for part in content:
                 if isinstance(part, dict) and isinstance(part.get("text"), str):
-                    total += len(_TIKTOKEN_ENCODING.encode(part["text"]))
+                    total += count_cl100k_tokens(part["text"])
         # Tool call arguments and results also count
         for tc in msg.get("tool_calls") or []:
             if isinstance(tc, dict):
                 func = tc.get("function", {})
-                total += len(_TIKTOKEN_ENCODING.encode(func.get("arguments", "")))
+                total += count_cl100k_tokens(func.get("arguments", ""))
     return total
 
 
@@ -373,7 +369,12 @@ async def run_reflect_agent(
 
     # Build initial messages (directives are injected into system prompt at START and END)
     system_prompt = build_system_prompt_for_tools(
-        bank_profile, context, directives=directives, has_mental_models=has_mental_models, budget=budget
+        bank_profile,
+        context,
+        directives=directives,
+        has_mental_models=has_mental_models,
+        include_observations=include_observations,
+        budget=budget,
     )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
@@ -672,7 +673,7 @@ async def run_reflect_agent(
                 # must respect max_tokens like the forced-final paths do. If it
                 # overshoots, run one extra capped call to rewrite it within
                 # the cap.
-                if max_tokens is not None and len(_TIKTOKEN_ENCODING.encode(answer)) > max_tokens:
+                if max_tokens is not None and count_cl100k_tokens(answer) > max_tokens:
                     rewrite_start = time.time()
                     rewritten, rewrite_usage = await llm_config.call(
                         messages=[
