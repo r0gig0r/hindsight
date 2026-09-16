@@ -80,7 +80,9 @@ def _check_within_batch_duplicates(
     return result
 
 
-async def check_duplicates_batch(conn, bank_id: str, facts: list[ProcessedFact], duplicate_checker_fn) -> list[bool]:
+async def check_duplicates_batch(
+    conn, bank_id: str, facts: list[ProcessedFact], duplicate_checker_fn, *, exclude_document_id: str | None = None
+) -> list[bool]:
     """
     Check which facts are duplicates using batched time-window queries
     and within-batch pairwise comparison.
@@ -95,6 +97,8 @@ async def check_duplicates_batch(conn, bank_id: str, facts: list[ProcessedFact],
         facts: List of ProcessedFact objects to check
         duplicate_checker_fn: Async function(conn, bank_id, texts, embeddings, date, time_window_hours)
                               that returns List[bool] indicating duplicates
+        exclude_document_id: Outgoing full-replacement document, if any. Its facts
+                             cannot be dedup targets because they are about to be deleted.
 
     Returns:
         List of boolean flags (same length as facts) indicating if each fact is a duplicate
@@ -128,7 +132,10 @@ async def check_duplicates_batch(conn, bank_id: str, facts: list[ProcessedFact],
         embeddings = [item[1].embedding for item in bucket_items]
 
         # Check duplicates for this time bucket
-        dup_flags = await duplicate_checker_fn(conn, bank_id, texts, embeddings, bucket_date, time_window_hours=24)
+        scope = {"exclude_document_id": exclude_document_id} if exclude_document_id is not None else {}
+        dup_flags = await duplicate_checker_fn(
+            conn, bank_id, texts, embeddings, bucket_date, time_window_hours=24, **scope
+        )
 
         # Map results back to original indices
         for idx, is_dup in zip(indices, dup_flags):

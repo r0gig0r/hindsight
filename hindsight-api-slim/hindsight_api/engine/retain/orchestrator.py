@@ -2991,7 +2991,16 @@ async def _streaming_retain_batch(
                 dedup_start = time.time()
                 async with acquire_with_retry(pool) as dedup_conn:
                     is_dup_flags = await check_duplicates_batch(
-                        dedup_conn, bank_id, batch_processed, duplicate_checker_fn
+                        dedup_conn,
+                        bank_id,
+                        batch_processed,
+                        duplicate_checker_fn,
+                        # Only the pending full replacement deletes these facts.
+                        # Recovery/continuation and later consumer batches must still
+                        # dedup against this document's surviving/newly written facts.
+                        exclude_document_id=(
+                            effective_doc_id if is_first_batch and not is_recovery and not doc_tracking_done[0] else None
+                        ),
                     )
                 non_dup_facts = filter_duplicates(batch_processed, is_dup_flags)
                 dup_count = len(batch_processed) - len(non_dup_facts)

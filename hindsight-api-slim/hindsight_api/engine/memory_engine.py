@@ -5325,6 +5325,7 @@ class MemoryEngine(MemoryEngineInterface):
         time_window_hours: int = 24,
         similarity_threshold: float = 0.92,
         global_similarity_threshold: float = 0.98,
+        exclude_document_id: str | None = None,
     ) -> list[bool]:
         """
         Check which facts are duplicates using semantic similarity + temporal window,
@@ -5344,6 +5345,7 @@ class MemoryEngine(MemoryEngineInterface):
             time_window_hours: Hours before/after event_date to search (default: 24)
             similarity_threshold: Minimum cosine similarity to consider duplicate (default: 0.92)
             global_similarity_threshold: Higher threshold for global (no time window) check (default: 0.98)
+            exclude_document_id: Document whose outgoing facts will be deleted by replacement.
 
         Returns:
             List of booleans - True if fact is a duplicate (should skip), False if new
@@ -5368,10 +5370,12 @@ class MemoryEngine(MemoryEngineInterface):
             FROM {fq_table("memory_units")}
             WHERE bank_id = $1
               AND event_date BETWEEN $2 AND $3
+              AND ($4::text IS NULL OR document_id IS DISTINCT FROM $4::text)
             """,
             bank_id,
             time_lower,
             time_upper,
+            exclude_document_id,
         )
 
         # If no existing facts in time window, nothing is duplicate from time-window check
@@ -5409,6 +5413,7 @@ class MemoryEngine(MemoryEngineInterface):
                     FROM {fq_table("memory_units")}
                     WHERE bank_id = $2
                       AND (event_date < $3 OR event_date > $4)
+                      AND ($5::text IS NULL OR document_id IS DISTINCT FROM $5::text)
                     ORDER BY embedding <=> $1::vector
                     LIMIT 1
                     """,
@@ -5416,6 +5421,7 @@ class MemoryEngine(MemoryEngineInterface):
                     bank_id,
                     time_lower,
                     time_upper,
+                    exclude_document_id,
                 )
                 if nearest and nearest["similarity"] > global_similarity_threshold:
                     is_duplicate[i] = True
