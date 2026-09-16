@@ -21,6 +21,16 @@ def _read_mcp_server_source() -> str:
     return open(os.path.join(SCRIPTS_DIR, "mcp_server.py"), encoding="utf-8").read()
 
 
+class TestDefaultBankUsesProjectCwd:
+    """The MCP server must derive its default bank from Claude's project cwd."""
+
+    def test_default_bank_prefers_launcher_project_cwd(self):
+        src = _read_mcp_server_source()
+        assert "HINDSIGHT_MCP_PROJECT_CWD" in src
+        assert 'os.environ.get("HINDSIGHT_MCP_PROJECT_CWD", os.getcwd())' in src
+        assert '_hook_input = {"cwd": _project_cwd, "session_id": ""}' in src
+
+
 class TestListPagesUsesMetadataProjection:
     """`agent_knowledge_list_pages` must request the API's metadata projection.
 
@@ -42,6 +52,28 @@ class TestListPagesUsesMetadataProjection:
         assert list_pages_def > 0 and next_def > list_pages_def
         list_pages_body = src[list_pages_def:next_def]
         assert "detail=metadata" in list_pages_body
+
+
+class TestDisabledKnowledgeToolsKeepsServerAlive:
+    """When `enableKnowledgeTools` is false the server must NOT exit at startup.
+
+    `.mcp.json` registers this server unconditionally, so Claude Code expects a
+    live process. If the server exits immediately (the old behavior), Claude
+    Code treats it as a crashed server and surfaces a `-32000` reconnect error
+    on every prompt (issue #1995). The disabled path must instead run an empty
+    MCP server (`mcp.run`) so the process stays alive with no tools registered.
+    """
+
+    def test_disabled_branch_runs_empty_server_not_bare_exit(self):
+        src = _read_mcp_server_source()
+        gate = src.find('if not _config.get("enableKnowledgeTools")')
+        assert gate > 0, "expected the enableKnowledgeTools startup gate"
+        # The disabled branch ends at the next top-level statement (`try:`).
+        branch = src[gate : src.find("\ntry:", gate)]
+        assert "mcp.run(transport=\"stdio\")" in branch, (
+            "disabled path must run an empty MCP server so the process stays "
+            "alive — exiting triggers a -32000 reconnect loop (issue #1995)"
+        )
 
 
 class TestGetPageUsesContentProjection:

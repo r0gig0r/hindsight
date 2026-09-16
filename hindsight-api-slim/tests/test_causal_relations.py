@@ -15,6 +15,8 @@ from hindsight_api import LLMConfig
 from hindsight_api.config import _get_raw_config
 from hindsight_api.engine.retain.fact_extraction import extract_facts_from_text
 
+pytestmark = pytest.mark.hs_llm_core
+
 
 class TestCausalRelationsValidation:
     """Tests for causal relations index validation."""
@@ -61,9 +63,7 @@ class TestCausalRelationsValidation:
                     assert rel.target_fact_index >= 0, (
                         f"Fact {i} has negative causal relation index: {rel.target_fact_index}"
                     )
-                    assert rel.relation_type in ["caused_by", "enabled_by", "prevented_by"], (
-                        f"Invalid relation_type: {rel.relation_type}"
-                    )
+                    assert rel.relation_type == "caused_by", f"Invalid relation_type: {rel.relation_type}"
 
     @pytest.mark.asyncio
     async def test_first_fact_has_no_causal_relations(self):
@@ -102,8 +102,7 @@ class TestCausalRelationsValidation:
             for rel in facts[0].causal_relations:
                 # This should never happen due to validation
                 assert False, (
-                    f"First fact should not have causal relations, "
-                    f"but found: target_index={rel.target_fact_index}"
+                    f"First fact should not have causal relations, but found: target_index={rel.target_fact_index}"
                 )
 
     @pytest.mark.asyncio
@@ -137,11 +136,13 @@ class TestCausalRelationsValidation:
         for i, fact in enumerate(facts):
             if fact.causal_relations:
                 for rel in fact.causal_relations:
-                    all_relations.append({
-                        "from_fact": i,
-                        "to_fact": rel.target_fact_index,
-                        "type": rel.relation_type,
-                    })
+                    all_relations.append(
+                        {
+                            "from_fact": i,
+                            "to_fact": rel.target_fact_index,
+                            "type": rel.relation_type,
+                        }
+                    )
 
         # If causal relations were extracted, verify they form a valid chain
         if all_relations:
@@ -193,10 +194,10 @@ class TestCausalRelationsValidation:
             )
 
     @pytest.mark.asyncio
-    async def test_relation_types_are_backward_looking(self):
+    async def test_relation_types_use_the_canonical_form(self):
         """
-        Test that all relation types describe how the current fact
-        relates to a previous fact (caused_by, enabled_by, prevented_by).
+        Test that all extracted relation types use the canonical backward-looking
+        ``caused_by`` form.
         """
         text = """
         Alice learned Python programming.
@@ -217,13 +218,9 @@ class TestCausalRelationsValidation:
             config=_get_raw_config(),
         )
 
-        # Verify relation types are all backward-looking
-        valid_types = {"caused_by", "enabled_by", "prevented_by"}
-
         for i, fact in enumerate(facts):
             if fact.causal_relations:
                 for rel in fact.causal_relations:
-                    assert rel.relation_type in valid_types, (
-                        f"Invalid relation_type '{rel.relation_type}'. "
-                        f"Must be one of: {valid_types}"
+                    assert rel.relation_type == "caused_by", (
+                        f"Invalid relation_type '{rel.relation_type}'. Must be 'caused_by'"
                     )

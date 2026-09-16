@@ -7,6 +7,7 @@ limits (e.g. DashScope / Aliyun Tongyi cap at 10). Users must be able to overrid
 the batch size via env var so `encode()` splits into smaller chunks.
 """
 
+import json
 import os
 
 import pytest
@@ -22,6 +23,7 @@ def setup_test_env():
         "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY",
         "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL",
         "HINDSIGHT_API_EMBEDDINGS_OPENAI_BATCH_SIZE",
+        "HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS",
         "HINDSIGHT_API_EMBEDDINGS_OPENROUTER_API_KEY",
         "HINDSIGHT_API_LLM_API_KEY",
         "HINDSIGHT_API_LLM_PROVIDER",
@@ -64,6 +66,17 @@ def test_openai_batch_size_env_var_is_read():
     assert config.embeddings_openai_batch_size == 10
 
 
+def test_openai_dimensions_env_var_is_read():
+    """HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS requests reduced OpenAI output dims."""
+    from hindsight_api.config import HindsightConfig
+
+    os.environ["HINDSIGHT_API_LLM_PROVIDER"] = "mock"
+    os.environ["HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS"] = "384"
+
+    config = HindsightConfig.from_env()
+    assert config.embeddings_openai_dimensions == 384
+
+
 def test_openai_embeddings_provider_uses_configured_batch_size():
     """create_embeddings_from_env() propagates config to OpenAIEmbeddings for 'openai' provider."""
     from hindsight_api.engine.embeddings import OpenAIEmbeddings, create_embeddings_from_env
@@ -90,6 +103,45 @@ def test_openrouter_provider_uses_configured_batch_size():
     embeddings = create_embeddings_from_env()
     assert isinstance(embeddings, OpenAIEmbeddings)
     assert embeddings.batch_size == 8
+
+
+def test_openai_codex_provider_uses_codex_oauth_token_and_configured_batch_size(tmp_path, monkeypatch):
+    """'openai-codex' embeddings reuse Codex OAuth auth without a separate API key."""
+    from hindsight_api.engine.embeddings import CodexOAuthEmbeddings, create_embeddings_from_env
+
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "codex-oauth-token-test",
+                    "account_id": "acct-test",
+                },
+            }
+        )
+    )
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # Codex auth resolves via CODEX_HOME first (falling back to ~/.codex), so a
+    # CODEX_HOME leaking in from the runner's environment would point auth.json
+    # away from the tmp_path fixture. Pin resolution to the patched HOME.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    os.environ["HINDSIGHT_API_LLM_PROVIDER"] = "mock"
+    os.environ["HINDSIGHT_API_EMBEDDINGS_PROVIDER"] = "openai-codex"
+    os.environ["HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL"] = "text-embedding-3-small"
+    os.environ["HINDSIGHT_API_EMBEDDINGS_OPENAI_BATCH_SIZE"] = "7"
+    os.environ["HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS"] = "384"
+
+    embeddings = create_embeddings_from_env()
+    assert isinstance(embeddings, CodexOAuthEmbeddings)
+    assert embeddings.provider_name == "openai-codex"
+    assert embeddings.model == "text-embedding-3-small"
+    assert embeddings.base_url == "https://api.openai.com/v1"
+    assert embeddings.api_key == "codex-oauth-token-test"
+    assert embeddings.batch_size == 7
+    assert embeddings.dimensions == 384
 
 
 def test_zero_batch_size_is_rejected():
@@ -125,26 +177,57 @@ def test_non_numeric_batch_size_is_rejected():
         HindsightConfig.from_env()
 
 
-def test_openai_encode_splits_on_configured_batch_size(monkeypatch):
+async def test_openai_encode_splits_on_configured_batch_size(monkeypatch):
     """encode() sends multiple upstream requests when len(texts) > batch_size."""
     from types import SimpleNamespace
 
+    from hindsight_api.engine.aiohttp_session import LoopLocal
     from hindsight_api.engine.embeddings import OpenAIEmbeddings
 
     emb = OpenAIEmbeddings(api_key="sk-test", model="text-embedding-3-small", batch_size=10)
 
     calls: list[int] = []
 
-    def fake_create(*, model, input):
+    async def fake_create(*, model, input):
         calls.append(len(input))
         return SimpleNamespace(data=[SimpleNamespace(index=i, embedding=[0.0] * 1536) for i in range(len(input))])
 
-    emb._client = SimpleNamespace(embeddings=SimpleNamespace(create=fake_create))
+    fake_client = SimpleNamespace(api_key="sk-test", embeddings=SimpleNamespace(create=fake_create))
+    emb._clients = LoopLocal(lambda: fake_client)
     emb._dimension = 1536
 
-    vectors = emb.encode(["x"] * 25)
+    vectors = await emb.encode(["x"] * 25)
 
+    assert calls == [10, 10, 5]
     assert len(vectors) == 25
-    assert calls == [10, 10, 5], (
-        f"Expected upstream calls of size 10, 10, 5 when batch_size=10 and 25 inputs, got {calls}"
+
+
+async def test_openai_encode_passes_configured_dimensions():
+    """OpenAI embeddings requests include the optional dimensions parameter when configured."""
+    from types import SimpleNamespace
+
+    from hindsight_api.engine.aiohttp_session import LoopLocal
+    from hindsight_api.engine.embeddings import OpenAIEmbeddings
+
+    emb = OpenAIEmbeddings(
+        api_key="sk-test",
+        model="text-embedding-3-small",
+        batch_size=10,
+        dimensions=384,
     )
+
+    calls: list[int | None] = []
+
+    async def fake_create(*, model, input, dimensions=None):
+        calls.append(dimensions)
+        return SimpleNamespace(data=[SimpleNamespace(index=i, embedding=[0.0] * 384) for i in range(len(input))])
+
+    fake_client = SimpleNamespace(api_key="sk-test", embeddings=SimpleNamespace(create=fake_create))
+    emb._clients = LoopLocal(lambda: fake_client)
+    emb._dimension = 384
+
+    vectors = await emb.encode(["x"] * 2)
+
+    assert calls == [384]
+    assert len(vectors) == 2
+    assert len(vectors[0]) == 384

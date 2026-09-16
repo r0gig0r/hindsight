@@ -1,6 +1,6 @@
 name: hindsight
 # Docker Compose file for Hindsight with PostgreSQL and vectorchord
-# docker compose -f docker/docker-compose/docker-compose.yaml down && sleep 2 && docker compose -f docker/docker-compose/docker-compose.yaml up -d
+# docker compose -f docker/docker-compose/vchord/docker-compose.yaml down && sleep 2 && docker compose -f docker/docker-compose/vchord/docker-compose.yaml up -d
 # Make sure to set the required environment variables before running:
 # - HINDSIGHT_DB_PASSWORD: Password for the PostgreSQL user
 # - Configure LLM provider variables as needed (see below in the hindsight service)
@@ -70,7 +70,7 @@ services:
       # LLM Configuration (uses OpenAI for testing vchord)
       # LLM configuration
       HINDSIGHT_API_LLM_PROVIDER: ${HINDSIGHT_API_LLM_PROVIDER:-openai}
-      HINDSIGHT_API_LLM_API_KEY: ${OPENAI_API_KEY:-your-api-key}
+      HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_API_LLM_API_KEY:-}
 
       # Database Configuration
       HINDSIGHT_API_DATABASE_URL: postgresql://${HINDSIGHT_DB_USER:-hindsight_user}:${HINDSIGHT_DB_PASSWORD:-hindsight_password}@db:5432/${HINDSIGHT_DB_NAME:-hindsight_db}

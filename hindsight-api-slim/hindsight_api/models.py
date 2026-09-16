@@ -2,9 +2,13 @@
 SQLAlchemy models for the memory system.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import TYPE_CHECKING
 from uuid import UUID as PyUUID
+
+if TYPE_CHECKING:
+    from .cancellation import CancellationToken
 
 
 @dataclass
@@ -13,8 +17,9 @@ class RequestContext:
     Context for request authentication and authorization.
 
     This dataclass carries authentication data from HTTP requests to the
-    memory engine operations. It can be extended to include additional
-    context like headers, tokens, user info, etc.
+    memory engine operations. Beyond the Authorization header, a deployment can
+    surface additional request headers to its extensions via ``extra_headers``
+    (see HINDSIGHT_API_EXTENSION_PASSTHROUGH_HEADERS).
     """
 
     api_key: str | None = None
@@ -30,6 +35,29 @@ class RequestContext:
     # validators that want exponential backoff on repeated failures (e.g.
     # "defer for 2^retry_count minutes") without querying the DB themselves.
     retry_count: int = 0
+    # Cooperative cancellation signal for long-running operations. The HTTP
+    # layer sets this to a token that fires when the client disconnects; the
+    # engine checks it at stage boundaries and aborts abandoned work so it stops
+    # consuming CPU/DB resources (issue #2122). None means "never cancelled" —
+    # every checkpoint is a no-op.
+    cancellation: "CancellationToken | None" = None
+    # Request headers an operator opted into forwarding to extensions, keyed by
+    # lower-cased header name. Populated by the HTTP and MCP transports from the
+    # HINDSIGHT_API_EXTENSION_PASSTHROUGH_HEADERS allowlist; always empty unless
+    # that variable is set, and it never carries a header absent from the
+    # request. Lets a custom TenantExtension read an identity signal that isn't
+    # the Authorization header — e.g. a per-caller assertion sent alongside a
+    # shared bearer token by an authenticating proxy.
+    extra_headers: dict[str, str] = field(default_factory=dict)
+
+    def raise_if_cancelled(self) -> None:
+        """Abort the current operation if its cancellation token has fired.
+
+        A no-op when no token is attached, so engine code can call it at every
+        stage boundary without caring whether the caller opted into cancellation.
+        """
+        if self.cancellation is not None:
+            self.cancellation.raise_if_cancelled()
 
 
 from pgvector.sqlalchemy import Vector
@@ -265,6 +293,8 @@ class MemoryLink(Base):
     entity = relationship("Entity", back_populates="memory_links")
 
     __table_args__ = (
+        # Retain writes ``caused_by`` only. Keep the historical causal values
+        # valid so existing rows and transfer archives remain queryable.
         CheckConstraint(
             "link_type IN ('temporal', 'semantic', 'entity', 'causes', 'caused_by', 'enables', 'prevents')",
             name="memory_links_link_type_check",

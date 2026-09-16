@@ -16,7 +16,7 @@
 import { basename, dirname } from "node:path";
 import { execFileSync } from "node:child_process";
 import type { HindsightConfig } from "./config.js";
-import { debugLog } from "./config.js";
+import { Logger } from "./logger.js";
 import type { HindsightClient } from "@vectorize-io/hindsight-client";
 
 const DEFAULT_BANK_NAME = "opencode";
@@ -25,11 +25,10 @@ const VALID_FIELDS = new Set(["agent", "project", "gitProject", "channel", "user
 /**
  * Resolve the main worktree root for a directory inside a git repository.
  *
- * Uses `git rev-parse --path-format=absolute --git-common-dir`, which always
- * points to the .git directory of the *main* worktree, even when invoked from
- * a linked worktree (created with `git worktree add`). The parent of that path
- * is the main worktree root, so all linked worktrees of the same repo resolve
- * to the same root and end up sharing one memory bank.
+ * Uses `git rev-parse --path-format=absolute --git-common-dir`, which points to
+ * the shared metadata directory even when invoked from a linked worktree. For
+ * regular clones that directory is the main worktree's `.git`; for bare-hubs it
+ * is the bare directory beside the worktrees.
  *
  * Returns `null` when git is unavailable, the directory is not a repo, or the
  * git invocation fails for any other reason.
@@ -48,15 +47,35 @@ function getProjectRootFromGit(directory: string): string | null {
       }
     ).trim();
     if (!commonDir) return null;
-    // For typical clones and `git worktree add`, common-dir is `<root>/.git`,
-    // so the parent is the main worktree root. For bare repos, common-dir is
-    // the bare directory itself (e.g. `myrepo.git`); use it directly.
+    // For typical clones and `git worktree add`, common-dir is `<root>/.git`.
     if (basename(commonDir) === ".git") {
       return dirname(commonDir);
     }
+
+    // In a bare-hub, a hidden common dir such as `.bare` is plumbing beside the worktrees. A
+    // standalone bare clone is named by its own directory, so only unwrap hidden bare dirs.
+    if (basename(commonDir).startsWith(".") && isBareRepository(commonDir)) {
+      return dirname(commonDir);
+    }
+
     return commonDir;
   } catch {
     return null;
+  }
+}
+
+function isBareRepository(commonDir: string): boolean {
+  try {
+    return (
+      execFileSync("git", ["-C", commonDir, "rev-parse", "--is-bare-repository"], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1000,
+        env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined },
+      }).trim() === "true"
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -121,7 +140,8 @@ export async function ensureBankMission(
   client: HindsightClient,
   bankId: string,
   config: HindsightConfig,
-  missionsSet: Set<string>
+  missionsSet: Set<string>,
+  logger: Logger = new Logger({ silent: true })
 ): Promise<void> {
   const mission = config.bankMission;
   if (!mission?.trim()) return;
@@ -140,9 +160,9 @@ export async function ensureBankMission(
         missionsSet.delete(k);
       }
     }
-    debugLog(config, `Set mission for bank: ${bankId}`);
+    logger.debug(`Set mission for bank: ${bankId}`);
   } catch (e) {
     // Don't fail if mission set fails — bank may not exist yet
-    debugLog(config, `Could not set bank mission for ${bankId}: ${e}`);
+    logger.debug(`Could not set bank mission for ${bankId}`, { error: String(e) });
   }
 }

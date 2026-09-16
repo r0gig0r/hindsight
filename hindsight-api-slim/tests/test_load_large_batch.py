@@ -21,7 +21,7 @@ from hindsight_api.engine.cross_encoder import LocalSTCrossEncoder
 from hindsight_api.engine.query_analyzer import DateparserQueryAnalyzer
 from hindsight_api.engine.task_backend import SyncTaskBackend
 from hindsight_api.engine.retain.fact_extraction import FactExtractionResponse, ExtractedFact
-from hindsight_api.engine.llm_wrapper import TokenUsage
+from hindsight_api.engine.response_models import LLMCallResult, TokenUsage
 
 logger = logging.getLogger(__name__)
 
@@ -72,21 +72,23 @@ def create_mock_facts_from_content(content: str, ratio: float = 1.5, max_facts: 
     If content has N sentences, return approximately N * ratio facts (capped at max_facts).
     """
     # Estimate sentences by splitting on periods
-    sentences = [s.strip() for s in content.split('.') if s.strip()]
+    sentences = [s.strip() for s in content.split(".") if s.strip()]
     num_facts = min(max(1, int(len(sentences) * ratio)), max_facts)
 
     facts = []
     for i in range(num_facts):
-        facts.append({
-            "what": f"Mock fact {i}: Something happened based on the content",
-            "when": "2024-06-15",
-            "where": "San Francisco",
-            "who": "John, Sarah",
-            "why": "Business reasons",
-            "fact_type": "world",
-            "entities": [{"text": "John", "type": "PERSON"}],
-            "causal_relations": [],
-        })
+        facts.append(
+            {
+                "what": f"Mock fact {i}: Something happened based on the content",
+                "when": "2024-06-15",
+                "where": "San Francisco",
+                "who": "John, Sarah",
+                "why": "Business reasons",
+                "fact_type": "world",
+                "entities": [{"text": "John", "type": "PERSON"}],
+                "causal_relations": [],
+            }
+        )
 
     return facts
 
@@ -122,6 +124,7 @@ class TestLargeBatchRetain:
     @pytest.fixture
     def disable_observations(self):
         from hindsight_api.config import _get_raw_config
+
         config = _get_raw_config()
         original = config.enable_observations
         config.enable_observations = False
@@ -147,11 +150,13 @@ class TestLargeBatchRetain:
         contents = []
         for i in range(num_items):
             content_text = generate_content(chars_per_item)
-            contents.append({
-                "content": content_text,
-                "context": f"Test content item {i + 1} of {num_items}",
-                "event_date": datetime.now(UTC),
-            })
+            contents.append(
+                {
+                    "content": content_text,
+                    "context": f"Test content item {i + 1} of {num_items}",
+                    "event_date": datetime.now(UTC),
+                }
+            )
 
         actual_total_chars = sum(len(c["content"]) for c in contents)
         logger.info(f"Created {num_items} content items with {actual_total_chars:,} total chars")
@@ -165,10 +170,9 @@ class TestLargeBatchRetain:
             # Consolidation calls expect a _ConsolidationBatchResponse (not a raw dict),
             # because consolidation does NOT use skip_validation=True.
             if kwargs.get("scope") == "consolidation":
-                return_usage = kwargs.get("return_usage", False)
-                if return_usage:
-                    return _ConsolidationBatchResponse(), TokenUsage(input_tokens=0, output_tokens=0)
-                return _ConsolidationBatchResponse()
+                return LLMCallResult(
+                    content=_ConsolidationBatchResponse(), usage=TokenUsage(input_tokens=0, output_tokens=0)
+                )
 
             call_tracker["count"] += 1
 
@@ -181,17 +185,14 @@ class TestLargeBatchRetain:
             # Return a dict (parsed JSON) — fact extraction uses skip_validation=True
             response_dict = {"facts": mock_facts}
 
-            return_usage = kwargs.get("return_usage", False)
-            if return_usage:
-                usage = TokenUsage(
-                    input_tokens=len(user_msg) // 4,
-                    output_tokens=len(json.dumps(response_dict)) // 4,
-                )
-                return response_dict, usage
-            return response_dict
+            usage = TokenUsage(
+                input_tokens=len(user_msg) // 4,
+                output_tokens=len(json.dumps(response_dict)) // 4,
+            )
+            return LLMCallResult(content=response_dict, usage=usage)
 
         # Patch LLMProvider.call at the class level
-        with patch('hindsight_api.engine.llm_wrapper.LLMProvider.call', new=mock_llm_call):
+        with patch("hindsight_api.engine.llm_wrapper.LLMProvider.call", new=mock_llm_call):
             start_time = time.time()
 
             try:
@@ -247,11 +248,13 @@ class TestLargeBatchRetain:
 
         contents = []
         for i in range(num_items):
-            contents.append({
-                "content": generate_content(chars_per_item),
-                "context": f"Chunk test item {i + 1}",
-                "event_date": datetime.now(UTC),
-            })
+            contents.append(
+                {
+                    "content": generate_content(chars_per_item),
+                    "context": f"Chunk test item {i + 1}",
+                    "event_date": datetime.now(UTC),
+                }
+            )
 
         actual_total_chars = sum(len(c["content"]) for c in contents)
         logger.info(f"Created {num_items} items with {actual_total_chars:,} chars (should trigger chunking)")
@@ -260,22 +263,18 @@ class TestLargeBatchRetain:
             from hindsight_api.engine.consolidation.consolidator import _ConsolidationBatchResponse
 
             if kwargs.get("scope") == "consolidation":
-                return_usage = kwargs.get("return_usage", False)
-                if return_usage:
-                    return _ConsolidationBatchResponse(), TokenUsage(input_tokens=0, output_tokens=0)
-                return _ConsolidationBatchResponse()
+                return LLMCallResult(
+                    content=_ConsolidationBatchResponse(), usage=TokenUsage(input_tokens=0, output_tokens=0)
+                )
 
             messages = kwargs.get("messages", args[0] if args else [])
             user_msg = messages[-1]["content"] if messages else ""
             mock_facts = create_mock_facts_from_content(user_msg, ratio=1.0)
             response_dict = {"facts": mock_facts}
 
-            return_usage = kwargs.get("return_usage", False)
-            if return_usage:
-                return response_dict, TokenUsage(input_tokens=100, output_tokens=50)
-            return response_dict
+            return LLMCallResult(content=response_dict, usage=TokenUsage(input_tokens=100, output_tokens=50))
 
-        with patch('hindsight_api.engine.llm_wrapper.LLMProvider.call', new=mock_llm_call):
+        with patch("hindsight_api.engine.llm_wrapper.LLMProvider.call", new=mock_llm_call):
             start_time = time.time()
 
             result = await memory.retain_batch_async(
@@ -305,26 +304,34 @@ class TestLargeBatchRetain:
         async def mock_llm_call(*args, **kwargs):
             # Small delay to simulate real LLM latency
             await asyncio.sleep(0.01)
-            mock_facts = [{"what": "Test fact", "when": "now", "where": "here",
-                          "who": "someone", "why": "testing", "fact_type": "world",
-                          "entities": [], "causal_relations": []}]
+            mock_facts = [
+                {
+                    "what": "Test fact",
+                    "when": "now",
+                    "where": "here",
+                    "who": "someone",
+                    "why": "testing",
+                    "fact_type": "world",
+                    "entities": [],
+                    "causal_relations": [],
+                }
+            ]
             response_dict = {"facts": mock_facts}
 
-            return_usage = kwargs.get("return_usage", False)
-            if return_usage:
-                return response_dict, TokenUsage(input_tokens=10, output_tokens=10)
-            return response_dict
+            return LLMCallResult(content=response_dict, usage=TokenUsage(input_tokens=10, output_tokens=10))
 
-        with patch('hindsight_api.engine.llm_wrapper.LLMProvider.call', new=mock_llm_call):
+        with patch("hindsight_api.engine.llm_wrapper.LLMProvider.call", new=mock_llm_call):
             # Run 10 concurrent retain operations
             tasks = []
             for i in range(10):
                 bank_id = f"pool-test-{uuid.uuid4().hex[:8]}"
-                contents = [{
-                    "content": f"Test content for concurrent operation {i}. " * 50,
-                    "context": f"Pool test {i}",
-                    "event_date": datetime.now(UTC),
-                }]
+                contents = [
+                    {
+                        "content": f"Test content for concurrent operation {i}. " * 50,
+                        "context": f"Pool test {i}",
+                        "event_date": datetime.now(UTC),
+                    }
+                ]
                 tasks.append(
                     memory.retain_batch_async(bank_id=bank_id, contents=contents, request_context=request_context)
                 )

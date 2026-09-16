@@ -12,7 +12,7 @@ import {
   LuNetwork, LuCode, LuLayers, LuCpu, LuHardDrive,
   LuArrowUpRight, LuBookOpen, LuRss, LuCloud, LuMessageCircle,
   LuChartBar, LuChartColumn, LuStar, LuCircleHelp,
-  LuLayoutTemplate, LuFileJson,
+  LuLayoutTemplate, LuFileJson, LuEraser, LuBookText,
 } from 'react-icons/lu';
 import {SiGo, SiPython, SiGithub, SiSlack, SiDocker, SiKubernetes, SiNodedotjs} from 'react-icons/si';
 
@@ -61,6 +61,8 @@ const ICON_MAP: Record<string, IconType> = {
   'lu-file-text':   LuFileText,
   'lu-layout-template': LuLayoutTemplate,
   'lu-file-json':   LuFileJson,
+  'lu-eraser':      LuEraser,
+  'lu-book-text':   LuBookText,
 };
 
 type Props = WrapperProps<typeof LinkType>;

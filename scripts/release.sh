@@ -91,6 +91,19 @@ for pin_file in "${META_PIN_FILES[@]}"; do
     fi
 done
 
+# hindsight-all also bundles the embedded daemon. Keep it in lockstep with the
+# metapackage so upgrades cannot retain an older, still-compatible release.
+EMBED_PIN_FILES=("hindsight-all/pyproject.toml" "hindsight-all-slim/pyproject.toml")
+for pin_file in "${EMBED_PIN_FILES[@]}"; do
+    if [ -f "$pin_file" ]; then
+        print_info "Repinning hindsight-embed in $pin_file"
+        sed -i.bak -E "s/\"hindsight-embed(==|>=)[0-9]+\.[0-9]+\.[0-9]+\"/\"hindsight-embed==$VERSION\"/g" "$pin_file"
+        rm "${pin_file}.bak"
+    else
+        print_warn "File $pin_file not found, skipping"
+    fi
+done
+
 DEV_PYPROJECT="hindsight-dev/pyproject.toml"
 if [ -f "$DEV_PYPROJECT" ]; then
     print_info "Repinning hindsight-api in $DEV_PYPROJECT"
@@ -173,6 +186,17 @@ if [ -f "$TYPESCRIPT_CLIENT_PKG" ]; then
     rm "${TYPESCRIPT_CLIENT_PKG}.bak"
 else
     print_warn "File $TYPESCRIPT_CLIENT_PKG not found, skipping"
+fi
+
+# Refresh root package-lock.json so workspace versions match the bumped
+# package.json files. Without this, `npm ci` in CI fails with
+# "Missing @vectorize-io/hindsight-client@<old-version> from lock file"
+# and the npm-publish + docs-deploy jobs break.
+print_info "Refreshing root package-lock.json to match bumped workspace versions..."
+if npm install --ignore-scripts --no-audit --no-fund > /dev/null 2>&1; then
+    print_info "✓ package-lock.json refreshed"
+else
+    print_warn "npm install failed; package-lock.json may be stale"
 fi
 
 # Update documentation version (creates new version or syncs to existing)

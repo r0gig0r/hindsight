@@ -1,11 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use std::fs;
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
-use crate::api::{
-    ApiClient, MemoryItem, MemoryItemTimestamp, RecallRequest, ReflectRequest, RetainRequest,
-};
+use crate::api::{ApiClient, MemoryItem, RecallRequest, ReflectRequest, RetainRequest};
 use crate::config;
 use crate::output::{self, OutputFormat};
 use crate::ui;
@@ -13,30 +12,28 @@ use crate::ui;
 // Import types from generated client
 use hindsight_client::types::{
     Budget, ChunkIncludeOptions, FactsIncludeOptions, IncludeOptions, ReflectIncludeOptions,
-    TagsMatch,
+    TagsMatch, TemporalWindow,
 };
 use serde::Deserialize;
 use serde_json;
 
-// Local types for serde_json::Value deserialization
+// Local types for serde_json::Value deserialization.
+//
+// Field names/shapes must mirror what `GET /memories/{memory_id}` actually
+// returns (see MemoryEngine.get_memory_unit): the fact type is exposed as
+// `type`, and `entities` is a flat list of canonical-name strings, not objects.
 #[derive(Debug, Deserialize)]
 struct MemoryUnitDetail {
     id: String,
     text: String,
-    #[serde(rename = "fact_type")]
+    #[serde(rename = "type")]
     type_: Option<String>,
     document_id: Option<String>,
     context: Option<String>,
     occurred_start: Option<String>,
     occurred_end: Option<String>,
-    entities: Option<Vec<EntityRef>>,
+    entities: Option<Vec<String>>,
     tags: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EntityRef {
-    id: String,
-    name: String,
 }
 
 // Helper function to parse budget string to Budget enum
@@ -49,6 +46,51 @@ fn parse_budget(budget: &str) -> Budget {
 }
 
 // Helper function to parse tags_match string to TagsMatch enum
+/// Build the recall temporal window from --window-start / --window-end.
+///
+/// Both ends are required: one alone is an incomplete range, not a half-open
+/// filter, and silently searching without the window the user asked for is
+/// worse than saying so. A datetime with no offset is read as UTC, matching how
+/// the API treats one.
+fn parse_temporal_window(
+    window_start: &Option<String>,
+    window_end: &Option<String>,
+) -> Result<Option<TemporalWindow>> {
+    match (window_start, window_end) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(anyhow!("--window-start requires --window-end")),
+        (None, Some(_)) => Err(anyhow!("--window-end requires --window-start")),
+        (Some(start), Some(end)) => {
+            let start = parse_window_bound(start, "--window-start")?;
+            let end = parse_window_bound(end, "--window-end")?;
+            if end < start {
+                return Err(anyhow!(
+                    "--window-end must not be earlier than --window-start"
+                ));
+            }
+            Ok(Some(TemporalWindow { start, end }))
+        }
+    }
+}
+
+fn parse_window_bound(value: &str, flag: &str) -> Result<DateTime<Utc>> {
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+        return Ok(parsed.with_timezone(&Utc));
+    }
+    // No offset: read as UTC, as the API does.
+    for format in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(value, format) {
+            return Ok(naive.and_utc());
+        }
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        return Ok(date.and_hms_opt(0, 0, 0).unwrap().and_utc());
+    }
+    Err(anyhow!(
+        "{flag} must be an ISO 8601 datetime (e.g. 2023-04-01T00:00:00Z or 2023-04-01), got {value:?}"
+    ))
+}
+
 fn parse_tags_match(tags_match: &Option<String>) -> TagsMatch {
     match tags_match
         .as_deref()
@@ -107,10 +149,7 @@ pub fn list(
                     println!("  {}", ui::dim("No memories found."));
                 } else {
                     for item in &result.items {
-                        let fact_type = item
-                            .get("fact_type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
+                        let fact_type = item.fact_type.as_deref().unwrap_or("unknown");
                         let type_t = match fact_type {
                             "world" => 0.0,
                             "experience" => 0.5,
@@ -119,22 +158,20 @@ pub fn list(
                             _ => 0.5,
                         };
 
-                        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
-
                         println!(
                             "  {} {}",
                             ui::gradient(&format!("[{}]", fact_type.to_uppercase()), type_t),
-                            ui::dim(id)
+                            ui::dim(&item.id)
                         );
 
                         // Truncate text if too long
-                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                            let text_preview: String = text.chars().take(100).collect();
-                            let ellipsis = if text.len() > 100 { "..." } else { "" };
+                        if !item.text.is_empty() {
+                            let text_preview: String = item.text.chars().take(100).collect();
+                            let ellipsis = if item.text.len() > 100 { "..." } else { "" };
                             println!("    {}{}", text_preview, ellipsis);
                         }
 
-                        if let Some(doc_id) = item.get("document_id").and_then(|v| v.as_str()) {
+                        if let Some(doc_id) = item.document_id.as_deref() {
                             println!("    {} {}", ui::dim("doc:"), ui::dim(doc_id));
                         }
                         println!();
@@ -226,7 +263,7 @@ pub fn get(
                         println!();
                         println!("{}", ui::gradient_text("─── Entities ───"));
                         for entity in entities {
-                            println!("  • {} ({})", entity.name, entity.id);
+                            println!("  • {}", entity);
                         }
                     }
                 }
@@ -281,9 +318,14 @@ pub fn recall(
     tags: Vec<String>,
     tags_match: Option<String>,
     query_timestamp: Option<String>,
+    prefer_observations: bool,
+    window_start: Option<String>,
+    window_end: Option<String>,
     verbose: bool,
     output_format: OutputFormat,
 ) -> Result<()> {
+    let temporal_window = parse_temporal_window(&window_start, &window_end)?;
+
     let spinner = if output_format == OutputFormat::Pretty {
         Some(ui::create_spinner("Recalling memories..."))
     } else {
@@ -314,10 +356,13 @@ pub fn recall(
         max_tokens,
         trace,
         query_timestamp,
+        prefer_observations,
         include,
         tags: if tags.is_empty() { None } else { Some(tags) },
         tags_match: parse_tags_match(&tags_match),
         tag_groups: None,
+        min_scores: None,
+        temporal_window,
     };
 
     let response = client.recall(agent_id, &request, verbose);
@@ -409,6 +454,7 @@ pub fn reflect(
         tags: if tags.is_empty() { None } else { Some(tags) },
         tags_match: parse_tags_match(&tags_match),
         tag_groups: None,
+        apply_all_directives: false,
         fact_types: mapped_fact_types,
         exclude_mental_models,
         exclude_mental_model_ids,
@@ -454,22 +500,18 @@ pub fn retain(
         None
     };
 
-    // MemoryItem.timestamp is a progenitor anyOf enum; round-trip through JSON to pick the matching variant.
-    let timestamp = match timestamp {
-        Some(s) => Some(
-            serde_json::from_value::<MemoryItemTimestamp>(serde_json::Value::String(s.clone()))
-                .with_context(|| format!("invalid --timestamp value: {:?}", s))?,
-        ),
-        None => None,
-    };
-
     let item = MemoryItem {
-        content: content.clone(),
+        // `content` is now `string | ContentBlock[]` so retain can take inline
+        // images. The CLI only ever sends text, which is the string variant.
+        content: hindsight_client::types::Content::Variant0(content.clone()),
         context,
         metadata: None,
         timestamp,
         document_id: Some(doc_id.clone()),
         entities: None,
+        // The CLI does not supply entities, so there is nothing for the flag to govern;
+        // true matches the server default.
+        resolve_entities: true,
         tags: None,
         observation_scopes: None,
         strategy: None,
@@ -480,6 +522,8 @@ pub fn retain(
         items: vec![item],
         async_: r#async,
         document_tags,
+        // The CLI does not expose idempotency keys; each invocation is a new operation.
+        operation_id: None,
     };
 
     let response = client.retain(agent_id, &request, r#async, verbose);
@@ -581,8 +625,13 @@ pub fn retain_files(
             pb.inc(1);
         }
 
-        let result =
-            client.file_retain(agent_id, file_data, context.clone(), strategy.clone(), verbose)?;
+        let result = client.file_retain(
+            agent_id,
+            file_data,
+            context.clone(),
+            strategy.clone(),
+            verbose,
+        )?;
         all_operation_ids.extend(result.operation_ids);
     }
 
@@ -830,6 +879,53 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    fn some(value: &str) -> Option<String> {
+        Some(value.to_string())
+    }
+
+    #[test]
+    fn test_temporal_window_requires_both_ends() {
+        // One end alone is an incomplete range, not a half-open filter, so it
+        // is an error rather than a silently window-less recall.
+        assert!(parse_temporal_window(&None, &None).unwrap().is_none());
+        assert!(parse_temporal_window(&some("2023-04-01T00:00:00Z"), &None).is_err());
+        assert!(parse_temporal_window(&None, &some("2023-06-30T23:59:59Z")).is_err());
+    }
+
+    #[test]
+    fn test_temporal_window_rejects_reversed_range() {
+        let result =
+            parse_temporal_window(&some("2023-06-30T23:59:59Z"), &some("2023-04-01T00:00:00Z"));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_temporal_window_accepts_equal_bounds() {
+        let window =
+            parse_temporal_window(&some("2023-04-01T00:00:00Z"), &some("2023-04-01T00:00:00Z"))
+                .unwrap()
+                .expect("an instant is a degenerate but valid window");
+
+        assert_eq!(window.start, window.end);
+    }
+
+    #[test]
+    fn test_temporal_window_reads_a_missing_offset_as_utc() {
+        // Matches how the API treats a datetime with no offset.
+        let window = parse_temporal_window(&some("2023-04-01T00:00:00"), &some("2023-06-30"))
+            .unwrap()
+            .expect("both ends given");
+
+        assert_eq!(window.start.to_rfc3339(), "2023-04-01T00:00:00+00:00");
+        assert_eq!(window.end.to_rfc3339(), "2023-06-30T00:00:00+00:00");
+    }
+
+    #[test]
+    fn test_temporal_window_rejects_unparseable_bound() {
+        assert!(parse_temporal_window(&some("last quarter"), &some("2023-06-30")).is_err());
+    }
+
     #[test]
     fn test_is_supported_file_text_extensions() {
         let supported = [
@@ -933,5 +1029,65 @@ mod tests {
         assert!(matches!(parse_budget("invalid"), Budget::Mid));
         assert!(matches!(parse_budget(""), Budget::Mid));
         assert!(matches!(parse_budget("unknown"), Budget::Mid));
+    }
+
+    // Mirrors a real `GET /memories/{memory_id}` payload (see
+    // MemoryEngine.get_memory_unit): `type` for the fact type and `entities`
+    // as a flat list of canonical-name strings. This previously failed to parse
+    // ("Invalid API response format") because the struct expected `fact_type`
+    // and entity objects.
+    #[test]
+    fn test_memory_unit_detail_parses_api_response() {
+        let value = serde_json::json!({
+            "id": "11111111-1111-1111-1111-111111111111",
+            "text": "Alice met Bob in Paris.",
+            "context": "trip notes",
+            "date": "2023-05-01",
+            "type": "experience",
+            "mentioned_at": null,
+            "occurred_start": "2023-05-01T00:00:00",
+            "occurred_end": null,
+            "entities": ["Alice", "Bob", "Paris"],
+            "document_id": "doc-1",
+            "chunk_id": null,
+            "tags": ["travel"],
+            "observation_scopes": null
+        });
+
+        let result: MemoryUnitDetail =
+            serde_json::from_value(value).expect("should parse API response");
+
+        assert_eq!(result.id, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(result.text, "Alice met Bob in Paris.");
+        assert_eq!(result.type_.as_deref(), Some("experience"));
+        assert_eq!(result.document_id.as_deref(), Some("doc-1"));
+        assert_eq!(
+            result.entities,
+            Some(vec![
+                "Alice".to_string(),
+                "Bob".to_string(),
+                "Paris".to_string()
+            ])
+        );
+        assert_eq!(result.tags, Some(vec!["travel".to_string()]));
+    }
+
+    // A world/experience fact has no entities/tags populated; the response still
+    // parses with those fields absent or empty.
+    #[test]
+    fn test_memory_unit_detail_parses_minimal_response() {
+        let value = serde_json::json!({
+            "id": "22222222-2222-2222-2222-222222222222",
+            "text": "The sky is blue.",
+            "type": "world",
+            "entities": [],
+            "tags": []
+        });
+
+        let result: MemoryUnitDetail =
+            serde_json::from_value(value).expect("should parse minimal response");
+
+        assert_eq!(result.type_.as_deref(), Some("world"));
+        assert_eq!(result.entities, Some(vec![]));
     }
 }

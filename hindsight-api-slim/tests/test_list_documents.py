@@ -1,6 +1,7 @@
 """
 Tests for list_documents pagination and tags filtering.
 """
+
 from datetime import datetime, timezone
 
 import pytest
@@ -27,26 +28,20 @@ async def test_list_documents_offset_pagination(memory, request_context):
         for i in range(4):
             await _retain_doc(memory, bank_id, f"doc-{i:02d}", [], request_context)
 
-        # All documents, ordered by created_at DESC → doc-03, doc-02, doc-01, doc-00
-        all_docs = await memory.list_documents(
-            bank_id=bank_id, limit=10, offset=0, request_context=request_context
-        )
+        # All documents, most recently written first → doc-03, doc-02, doc-01, doc-00
+        all_docs = await memory.list_documents(bank_id=bank_id, limit=10, offset=0, request_context=request_context)
         assert all_docs["total"] == 4
         assert len(all_docs["items"]) == 4
         all_ids = [d["id"] for d in all_docs["items"]]
 
         # offset=2 should skip the first two and return the remaining two
-        page2 = await memory.list_documents(
-            bank_id=bank_id, limit=10, offset=2, request_context=request_context
-        )
+        page2 = await memory.list_documents(bank_id=bank_id, limit=10, offset=2, request_context=request_context)
         assert page2["total"] == 4  # total is always the full count
         assert len(page2["items"]) == 2
         assert [d["id"] for d in page2["items"]] == all_ids[2:]
 
         # offset beyond total returns empty items but correct total
-        beyond = await memory.list_documents(
-            bank_id=bank_id, limit=10, offset=10, request_context=request_context
-        )
+        beyond = await memory.list_documents(bank_id=bank_id, limit=10, offset=10, request_context=request_context)
         assert beyond["total"] == 4
         assert beyond["items"] == []
 
@@ -169,6 +164,39 @@ async def test_list_documents_tags_and_search_query_combined(memory, request_con
         )
         ids = {d["id"] for d in result["items"]}
         assert ids == {"report-2024"}
+
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_list_documents_orders_by_last_write(memory, request_context):
+    """A re-retained old document sorts ahead of newer, untouched documents.
+
+    Ordering by created_at would bury a long-lived document that keeps receiving
+    appends behind every document created after it.
+    """
+    bank_id = f"test_list_docs_order_{datetime.now(timezone.utc).timestamp()}"
+
+    try:
+        await _retain_doc(memory, bank_id, "doc-old", [], request_context)
+        await _retain_doc(memory, bank_id, "doc-new", [], request_context)
+
+        # Baseline: newest-created first.
+        result = await memory.list_documents(bank_id=bank_id, request_context=request_context)
+        assert [d["id"] for d in result["items"]] == ["doc-new", "doc-old"]
+
+        # Write to the older document again — no new document, but it is now the
+        # most recently written one.
+        await memory.retain_batch_async(
+            bank_id=bank_id,
+            contents=[{"content": "xyzabc123 !@# $$$ doc-old revised"}],
+            document_id="doc-old",
+            request_context=request_context,
+        )
+
+        result = await memory.list_documents(bank_id=bank_id, request_context=request_context)
+        assert [d["id"] for d in result["items"]] == ["doc-old", "doc-new"]
 
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)

@@ -6,15 +6,11 @@ Provides dataset, answer generator, and evaluator for the LongMemEval benchmark.
 
 import asyncio
 import json
-import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pydantic
-from hindsight_api.engine.llm_wrapper import LLMConfig
-from openai import AsyncOpenAI
 
 from benchmarks.common.benchmark_runner import (
     BenchmarkDataset,
@@ -22,6 +18,7 @@ from benchmarks.common.benchmark_runner import (
     LLMAnswerEvaluator,
     LLMAnswerGenerator,
 )
+from benchmarks.common.llm_role_config import ANSWER_ROLE, build_role_llm_config
 
 
 class LongMemEvalDataset(BenchmarkDataset):
@@ -152,13 +149,7 @@ class LongMemEvalAnswerGenerator(LLMAnswerGenerator):
         """
         # Uses HINDSIGHT_API_ANSWER_LLM_* env vars with fallback to HINDSIGHT_API_LLM_* for
         # benchmark-specific LLM configuration (separate from the API config system).
-        self.llm_config = LLMConfig(
-            provider=os.getenv("HINDSIGHT_API_ANSWER_LLM_PROVIDER", os.getenv("HINDSIGHT_API_LLM_PROVIDER", "openai")),
-            api_key=os.getenv("HINDSIGHT_API_ANSWER_LLM_API_KEY", os.getenv("HINDSIGHT_API_LLM_API_KEY", "")),
-            base_url=os.getenv("HINDSIGHT_API_ANSWER_LLM_BASE_URL", os.getenv("HINDSIGHT_API_LLM_BASE_URL", "")),
-            model=os.getenv("HINDSIGHT_API_ANSWER_LLM_MODEL", os.getenv("HINDSIGHT_API_LLM_MODEL", "gpt-4o-mini")),
-            reasoning_effort="high",
-        )
+        self.llm_config = build_role_llm_config(ANSWER_ROLE)
         self.client = self.llm_config._client
         self.model = self.llm_config.model
         self.context_format = context_format
@@ -200,7 +191,6 @@ class LongMemEvalAnswerGenerator(LLMAnswerGenerator):
 
             # Extract temporal information
             occurred_start = fact.get("occurred_start")
-            occurred_end = fact.get("occurred_end")
             mentioned_at = fact.get("mentioned_at")
 
             # Build temporal string
@@ -622,8 +612,6 @@ async def run_benchmark(
             console.print(f"[green]Found {total_found} {filter_type} items to re-evaluate[/green]")
 
     # Create local memory engine
-    from hindsight_api.engine.memory_engine import Budget
-    from hindsight_api.models import RequestContext
 
     from benchmarks.common.benchmark_runner import create_memory_engine
 
@@ -677,7 +665,6 @@ async def run_benchmark(
     # If filtering by category, failed, invalid, only_ingested, or max_instances_per_category, we need to use a custom dataset that only returns those items
     # We'll temporarily replace the dataset's load method
     if filtered_items is not None:
-        original_load = dataset.load
 
         def filtered_load(path: Path, max_items: Optional[int] = None):
             return filtered_items[:max_items] if max_items else filtered_items

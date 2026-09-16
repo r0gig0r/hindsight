@@ -131,7 +131,7 @@ tools = create_hindsight_tools(
 | `recall_tags_match` | `"any"` | Tag matching mode (any/all/any\_strict/all\_strict) |
 | `retain_metadata` | `None` | Default metadata dict for retain operations |
 | `retain_document_id` | `None` | Default document\_id for retain (groups/upserts memories) |
-| `recall_types` | `None` | Fact types to filter (world, experience, opinion, observation) |
+| `recall_types` | `None` | Fact types to filter (world, experience, observation) |
 | `recall_include_entities` | `False` | Include entity information in recall results |
 | `reflect_context` | `None` | Additional context for reflect operations |
 | `reflect_max_tokens` | `None` | Max tokens for reflect results (defaults to `max_tokens`) |
@@ -150,6 +150,6 @@ tools = create_hindsight_tools(
 
 ## Documentation
 
-- [Integration docs](https://docs.hindsight.vectorize.io/docs/sdks/integrations/autogen)
+- [Integration docs](https://hindsight.vectorize.io/sdks/integrations/autogen)
 - [Cookbook: AutoGen assistant with memory](https://docs.hindsight.vectorize.io/cookbook/recipes/autogen-assistant-agent)
 - [Hindsight API docs](https://docs.hindsight.vectorize.io)

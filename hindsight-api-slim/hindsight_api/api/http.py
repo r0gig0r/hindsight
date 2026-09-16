@@ -6,20 +6,40 @@ the FastAPI application with all API endpoints.
 """
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
 import re
+import time
+import traceback
 import uuid
+from collections.abc import Awaitable
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from typing import Any, Literal
+from datetime import datetime
+from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar
+from urllib.parse import quote, unquote
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse, Response
 
-from hindsight_api.engine.audit import AuditEntry, AuditLogger
-from hindsight_api.extensions import AuthenticationError
+from hindsight_api.api import page_markdown
+from hindsight_api.api.admission import AdmissionAbandoned, AdmissionRejected, build_controller_from_config
+from hindsight_api.api.disconnect import ClientDisconnectCancellationMiddleware, get_scope_cancellation_token
+from hindsight_api.api.observability import HttpObservabilityMiddleware
+from hindsight_api.api.passthrough_headers import collect_passthrough_headers
+from hindsight_api.api.unknown_params import UnknownParamsRoute, use_unknown_params_routes
+from hindsight_api.cancellation import OperationCancelledError
+from hindsight_api.engine.audit import (
+    AuditEntry,
+    AuditLogger,
+    AuditLogListResponse,
+    AuditLogStatsResponse,
+)
+from hindsight_api.engine.llm_trace import LLMRequestListResponse, LLMRequestStatsResponse
+from hindsight_api.extensions import AuthenticationError, BankWriteOperation, PrecheckOperation
 
 
 def _parse_metadata(metadata: Any) -> dict[str, Any]:
@@ -36,11 +56,129 @@ def _parse_metadata(metadata: Any) -> dict[str, Any]:
     return {}
 
 
-from typing import Callable
+from collections.abc import Iterable
+from types import UnionType
+from typing import Callable, Union, get_args, get_origin
 
+if TYPE_CHECKING:
+    from opentelemetry.trace import Span
+
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from hindsight_api import MemoryEngine
+from hindsight_api.config import RETAIN_EXTRACTION_MODES
+from hindsight_api.config_resolver import BankConfigPersistenceConflictError
+from hindsight_api.engine.retain.entity_labels import LabelGroup, _migrate_label_group
+
+
+def _migrate_entity_labels_input(value: Any) -> Any:
+    """Pydantic ``mode='before'`` hook: migrate legacy entity-label dicts before ``LabelGroup`` validation.
+
+    Keeps the request boundary accepting the legacy ``free_values``/``multi_value`` shape (translated to
+    the ``type`` field) that ``parse_entity_labels`` already tolerates on the storage-read side, so typing
+    the field as ``list[LabelGroup]`` (which publishes the schema in OpenAPI) does not drop those keys.
+    """
+    if isinstance(value, list):
+        return [_migrate_label_group(item) if isinstance(item, dict) else item for item in value]
+    return value
+
+
+def _drop_additional_properties(schema: dict[str, Any]) -> None:
+    """Strip the ``additionalProperties: true`` that ``extra="allow"`` publishes.
+
+    The passthrough is a runtime property of the row models (see ``OpenRowModel``); it does
+    not belong in the spec, and openapi-generator 7.10.0's Python generator crashes on a
+    schema that pairs ``additionalProperties`` with a nullable ``anyOf`` property
+    ("Codegen Property not yet supported in getPydanticType"), which every row here has.
+    """
+    schema.pop("additionalProperties", None)
+
+
+class OpenRowModel(BaseModel):
+    """Base for the typed list/graph rows: named fields, but nothing is lost or dropped.
+
+    The rows these describe used to be ``dict[str, Any]`` (#4218), so every generated SDK
+    handed callers untyped dicts. Typing them must not change a single byte of the wire, so
+    a row model is *open* in both directions:
+
+    - ``extra="allow"`` carries through a key the server emits and the model does not
+      declare — a memories store that owns its own document or entity registry builds these
+      rows itself, and its extra columns must survive.
+    - ``ExcludeNoneRoute`` leaves these routes' nulls alone (see ``_model_must_keep_nulls``).
+      A ``dict`` row's null values were always emitted, and a caller indexing a row would
+      get a ``KeyError`` if typing the rows started omitting them.
+    """
+
+    model_config = ConfigDict(extra="allow", json_schema_extra=_drop_additional_properties)
+
+
+def _annotation_is_nullable(annotation: Any) -> bool:
+    """True if the annotation is a Union that includes None (i.e. ``X | None``)."""
+    if get_origin(annotation) in (Union, UnionType):
+        return any(arg is type(None) for arg in get_args(annotation))
+    return False
+
+
+def _iter_models(annotation: Any) -> Iterable[type[BaseModel]]:
+    """Yield every Pydantic model referenced by an annotation, recursing through generics."""
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        yield annotation
+        return
+    for arg in get_args(annotation):
+        yield from _iter_models(arg)
+
+
+def _model_must_keep_nulls(model: type[BaseModel], seen: set[type[BaseModel]]) -> bool:
+    """True if dropping nulls from this model (or a nested one) would break clients.
+
+    Two cases:
+
+    - A required *and* nullable field is in the OpenAPI ``required`` set but may serialize
+      to null, so dropping it (via ``exclude_none``) would omit a key strict generated
+      clients expect to be present.
+    - An ``OpenRowModel`` describes rows that shipped as bare dicts before #4218, whose
+      nulls were always on the wire because ``exclude_none`` does not reach inside a
+      ``dict[str, Any]`` value. Typing the rows must not start omitting those keys.
+    """
+    if model in seen:
+        return False
+    seen.add(model)
+    if issubclass(model, OpenRowModel):
+        return True
+    for field in model.model_fields.values():
+        annotation = field.annotation
+        if field.is_required() and _annotation_is_nullable(annotation):
+            return True
+        for nested in _iter_models(annotation):
+            if _model_must_keep_nulls(nested, seen):
+                return True
+    return False
+
+
+def _response_model_must_keep_nulls(response_model: Any) -> bool:
+    seen: set[type[BaseModel]] = set()
+    return any(_model_must_keep_nulls(model, seen) for model in _iter_models(response_model))
+
+
+class ExcludeNoneRoute(APIRoute):
+    """Route class that drops null fields from responses, preserving wire compatibility.
+
+    ``response_model_exclude_none`` is enabled automatically for every route whose response
+    model can afford it. Routes whose model must keep its nulls (see
+    ``_model_must_keep_nulls``) are left untouched and keep emitting them. An explicit
+    ``response_model_exclude_none`` passed to the route decorator is respected.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        response_model = kwargs.get("response_model")
+        if (
+            not kwargs.get("response_model_exclude_none")
+            and response_model is not None
+            and not _response_model_must_keep_nulls(response_model)
+        ):
+            kwargs["response_model_exclude_none"] = True
+        super().__init__(*args, **kwargs)
 
 
 def FieldWithDefault(default_factory: Callable, **kwargs) -> Any:
@@ -74,16 +212,124 @@ def FieldWithDefault(default_factory: Callable, **kwargs) -> Any:
     return Field(default_factory=default_factory, json_schema_extra=json_extra, **kwargs)
 
 
-from hindsight_api.config import get_config
-from hindsight_api.engine.memory_engine import Budget, _current_schema, _get_tiktoken_encoding, fq_table
+from hindsight_api.config import HindsightConfig, StaticConfigProxy, get_config
+from hindsight_api.engine.interface import BankTemplateImportWrite
+from hindsight_api.engine.memory_engine import (
+    KEEP_PARENT,
+    Budget,
+    RetainOperationConflictError,
+    VisionNotSupportedError,
+    _current_schema,
+)
+from hindsight_api.engine.mental_model_refresh import (
+    MentalModelDryRunRefreshResult,
+    RefreshMentalModelOperationDetails,
+)
 from hindsight_api.engine.providers.none_llm import LLMNotAvailableError
-from hindsight_api.engine.response_models import VALID_RECALL_FACT_TYPES, MemoryFact, TokenUsage
+from hindsight_api.engine.reflect import ReflectNoAnswerError, ReflectToolCallError, ReflectToolExecutionError
+from hindsight_api.engine.response_models import (
+    VALID_RECALL_FACT_TYPES,
+    DryRunExtractionResult,
+    MemoryFact,
+    MinScores,
+    RecallScores,
+    TemporalWindow,
+    TokenUsage,
+)
+from hindsight_api.engine.retain.attachment_content import (
+    CanonicalContent,
+    RetainAttachment,
+    RetainText,
+    canonicalize,
+    compute_attachment_hash,
+    contains_placeholder_like,
+    iter_placeholder_ids,
+    neutralize_placeholders,
+    short_attachment_id,
+)
+from hindsight_api.engine.retain.attachment_content import ContentBlock as CanonicalBlock
+from hindsight_api.engine.retain.attachment_store import StoredAttachment
+from hindsight_api.engine.search.tag_resolution import needs_resolution
 from hindsight_api.engine.search.tags import TagGroup, TagsMatch
+from hindsight_api.engine.structured_output import validate_response_schema
+from hindsight_api.engine.token_encoding import count_tokens
 from hindsight_api.extensions import HttpExtension, OperationValidationError, load_extension
-from hindsight_api.metrics import create_metrics_collector, get_metrics_collector, initialize_metrics
+from hindsight_api.liveness import LivenessResponse, liveness_response
+from hindsight_api.metrics import (
+    create_metrics_collector,
+    get_metrics_collector,
+    initialize_metrics,
+    reset_metrics_collector,
+)
 from hindsight_api.models import RequestContext
 
 logger = logging.getLogger(__name__)
+
+
+def _internal_error(exc: Exception, where: str) -> HTTPException:
+    """Log an unhandled handler exception with its traceback, and map it to a 500.
+
+    Every route's catch-all used to do this inline — 72 byte-identical copies of
+    the same four lines, plus seven near-copies that logged the traceback without
+    the message. The duplication is why the policy had already drifted: what gets
+    logged, and the fact that the client sees ``detail=str(exc)`` rather than a
+    traceback, was re-decided per route instead of once.
+
+    ``traceback.format_exc()`` reads the *currently handled* exception, so this
+    must be called from inside an ``except`` block — which is where every call
+    site is.
+
+    Returns the exception rather than raising it, so call sites read
+    ``raise _internal_error(e, ...)`` and keep the ``raise`` visible at the
+    handler instead of hidden behind a call.
+    """
+    logger.error(f"Error in {where}: {exc}\n\nTraceback:\n{traceback.format_exc()}")
+    return HTTPException(status_code=500, detail=str(exc))
+
+
+# 499 is the de facto reverse-proxy status for "client closed request".
+_CLIENT_CLOSED_REQUEST_STATUS_CODE = 499
+
+# Declared on every bank-scoped read so a generated client can tell "this bank
+# does not exist" apart from "this bank is empty" (#4175). Without it the spec
+# advertises only 200/422 and a consumer has no documented missing-bank case.
+_BANK_NOT_FOUND_RESPONSES: dict[int | str, dict[str, Any]] = {404: {"description": "The bank does not exist."}}
+
+
+_T = TypeVar("_T")
+
+
+async def run_cancellable_on_disconnect(
+    http_request: Request,
+    request_context: RequestContext,
+    coro: Awaitable[_T],
+    *,
+    operation: str,
+    bank_id: str,
+) -> _T:
+    """Run an engine coroutine, aborting it with 499 if the client disconnects.
+
+    Shared by the recall and reflect handlers. The actual disconnect detection
+    lives in ``ClientDisconnectCancellationMiddleware`` (a pure-ASGI middleware
+    installed outside the ``BaseHTTPMiddleware`` layer), which attaches a
+    :class:`CancellationToken` to the ASGI scope and trips it on
+    ``http.disconnect``. Here we simply hand that token to the engine via
+    ``RequestContext`` — the engine checks it at stage/iteration boundaries — and
+    translate the resulting ``OperationCancelledError`` into 499 so abandoned
+    work stops instead of running to completion (issue #2122).
+
+    Note: ``Request.is_disconnected()`` is deliberately NOT used — it silently
+    never fires behind ``BaseHTTPMiddleware``, which is why the original #2127
+    implementation did not actually cancel anything in this app.
+    """
+    token = get_scope_cancellation_token(http_request.scope)
+    if token is not None:
+        request_context.cancellation = token
+    try:
+        return await coro
+    except OperationCancelledError as e:
+        logger.info(f"[{operation.upper()} CANCELLED] bank={bank_id} reason={e.reason}")
+        raise HTTPException(status_code=_CLIENT_CLOSED_REQUEST_STATUS_CODE, detail=e.reason) from e
 
 
 class EntityIncludeOptions(BaseModel):
@@ -138,6 +384,7 @@ class RecallRequest(BaseModel):
                 "trace": True,
                 "query_timestamp": "2023-05-30T23:40:00",
                 "include": {"entities": {"max_tokens": 500}},
+                "temporal_window": {"start": "2023-04-01T00:00:00Z", "end": "2023-06-30T23:59:59Z"},
                 "tags": ["user_a"],
                 "tags_match": "any",
             }
@@ -147,13 +394,27 @@ class RecallRequest(BaseModel):
     query: str
     types: list[str] | None = Field(
         default=None,
-        description="List of fact types to recall: 'world', 'experience', 'observation'. Defaults to world and experience if not specified.",
+        description="List of fact types to recall: 'world', 'experience', 'observation'. Defaults to all fact types if not specified.",
+    )
+    prefer_observations: bool = Field(
+        default=False,
+        description=(
+            "When recalling raw facts ('world'/'experience') together with 'observation', drop any raw "
+            "fact that an observation in the results was consolidated from, so the observation supersedes "
+            "it and you don't get duplicate content. The freed slots are backfilled with the next results, "
+            "keeping the result count at the requested budget. Disabled by default; set to true to enable. "
+            "No effect unless 'observation' and at least one raw type are both requested."
+        ),
     )
     budget: Budget = Budget.MID
     max_tokens: int = 4096
     trace: bool = False
     query_timestamp: str | None = Field(
-        default=None, description="ISO format date string (e.g., '2023-05-30T23:40:00')"
+        default=None,
+        description=(
+            "ISO format date string (e.g., '2023-05-30T23:40:00'). Used as the query-time anchor for "
+            "relative temporal expressions and recency scoring."
+        ),
     )
     include: IncludeOptions = FieldWithDefault(
         IncludeOptions,
@@ -161,17 +422,45 @@ class RecallRequest(BaseModel):
     )
     tags: list[str] | None = Field(
         default=None,
-        description="Filter memories by tags. If not specified, all memories are returned.",
+        description="Filter memories by tags. If not specified, all memories are returned. "
+        "Omitting tags (or passing []) together with tags_match='exact' filters to "
+        "untagged/global observations only (the scope written by observation_scopes='shared').",
     )
     tags_match: TagsMatch = Field(
         default="any",
         description="How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), "
-        "'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged).",
+        "'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged), "
+        "'exact' (set-equality on the full scope, excludes untagged). With 'exact' and no tags "
+        "(or []), the empty global scope is selected and only untagged memories match.",
     )
     tag_groups: list[TagGroup] | None = Field(
         default=None,
         description="Compound tag filter using boolean groups. Groups in the list are AND-ed. "
-        "Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}.",
+        "Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}. "
+        "A leaf may set resolve='fuzzy' to match its tags against the bank's tags by trigram similarity instead of literally, so a query that says 'typsecript' still reaches memories tagged 'typescript'.",
+    )
+    min_scores: MinScores | None = Field(
+        default=None,
+        description="Optional per-stage score floors, each inclusive (`>=`). `semantic` and `keyword` are "
+        "retrieval-level cutoffs pushed into the SQL arm they name (overriding the global similarity/BM25 "
+        "minimums for this request), and constrain only that arm: recall fuses four arms (semantic, keyword, "
+        "graph, temporal) and returns a result surfaced by any of them, so a returned result reports null for a "
+        "stage that did not surface it (a non-null score always clears its floor). Setting both therefore "
+        "does not restrict the response to results clearing both. `reranker` and `final` are post-ranking "
+        "filters applied to every scored result, so those floors *are* guaranteed by each result returned — "
+        "use them for query abstention. Any field left unset imposes no floor; omitting `min_scores` entirely "
+        "(the default) applies no score filtering. Use with care — the reranker's absolute scores are not "
+        "calibrated across queries (a clearly-relevant match may score ~0.001 even though it is ranked first).",
+    )
+    temporal_window: TemporalWindow | None = Field(
+        default=None,
+        description="Window for the temporal retrieval arm, supplied instead of extracting dates from `query`. "
+        "Set this when you already know the range you mean — a date picker, or an agent that resolved "
+        "'last quarter' itself — and recall will skip parsing the query text for dates. "
+        "**This ranks, it does not filter**: the temporal arm surfaces memories whose own dates "
+        "(`mentioned_at`, `occurred_start`, `occurred_end`) fall inside the window so they rank higher, "
+        "while the semantic, keyword and graph arms are unaffected — so memories dated outside the window "
+        "are still returned. Ignored when the bank has temporal retrieval disabled.",
     )
 
     @field_validator("query")
@@ -235,7 +524,7 @@ class RecallResult(BaseModel):
 
     id: str
     text: str
-    type: str | None = None  # fact type: world, experience, opinion, observation
+    type: str | None = None  # fact type: world, experience, observation
     entities: list[str] | None = None  # Entity names mentioned in this fact
     context: str | None = None
     occurred_start: str | None = None  # ISO format date when the event started
@@ -247,6 +536,15 @@ class RecallResult(BaseModel):
     tags: list[str] | None = None  # Visibility scope tags
     source_fact_ids: list[str] | None = (
         None  # IDs of source facts (observation type only, when source_facts is enabled)
+    )
+    scores: RecallScores | None = None  # Per-stage recall scores (final/reranker/semantic/text)
+    attachments: list["ChunkAttachment"] | None = Field(
+        default=None,
+        description=(
+            "Attachments this fact was drawn from, as recorded per fact at extraction time — the "
+            "same edge the memory read endpoints return, not everything its chunk happened to "
+            "carry. A fact stated in prose reports none. Omitted when there are none."
+        ),
     )
 
 
@@ -316,6 +614,44 @@ class EntityListResponse(BaseModel):
     offset: int
 
 
+class EntityGraphNodeData(OpenRowModel):
+    """The payload of one entity node in the co-occurrence graph.
+
+    Extra keys are allowed and passed through: the graph payload has always been an open
+    object, and typing it must not drop a field an older or newer server also returns.
+    """
+
+    id: str = Field(description="Entity ID")
+    label: str = Field(default="", description="Entity canonical name")
+    mentionCount: int = Field(default=0, description="How many times this entity was mentioned")
+    color: str | None = Field(default=None, description="Suggested node colour for rendering")
+
+
+class EntityGraphNode(OpenRowModel):
+    """An entity node, in the Cytoscape ``{"data": {...}}`` envelope the graph uses."""
+
+    data: EntityGraphNodeData
+
+
+class EntityGraphEdgeData(OpenRowModel):
+    """The payload of one co-occurrence edge."""
+
+    id: str = Field(description="Edge ID (``<source>-<target>``)")
+    source: str = Field(description="Source entity ID")
+    target: str = Field(description="Target entity ID")
+    linkType: str = Field(default="cooccurrence", description="Kind of relationship this edge represents")
+    weight: int = Field(default=0, description="Number of co-occurrences between the two entities")
+    color: str | None = Field(default=None, description="Suggested edge colour for rendering")
+    lineStyle: str | None = Field(default=None, description="Suggested edge line style for rendering")
+    lastCooccurred: str | None = Field(default=None, description="ISO 8601 timestamp of the most recent co-occurrence")
+
+
+class EntityGraphEdge(OpenRowModel):
+    """A co-occurrence edge, in the Cytoscape ``{"data": {...}}`` envelope the graph uses."""
+
+    data: EntityGraphEdgeData
+
+
 class EntityGraphResponse(BaseModel):
     """Response model for entity co-occurrence graph endpoint."""
 
@@ -347,8 +683,8 @@ class EntityGraphResponse(BaseModel):
         }
     )
 
-    nodes: list[dict[str, Any]]
-    edges: list[dict[str, Any]]
+    nodes: list[EntityGraphNode]
+    edges: list[EntityGraphEdge]
     total_entities: int
     total_edges: int
     limit: int
@@ -379,6 +715,18 @@ class EntityDetailResponse(BaseModel):
     observations: list[EntityObservationResponse]
 
 
+class ChunkAttachment(BaseModel):
+    """An attachment referenced by retained text, and where to fetch it."""
+
+    id: str = Field(description="The id inside the text's placeholder; a prefix of the bytes' sha256.")
+    hash: str = Field(description="Full sha256 of the attachment bytes.")
+    kind: str = Field(description="'image' or 'file', as the caller sent it.")
+    media_type: str = Field(description="MIME type of the attachment.")
+    byte_size: int = Field(description="Size of the attachment in bytes.")
+    filename: str | None = Field(default=None, description="Original filename, when the caller supplied one.")
+    url: str = Field(description="Bank-scoped API path serving the bytes. Requires the same authorization as the bank.")
+
+
 class ChunkData(BaseModel):
     """Chunk data for a single chunk."""
 
@@ -386,6 +734,15 @@ class ChunkData(BaseModel):
     text: str
     chunk_index: int
     truncated: bool = Field(default=False, description="Whether the chunk text was truncated due to token limits")
+    attachments: list[ChunkAttachment] | None = Field(
+        default=None,
+        description=(
+            "Attachments this chunk's text references, in order of first appearance, when it was "
+            "retained with inline content. The text keeps each attachment's placeholder token "
+            "(⟦hs-att:...⟧) where it sat, so a multimodal agent can render or reason over the "
+            "original at the position it occupied in the source document. Omitted when there are none."
+        ),
+    )
 
 
 class RecallResponse(BaseModel):
@@ -440,6 +797,14 @@ class RecallResponse(BaseModel):
     source_facts: dict[str, RecallResult] | None = Field(
         default=None, description="Source facts for observation-type results, keyed by fact ID"
     )
+    source_facts_truncated: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the source_facts map was cut short by the token budget. When true, some IDs in "
+            "results[].source_fact_ids have no entry in source_facts — the budget ran out, the "
+            "references are not dangling. Only set when source facts were requested."
+        ),
+    )
 
 
 class EntityInput(BaseModel):
@@ -447,6 +812,308 @@ class EntityInput(BaseModel):
 
     text: str = Field(description="The entity name/text")
     type: str | None = Field(default=None, description="Optional entity type (e.g., 'PERSON', 'ORG', 'CONCEPT')")
+
+
+#: A syntactically well-formed MIME type. Deliberately the ONLY constraint on what
+#: may be attached: vision models keep gaining formats (PDF, audio, video), and an
+#: allowlist here would refuse content the provider would happily have read. An
+#: unsupported type is rejected by the provider, and that rejection fails the
+#: retain with the provider's own message — see `_require_vision_capable_retain_llm`.
+_MEDIA_TYPE_RE = re.compile(r"^[\w.+-]+/[\w.+-]+$")
+
+#: Image types the recall/UI path renders inline. Everything else is still stored
+#: and still sent to the model; this only decides what a browser is asked to draw.
+RENDERABLE_IMAGE_MEDIA_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
+
+
+class Base64AttachmentSource(BaseModel):
+    """Inline attachment bytes, base64-encoded.
+
+    The only source type in this version. ``url`` (server-side fetch) and
+    ``blob_id`` (pre-uploaded handle) are the natural next ones, which is why this
+    is modelled as a discriminated union on ``type`` rather than as bare fields.
+    """
+
+    type: Literal["base64"] = "base64"
+    media_type: str = Field(
+        description=(
+            "MIME type of the attachment, e.g. 'image/png' or 'application/pdf'. Any well-formed "
+            "type is accepted; whether the model can read it is the model's answer to give, and a "
+            "provider that rejects it fails the retain with its own error."
+        )
+    )
+    data: str = Field(description="Base64-encoded bytes (no data: URI prefix).")
+
+    @field_validator("media_type")
+    @classmethod
+    def validate_media_type(cls, v: str) -> str:
+        if not _MEDIA_TYPE_RE.match(v):
+            raise ValueError(f"media_type must look like 'type/subtype', got {v!r}")
+        return v
+
+    def decode(self) -> bytes:
+        """Decode the payload, raising ``ValueError`` on malformed base64.
+
+        Not a validator: decoding a large attachment is expensive enough that it
+        should happen once, at the point the bytes are actually needed, rather
+        than on every model construction. The retain handler calls this inside its
+        request-validation block so a bad payload is still a 400, not a 500.
+        """
+        try:
+            return base64.b64decode(self.data, validate=True)
+        except (binascii.Error, ValueError) as e:
+            raise ValueError(f"attachment source data is not valid base64: {e}") from e
+
+
+class TextContentBlock(BaseModel):
+    """A run of text within a multimodal item, in the position the caller wrote it."""
+
+    type: Literal["text"]
+    text: str
+
+
+class ImageContentBlock(BaseModel):
+    """An image within a multimodal item, in the position the caller wrote it."""
+
+    type: Literal["image"]
+    source: Base64AttachmentSource
+
+
+class FileContentBlock(BaseModel):
+    """A non-image attachment — a PDF, a spreadsheet — in the position it was written.
+
+    Split from ``image`` rather than folded into one type because the providers
+    split it: Anthropic has distinct image and document blocks, OpenAI has
+    image_url and file parts. Carrying the caller's own distinction through means
+    the per-provider conversion never has to guess from the media type alone.
+    """
+
+    type: Literal["file"]
+    source: Base64AttachmentSource
+    filename: str | None = Field(
+        default=None,
+        description="Original filename, passed to providers that show one to the model (e.g. OpenAI).",
+    )
+
+
+#: One element of a multimodal ``content`` array. Discriminated on ``type`` so a
+#: malformed block reports which variant it failed against instead of dumping
+#: every variant's errors.
+ContentBlock = Annotated[TextContentBlock | ImageContentBlock | FileContentBlock, Field(discriminator="type")]
+
+
+def bank_attachment_url(bank_id: str, attachment_id: str) -> str:
+    """The API path serving one of a bank's retained attachments, by its short id."""
+    return f"/v1/default/banks/{quote(bank_id, safe='')}/attachments/{attachment_id}"
+
+
+# OpenAPI content entry for a raw-bytes response body, so generated clients
+# return bytes instead of trying to decode the payload.
+_BINARY_SCHEMA: dict[str, Any] = {"schema": {"type": "string", "format": "binary"}}
+
+
+def chunk_attachments_of(
+    bank_id: str,
+    text: str,
+    records: "dict[str, StoredAttachment]",
+) -> list[ChunkAttachment] | None:
+    """The attachments ``text`` references, deduplicated, in first-appearance order.
+
+    Returns None rather than an empty list when there are none, so the field is
+    simply absent from a response instead of adding a null to every read.
+    """
+    seen: dict[str, ChunkAttachment] = {}
+    for attachment_id in iter_placeholder_ids(text):
+        if attachment_id in seen:
+            continue
+        record = records.get(attachment_id)
+        if record is None:
+            # The bytes are gone (reclaimed, or a storage backend swapped under an
+            # old document). The placeholder stays in the text, honestly saying an
+            # attachment was here; there is just nothing to fetch.
+            continue
+        seen[attachment_id] = ChunkAttachment(
+            id=attachment_id,
+            hash=record.attachment_hash,
+            kind=record.kind,
+            media_type=record.media_type,
+            byte_size=record.byte_size,
+            filename=record.filename,
+            url=bank_attachment_url(bank_id, attachment_id),
+        )
+    return list(seen.values()) or None
+
+
+def _attachment_model(bank_id: str, record: "StoredAttachment") -> ChunkAttachment:
+    """One attachment, in the shape every read surface returns."""
+    return ChunkAttachment(
+        id=record.short_id,
+        hash=record.attachment_hash,
+        kind=record.kind,
+        media_type=record.media_type,
+        byte_size=record.byte_size,
+        filename=record.filename,
+        url=bank_attachment_url(bank_id, record.short_id),
+    )
+
+
+def _attachment_payload(bank_id: str, record: "StoredAttachment") -> dict[str, Any]:
+    """The same attachment as a plain dict, for the endpoints that return one."""
+    return _attachment_model(bank_id, record).model_dump()
+
+
+async def _attach_to_memories(
+    memory_app: "MemoryEngine",
+    bank_id: str,
+    items: "list[dict[str, Any]]",
+    request_context: RequestContext,
+) -> None:
+    """Add ``attachments`` to memory dicts, in place — the ones each fact came from.
+
+    A fact's own text carries no placeholder (it would surface a content hash as
+    knowledge), so the edge is the one the extractor attributed at retain time.
+    It is per fact, not per chunk: a chunk carrying a screenshot also carries the
+    prose around it, and showing the screenshot against every fact from that one
+    LLM call attributes the diagram to the paragraph that never mentioned it.
+
+    One lookup for the whole page, not one per memory.
+
+    A store that owns its rows renders them itself and puts each memory's ids on
+    the item as ``attachment_ids``. Those are taken off here — the key is an
+    internal carrier, and leaving it would make the payload differ by backend —
+    and handed to the engine, so the lookup resolves them instead of reading them
+    back from a table the store never wrote.
+    """
+    unit_ids: list[str] = []
+    carried: dict[str, tuple[str | None, list[str]]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        ids = item.pop("attachment_ids", None)
+        if not item.get("id"):
+            continue
+        unit_ids.append(item["id"])
+        if ids is not None:
+            carried[str(item["id"])] = (item.get("document_id"), list(ids))
+    if not unit_ids:
+        return
+    by_unit = await memory_app.attachments_for_memories(bank_id, unit_ids, request_context, carried=carried)
+    if not by_unit:
+        return
+    for item in items:
+        records = by_unit.get(str(item.get("id"))) if isinstance(item, dict) else None
+        if records:
+            item["attachments"] = [_attachment_payload(bank_id, record) for record in records]
+
+
+async def _attach_to_recall_results(
+    memory_app: "MemoryEngine",
+    bank_id: str,
+    results: "list[RecallResult]",
+    request_context: RequestContext,
+    carried: "dict[str, tuple[str | None, list[str]]] | None" = None,
+) -> None:
+    """Add ``attachments`` to recall results — the same per-fact edge as :func:`_attach_to_memories`.
+
+    Recall already reports the chunk each fact came from, and a chunk lists every
+    attachment its text references; that is strictly coarser. A chunk holding a
+    screenshot also holds the prose around it, so going through the chunk shows
+    the screenshot against the paragraph that never mentioned it. This reads the
+    edge the extractor recorded instead.
+
+    One lookup for the whole page. For a bank that has retained no attachments it
+    is a single indexed read of the ids column that returns nothing to resolve,
+    which is why this is unconditional rather than another `include` flag.
+
+    ``carried`` is unit id -> ``(document_id, attachment_ids)`` for results whose
+    ids the memories store returned on the row. For a store-owned bank that is the
+    only source: the engine resolves them and never reads ``memory_units``.
+    """
+    unit_ids = [result.id for result in results if result.id]
+    if not unit_ids:
+        return
+    by_unit = await memory_app.attachments_for_memories(bank_id, unit_ids, request_context, carried=carried)
+    if not by_unit:
+        return
+    for result in results:
+        records = by_unit.get(str(result.id))
+        if records:
+            result.attachments = [_attachment_model(bank_id, record) for record in records]
+
+
+def canonicalize_item_content(
+    content: str | list[ContentBlock],
+    *,
+    item_index: int,
+    config: HindsightConfig,
+    allowed_attachment_ids: "set[str] | None" = None,
+) -> CanonicalContent:
+    """Flatten a retain item's content to the canonical text the pipeline stores.
+
+    A plain string passes through untouched, so nothing about the text-only path
+    changes. A block list becomes one body with an atomic placeholder standing in
+    for each attachment, plus the decoded attachments themselves — which the
+    caller persists content-addressed before the retain is submitted.
+
+    Raises ``HTTPException(400)`` for anything wrong with the caller's
+    attachments: these are request errors, and the caller needs to know which item
+    and which block to fix. What the *model* can read is deliberately not checked
+    here — any well-formed media type is accepted and the provider's rejection is
+    what fails the retain.
+    """
+    if isinstance(content, str):
+        # Scrubbed exactly like a text block. Only the canonicalizer may mint a
+        # placeholder: without this, a caller could hand-write the token in plain
+        # string content and have extraction resolve it to an attachment the
+        # document never carried — anything already retained in the same bank.
+        return CanonicalContent(text=neutralize_placeholders(content, allowed_attachment_ids), attachments=())
+
+    blocks: list[CanonicalBlock] = []
+    attachment_count = 0
+    for block_index, block in enumerate(content):
+        if isinstance(block, TextContentBlock):
+            blocks.append(RetainText(block.text))
+            continue
+
+        attachment_count += 1
+        if attachment_count > config.retain_attachment_max_count:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"items[{item_index}] carries more than {config.retain_attachment_max_count} attachments. "
+                    f"Split the content across several items."
+                ),
+            )
+        try:
+            data = block.source.decode()
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"items[{item_index}].content[{block_index}]: {e}") from e
+        if not data:
+            raise HTTPException(
+                status_code=400,
+                detail=f"items[{item_index}].content[{block_index}]: attachment source data is empty",
+            )
+        if len(data) > config.retain_attachment_max_size_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"items[{item_index}].content[{block_index}]: attachment is "
+                    f"{len(data) / (1024 * 1024):.1f}MB, exceeding the "
+                    f"{config.retain_attachment_max_size_mb}MB limit for a single attachment."
+                ),
+            )
+        blocks.append(
+            RetainAttachment(
+                attachment_hash=compute_attachment_hash(data),
+                media_type=block.source.media_type,
+                data=data,
+                block_index=block_index,
+                kind=block.type,
+                filename=getattr(block, "filename", None),
+            )
+        )
+
+    return canonicalize(blocks, allowed_attachment_ids)
 
 
 class MemoryItem(BaseModel):
@@ -466,7 +1133,18 @@ class MemoryItem(BaseModel):
         },
     )
 
-    content: str
+    content: str | list[ContentBlock] = Field(
+        description=(
+            "The raw content to retain. Either a plain string, or an ordered list of "
+            "content blocks so images sit inline where they actually appear:\n\n"
+            '  [{"type": "text", "text": "click the button shown:"},\n'
+            '   {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}},\n'
+            '   {"type": "text", "text": "...then reconnect."}]\n\n'
+            "The block form requires a vision-capable retain LLM; a retain carrying images "
+            "against a text-only model is rejected rather than silently dropping them. "
+            "A single text block is equivalent to the plain string form."
+        )
+    )
     timestamp: datetime | str | None = Field(
         default=None,
         description=(
@@ -478,10 +1156,25 @@ class MemoryItem(BaseModel):
     )
     context: str | None = None
     metadata: dict[str, str] | None = None
-    document_id: str | None = Field(default=None, description="Optional document ID for this memory item.")
+    document_id: str | None = Field(
+        default=None,
+        description="Optional document ID for this memory item. Provide a distinct document_id per source "
+        "document — items sharing a document_id are grouped into the same document. Auto-generated when omitted.",
+    )
     entities: list[EntityInput] | None = Field(
         default=None,
         description="Optional entities to combine with auto-extracted entities.",
+    )
+    resolve_entities: bool = Field(
+        default=True,
+        description="Whether the names in 'entities' are resolved against the entities already in "
+        "the bank. True (default) matches each name to a similar existing entity when it scores "
+        "above the match threshold, so a name close to one already in the bank may resolve to that "
+        "one instead of the one you wrote. False takes your names literally — an existing entity is "
+        "reused only on a case-insensitive name match, any other name creates a new entity, and "
+        "your names are never merged with each other. This applies only to the entities you supply "
+        "here; auto-extracted entities are always resolved, since they are the extractor's guess at "
+        "a name rather than yours. Ignored when 'entities' is omitted.",
     )
     tags: list[str] | None = Field(
         default=None,
@@ -490,8 +1183,19 @@ class MemoryItem(BaseModel):
 
     @field_validator("content")
     @classmethod
-    def validate_content(cls, v: str) -> str:
-        if not v.strip():
+    def validate_content(cls, v: str | list[ContentBlock]) -> str | list[ContentBlock]:
+        if isinstance(v, str):
+            if not v.strip():
+                raise ValueError("content cannot be empty")
+            return v
+
+        if not v:
+            raise ValueError("content cannot be empty")
+        # An all-text block list must clear the same bar as the string form. A list
+        # carrying an attachment is never empty, whatever its text blocks say.
+        if not any(isinstance(block, (ImageContentBlock, FileContentBlock)) for block in v) and not any(
+            block.text.strip() for block in v if isinstance(block, TextContentBlock)
+        ):
             raise ValueError("content cannot be empty")
         return v
 
@@ -515,13 +1219,16 @@ class MemoryItem(BaseModel):
             return [v]
         return v
 
-    observation_scopes: Literal["per_tag", "combined", "all_combinations"] | list[list[str]] | None = Field(
+    observation_scopes: Literal["per_tag", "combined", "all_combinations", "shared"] | list[list[str]] | None = Field(
         default=None,
         title="ObservationScopes",
         description=(
             "How to scope observations during consolidation. "
             "'per_tag' runs one consolidation pass per individual tag, creating separate observations for each tag. "
             "'combined' (default) runs a single pass with all tags together. "
+            "'shared' runs a single pass over one global, untagged scope, so memories consolidate together "
+            "regardless of their tags — useful for deduplicating across volatile per-call provenance tags "
+            "(e.g. per-session ids) while keeping those tags on the source facts. "
             "A list of tag lists runs one pass per inner list, giving full control over which combinations to use."
         ),
     )
@@ -587,6 +1294,25 @@ class RetainRequest(BaseModel):
         description="Deprecated. Use item-level tags instead.",
         deprecated=True,
     )
+    operation_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional client-supplied UUID used as the identity of an async retain operation. "
+            "Re-submitting with the same operation_id returns the original operation and creates no new "
+            "work, so retrying after a lost or timed-out acknowledgement will not enqueue a duplicate. "
+            "Reusing an id that belongs to a different operation returns HTTP 409. Ignored for synchronous retain."
+        ),
+    )
+
+    @field_validator("operation_id")
+    @classmethod
+    def validate_operation_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            return str(uuid.UUID(value))
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise ValueError("operation_id must be a valid UUID") from exc
 
 
 class FileRetainMetadata(BaseModel):
@@ -634,6 +1360,26 @@ class FileRetainRequest(BaseModel):
         default=None,
         description="Metadata for each file (optional, must match number of files if provided)",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_misplaced_file_metadata(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        misplaced = sorted(name for name in _FILE_RETAIN_PER_FILE_FIELDS if data.get(name) is not None)
+        errors = []
+        if misplaced:
+            fields = ", ".join(misplaced)
+            errors.append(f"Per-file fields ({fields}) must be placed in the corresponding 'files_metadata' entry")
+        if data.get("update_mode") is not None:
+            errors.append("'update_mode' is not supported by /files/retain, which always processes asynchronously")
+        if errors:
+            raise ValueError("; ".join(errors))
+        return data
+
+
+_FILE_RETAIN_PER_FILE_FIELDS = frozenset(FileRetainMetadata.model_fields) - frozenset(FileRetainRequest.model_fields)
 
 
 class RetainResponse(BaseModel):
@@ -763,17 +1509,28 @@ class ReflectRequest(BaseModel):
     )
     tags: list[str] | None = Field(
         default=None,
-        description="Filter memories by tags during reflection. If not specified, all memories are considered.",
+        description="Scope raw facts, observations, mental models, and tagged directives during reflection. "
+        "With no tags, memory retrieval is unfiltered while only untagged/global directives are loaded. "
+        "Use tags=[] with tags_match='exact' to select the untagged/global scope.",
     )
     tags_match: TagsMatch = Field(
         default="any",
         description="How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), "
-        "'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged).",
+        "'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged), or "
+        "'exact' (set equality). Untagged directives remain global in every mode.",
     )
     tag_groups: list[TagGroup] | None = Field(
         default=None,
         description="Compound tag filter using boolean groups. Groups in the list are AND-ed. "
-        "Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}.",
+        "Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}. "
+        "Mutually exclusive with tags. "
+        "A leaf may set resolve='fuzzy' to match its tags against the bank's tags by trigram similarity instead of literally, so a query that says 'typsecript' still reaches memories tagged 'typescript'.",
+    )
+    apply_all_directives: bool = Field(
+        default=False,
+        description="Apply every active directive regardless of tags. By default directives are "
+        "scoped like memories: untagged directives always apply, and tagged directives apply only "
+        "when the request's tags match them. Set true to apply all active directives, ignoring tag scope.",
     )
     fact_types: list[Literal["world", "experience", "observation"]] | None = Field(
         default=None,
@@ -793,6 +1550,13 @@ class ReflectRequest(BaseModel):
     def validate_reflect_fact_types(cls, v: list[str] | None) -> list[str] | None:
         if v is not None and len(v) == 0:
             raise ValueError("fact_types must not be empty. Use null to include all fact types.")
+        return v
+
+    @field_validator("response_schema")
+    @classmethod
+    def validate_reflect_response_schema(cls, v: dict | None) -> dict | None:
+        if v is not None:
+            validate_response_schema(v)
         return v
 
     @model_validator(mode="after")
@@ -822,7 +1586,7 @@ class ReflectFact(BaseModel):
     text: str = Field(
         description="Fact text. When type='observation', this contains markdown-formatted consolidated knowledge"
     )
-    type: str | None = None  # fact type: world, experience, opinion, observation
+    type: str | None = None  # fact type: world, experience, observation
     context: str | None = None
     occurred_start: str | None = None
     occurred_end: str | None = None
@@ -922,6 +1686,15 @@ class ReflectResponse(BaseModel):
     structured_output: dict | None = Field(
         default=None,
         description="Structured output parsed according to the request's response_schema. Only present when response_schema was provided in the request.",
+    )
+    structured_output_error: str | None = Field(
+        default=None,
+        description=(
+            "Why structured output could not be produced. Present only when a response_schema was "
+            "given and the extraction call failed (provider error, timeout, unparseable output). "
+            "A missing structured_output *without* this field means the answer held nothing "
+            "matching the schema — the reflect itself still succeeded either way."
+        ),
     )
     usage: TokenUsage | None = Field(
         default=None,
@@ -1035,11 +1808,24 @@ class BankListItem(BaseModel):
     created_at: str | None = None
     updated_at: str | None = None
     fact_count: int = 0
-    last_document_at: str | None = None
+    last_document_at: str | None = Field(
+        default=None,
+        description=(
+            "When a document was last *ingested* into this bank. Appending to an existing "
+            "document does not move this — use `last_write_at` for write activity."
+        ),
+    )
+    last_write_at: str | None = Field(
+        default=None,
+        description=(
+            "When anything was last written to this bank: a document retained (including "
+            "appends to an existing document) or a fact stored. Null if the bank is empty."
+        ),
+    )
 
 
 class BankListResponse(BaseModel):
-    """Response model for listing all banks."""
+    """Response model for listing banks, one page at a time."""
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -1054,13 +1840,20 @@ class BankListResponse(BaseModel):
                         "updated_at": "2024-01-16T14:20:00Z",
                         "fact_count": 156,
                         "last_document_at": "2024-01-16T14:20:00Z",
+                        "last_write_at": "2024-01-17T09:05:00Z",
                     }
-                ]
+                ],
+                "total": 50,
+                "limit": 100,
+                "offset": 0,
             }
         }
     )
 
     banks: list[BankListItem]
+    total: int = Field(description="Total number of banks visible to the caller, ignoring `limit`/`offset`.")
+    limit: int
+    offset: int
 
 
 class CreateBankRequest(BaseModel):
@@ -1111,7 +1904,7 @@ class CreateBankRequest(BaseModel):
     )
     retain_extraction_mode: str | None = Field(
         default=None,
-        description="Fact extraction mode: 'concise' (default), 'verbose', or 'custom'.",
+        description="Fact extraction mode: 'concise' (default), 'verbose', 'custom', 'verbatim', or 'chunks'.",
     )
     retain_custom_instructions: str | None = Field(
         default=None,
@@ -1119,7 +1912,22 @@ class CreateBankRequest(BaseModel):
     )
     retain_chunk_size: int | None = Field(
         default=None,
-        description="Maximum token size for each content chunk during retain.",
+        description="Target maximum characters for each content chunk during retain.",
+    )
+    retain_structured_chunk_size: int | None = Field(
+        default=None,
+        description=(
+            "Maximum characters for a single JSONL line or conversation turn to keep whole during retain. "
+            "Defaults to retain_chunk_size when unset."
+        ),
+    )
+    retain_max_attachments_per_chunk: int | None = Field(
+        default=None,
+        description=(
+            "Maximum inline attachments one extraction chunk may carry. retain_chunk_size budgets "
+            "text only — a placeholder costs the characters it occupies and nothing more — so this "
+            "is what bounds attachments. Match it to the provider's per-request limit."
+        ),
     )
     enable_observations: bool | None = Field(
         default=None,
@@ -1146,6 +1954,35 @@ class CreateBankRequest(BaseModel):
     )
     experimental_structural_shadow_enabled: bool | None = Field(
         default=None, description="Enable experimental structural retrieval metrics without injecting its candidates."
+    )
+    enable_text_search: bool | None = Field(
+        default=None,
+        description=(
+            "Toggle the keyword (BM25) retrieval arm during recall. Disabling leaves pure vector "
+            "search: the arm is left out of the query entirely rather than filtered to nothing, so "
+            "none of its cost is paid. Also drops the keyword arm from knowledge-page search."
+        ),
+    )
+    enable_temporal_retrieval: bool | None = Field(
+        default=None,
+        description=(
+            "Toggle the temporal retrieval arm during recall, together with the date-aware query "
+            "analysis that feeds it. Useful for banks whose content carries no meaningful dates."
+        ),
+    )
+    enable_graph_retrieval: bool | None = Field(
+        default=None,
+        description=(
+            "Toggle the entity/link graph traversal arm during recall. Disabling trades relational "
+            "recall for latency on banks whose content has little entity structure."
+        ),
+    )
+    enable_reranking: bool | None = Field(
+        default=None,
+        description=(
+            "Toggle cross-encoder reranking during recall. Disabling returns the RRF-fused ordering "
+            "directly, which is faster but less precise."
+        ),
     )
 
     def get_config_updates(self) -> dict[str, Any]:
@@ -1177,6 +2014,8 @@ class CreateBankRequest(BaseModel):
             "retain_extraction_mode",
             "retain_custom_instructions",
             "retain_chunk_size",
+            "retain_structured_chunk_size",
+            "retain_max_attachments_per_chunk",
             "enable_observations",
             "observations_mission",
             "experimental_memory_feedback_enabled",
@@ -1185,6 +2024,10 @@ class CreateBankRequest(BaseModel):
             "experimental_conflict_detection_enabled",
             "experimental_structural_retrieval_enabled",
             "experimental_structural_shadow_enabled",
+            "enable_text_search",
+            "enable_temporal_retrieval",
+            "enable_graph_retrieval",
+            "enable_reranking",
         ):
             value = getattr(self, field_name)
             if value is not None:
@@ -1199,8 +2042,7 @@ class BankConfigUpdate(BaseModel):
         json_schema_extra={
             "example": {
                 "updates": {
-                    "llm_model": "claude-sonnet-4-5",
-                    "retain_extraction_mode": "verbose",
+                    "retain_extraction_mode": "custom",
                     "retain_custom_instructions": "Extract technical details carefully",
                 }
             }
@@ -1208,8 +2050,8 @@ class BankConfigUpdate(BaseModel):
     )
 
     updates: dict[str, Any] = Field(
-        description="Configuration overrides. Keys can be in Python field format (llm_provider) "
-        "or environment variable format (HINDSIGHT_API_LLM_PROVIDER). "
+        description="Configuration overrides. Keys can be in Python field format (retain_extraction_mode) "
+        "or environment variable format (HINDSIGHT_API_RETAIN_EXTRACTION_MODE). "
         "Only hierarchical fields can be overridden per-bank."
     )
 
@@ -1222,12 +2064,10 @@ class BankConfigResponse(BaseModel):
             "example": {
                 "bank_id": "my-bank",
                 "config": {
-                    "llm_provider": "openai",
-                    "llm_model": "gpt-4",
                     "retain_extraction_mode": "verbose",
+                    "retain_chunk_size": 3000,
                 },
                 "overrides": {
-                    "llm_model": "gpt-4",
                     "retain_extraction_mode": "verbose",
                 },
             }
@@ -1241,6 +2081,68 @@ class BankConfigResponse(BaseModel):
     overrides: dict[str, Any] = Field(description="Bank-specific configuration overrides only (Python field names)")
 
 
+class MemoryGraphNodeData(OpenRowModel):
+    """The payload of one memory-unit node in the memory graph.
+
+    Extra keys are allowed and passed through, so typing this never drops a field the
+    server also returns.
+    """
+
+    id: str = Field(description="Memory unit ID")
+    label: str = Field(default="", description="Short display label (the text, truncated)")
+    text: str = Field(default="", description="Full memory unit text")
+    date: str = Field(default="", description="Event date (ISO 8601), empty when unknown")
+    context: str = Field(default="", description="Context the memory was captured in")
+    entities: str = Field(default="", description="Comma-separated entity names, 'None' when there are none")
+    color: str | None = Field(default=None, description="Suggested node colour for rendering")
+
+
+class MemoryGraphNode(OpenRowModel):
+    """A memory-unit node, in the Cytoscape ``{"data": {...}}`` envelope the graph uses."""
+
+    data: MemoryGraphNodeData
+
+
+class MemoryGraphEdgeData(OpenRowModel):
+    """The payload of one edge between two memory units."""
+
+    id: str = Field(description="Edge ID (``<source>-<target>-<linkType>``)")
+    source: str = Field(description="Source memory unit ID")
+    target: str = Field(description="Target memory unit ID")
+    linkType: str = Field(default="", description="Link kind: 'entity', 'semantic', 'temporal', ...")
+    weight: float = Field(default=0.0, description="Link strength")
+    entityName: str = Field(default="", description="Shared entity for an 'entity' link, empty otherwise")
+    color: str | None = Field(default=None, description="Suggested edge colour for rendering")
+    lineStyle: str | None = Field(default=None, description="Suggested edge line style for rendering")
+
+
+class MemoryGraphEdge(OpenRowModel):
+    """An edge between two memory units, in the Cytoscape ``{"data": {...}}`` envelope."""
+
+    data: MemoryGraphEdgeData
+
+
+class MemoryGraphTableRow(OpenRowModel):
+    """One row of the flat table view that accompanies the memory graph."""
+
+    id: str = Field(description="Memory unit ID")
+    text: str = Field(default="", description="Memory unit text")
+    context: str = Field(default="", description="Context the memory was captured in ('N/A' when absent)")
+    occurred_start: str | None = Field(default=None, description="Start of the event interval (ISO 8601)")
+    occurred_end: str | None = Field(default=None, description="End of the event interval (ISO 8601)")
+    mentioned_at: str | None = Field(default=None, description="When the memory was mentioned (ISO 8601)")
+    date: str | None = Field(
+        default=None, description="Deprecated: formatted event date, kept for backwards compatibility"
+    )
+    entities: str = Field(default="", description="Comma-separated entity names, 'None' when there are none")
+    document_id: str | None = Field(default=None, description="Source document ID")
+    chunk_id: str | None = Field(default=None, description="Source chunk ID")
+    fact_type: str | None = Field(default=None, description="Fact type: world, experience or observation")
+    tags: list[str] = FieldWithDefault(list, description="Tags on this memory unit")
+    created_at: str | None = Field(default=None, description="When the memory unit was created (ISO 8601)")
+    proof_count: int | None = Field(default=None, description="How many times the fact was independently seen")
+
+
 class GraphDataResponse(BaseModel):
     """Response model for graph data endpoint."""
 
@@ -1248,10 +2150,20 @@ class GraphDataResponse(BaseModel):
         json_schema_extra={
             "example": {
                 "nodes": [
-                    {"id": "1", "label": "Alice works at Google", "type": "world"},
-                    {"id": "2", "label": "Bob went hiking", "type": "world"},
+                    {"data": {"id": "1", "label": "Alice works at Google", "text": "Alice works at Google"}},
+                    {"data": {"id": "2", "label": "Bob went hiking", "text": "Bob went hiking"}},
                 ],
-                "edges": [{"from": "1", "to": "2", "type": "semantic", "weight": 0.8}],
+                "edges": [
+                    {
+                        "data": {
+                            "id": "1-2-semantic",
+                            "source": "1",
+                            "target": "2",
+                            "linkType": "semantic",
+                            "weight": 0.8,
+                        }
+                    }
+                ],
                 "table_rows": [
                     {
                         "id": "abc12345...",
@@ -1267,11 +2179,79 @@ class GraphDataResponse(BaseModel):
         }
     )
 
-    nodes: list[dict[str, Any]]
-    edges: list[dict[str, Any]]
-    table_rows: list[dict[str, Any]]
+    nodes: list[MemoryGraphNode]
+    edges: list[MemoryGraphEdge]
+    table_rows: list[MemoryGraphTableRow]
     total_units: int
     limit: int
+
+
+class ObservationScope(BaseModel):
+    """A distinct observation scope: an exact tag set plus its observation count."""
+
+    tags: list[str] = Field(
+        description="The exact tag set defining this scope (normalized order). Empty list is the global/untagged scope."
+    )
+    count: int = Field(description="Number of observations that live under this scope")
+
+
+class ObservationScopesResponse(BaseModel):
+    """Response model for the observation scopes enumeration endpoint."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "scopes": [
+                    {"tags": ["user:alice"], "count": 12},
+                    {"tags": ["user:alice", "project:apollo"], "count": 4},
+                    {"tags": [], "count": 2},
+                ],
+                "total": 3,
+                "limit": 100,
+                "offset": 0,
+            }
+        }
+    )
+
+    scopes: list[ObservationScope] = Field(description="Distinct observation scopes, most populous first")
+    total: int = Field(description="Total number of distinct scopes in the bank (ignores limit/offset)")
+    limit: int = Field(description="Maximum number of scopes returned in this page")
+    offset: int = Field(description="Offset this page started at")
+
+
+class MemoryUnitListItem(OpenRowModel):
+    """One row of the memory-unit listing.
+
+    Extra keys are allowed and passed through: the rows used to be an open object, and
+    typing them must not drop a field an older or newer server also returns.
+    """
+
+    id: str = Field(description="Memory unit ID")
+    text: str = Field(default="", description="The fact text")
+    context: str = Field(default="", description="Context the memory was captured in")
+    date: str = Field(default="", description="Event date (ISO 8601), empty when unknown")
+    fact_type: str | None = Field(default=None, description="Fact type: world, experience or observation")
+    document_id: str | None = Field(default=None, description="Source document ID")
+    mentioned_at: str | None = Field(default=None, description="When the memory was mentioned (ISO 8601)")
+    occurred_start: str | None = Field(default=None, description="Start of the event interval (ISO 8601)")
+    occurred_end: str | None = Field(default=None, description="End of the event interval (ISO 8601)")
+    entities: str = Field(default="", description="Comma-separated canonical entity names")
+    chunk_id: str | None = Field(default=None, description="Source chunk ID")
+    proof_count: int = Field(default=1, description="How many times the fact was independently seen")
+    tags: list[str] = FieldWithDefault(list, description="Tags on this memory unit")
+    metadata: dict[str, Any] = FieldWithDefault(dict, description="Arbitrary metadata stored with the memory")
+    consolidated_at: str | None = Field(default=None, description="When consolidation last succeeded (ISO 8601)")
+    consolidation_failed_at: str | None = Field(
+        default=None, description="When consolidation last failed permanently (ISO 8601)"
+    )
+    state: str = Field(default="valid", description="Curation state: 'valid' or 'invalidated'")
+    invalidation_reason: str | None = Field(default=None, description="Why the fact was invalidated, if it was")
+    invalidated_at: str | None = Field(default=None, description="When the fact was invalidated (ISO 8601)")
+    edited_at: str | None = Field(default=None, description="When the fact was last edited by hand (ISO 8601)")
+    updated_at: str | None = Field(default=None, description="Write watermark for this row (ISO 8601)")
+    source_memory_ids: list[str] = FieldWithDefault(
+        list, description="An observation's source facts; empty for a source fact"
+    )
 
 
 class ListMemoryUnitsResponse(BaseModel):
@@ -1286,8 +2266,11 @@ class ListMemoryUnitsResponse(BaseModel):
                         "text": "Alice works at Google on the AI team",
                         "context": "Work conversation",
                         "date": "2024-01-15T10:30:00Z",
-                        "type": "world",
-                        "entities": "Alice (PERSON), Google (ORGANIZATION)",
+                        "fact_type": "world",
+                        "entities": "Alice, Google",
+                        "state": "valid",
+                        "tags": ["user:alice"],
+                        "metadata": {"source": "slack", "channel": "engineering"},
                     }
                 ],
                 "total": 150,
@@ -1297,10 +2280,220 @@ class ListMemoryUnitsResponse(BaseModel):
         }
     )
 
-    items: list[dict[str, Any]]
+    items: list[MemoryUnitListItem]
     total: int
     limit: int
     offset: int
+
+
+class PromptPreviewRequest(BaseModel):
+    """Request to render the prompts an operation would send, without calling an LLM.
+
+    The operation is the whole request: everything that shapes the prompt comes from
+    the bank — its resolved config, profile and directives — and the runtime data an
+    operation would be given is a fixed placeholder. There is deliberately nothing to
+    override. A preview answers "what does this bank send"; letting a caller pass its
+    own mission or sample text only moved that question somewhere the bank cannot
+    answer it. To try a candidate value, save it and look again — the response says
+    which settings are editable.
+    """
+
+    model_config = ConfigDict(json_schema_extra={"example": {"operation": "retain"}})
+
+    operation: Literal["retain", "consolidation", "reflect"] = Field(
+        default="retain", description="Which operation's prompts to render."
+    )
+    strategy: str | None = Field(
+        default=None,
+        description=(
+            "Name of a retain strategy to render under (a key of the bank's `retain_strategies`). "
+            "Retain only. Omit it and the bank's `retain_default_strategy` applies, exactly as it "
+            "does for a retain that names none."
+        ),
+    )
+
+
+class PromptBlockModel(BaseModel):
+    """One block of a message: its text, and the setting that decides it.
+
+    The **active** blocks of a message concatenate back to the exact text sent, so a
+    client can render them separately without showing the reader something the model
+    never receives. An **inactive** block has no text: it marks a setting that is
+    switched off, at the point where it would land if it were on.
+
+    Everything identifying a block is a machine value, never display copy — what a
+    block is called, and what turning a switched-off one on would do, is for the
+    client to say in the language it is running in.
+    """
+
+    text: str = Field(description="The block's text; empty when the block is inactive.")
+    source: Literal["config", "builtin"] = Field(
+        description="`config` — produced by a setting (`field` names it); `builtin` — Hindsight's own wording."
+    )
+    field: str = Field(default="", description="Config field behind this block; empty when no single field owns it.")
+    section: str = Field(
+        default="",
+        description=(
+            "Slug for a part the preview names itself and no field owns: `bank_identity`, `disposition`, "
+            "`directives`. Empty otherwise."
+        ),
+    )
+    heading: str = Field(
+        default="",
+        description=(
+            "The section heading the prompt text carries at this point, extracted from the prompt itself. "
+            "Empty when it carries none."
+        ),
+    )
+    active: bool = Field(default=True, description="Whether this block is in the prompt as configured.")
+    value: str | None = Field(default=None, description="The field's effective value; null when unset.")
+    # Required, with no default: progenitor (the Rust client generator) rejects a
+    # default value on an inline enum property with TypeError(InvalidValue), and the
+    # server always sends this field anyway. Same reason `source` and `role` carry no
+    # default. Don't add one back without regenerating the Rust client.
+    kind: Literal["text", "boolean", "choice", "complex"] = Field(
+        description="Shape of the value, so a client can offer the right control for editing it."
+    )
+    choices: list[str] | None = Field(default=None, description="Allowed values, when `kind` is `choice`.")
+    editable: bool = Field(
+        default=False,
+        description=(
+            "Whether this bank may override the field via the bank config API. Server-level fields shape "
+            "the prompt but cannot be set per bank, and offering to edit one would only collect a 400."
+        ),
+    )
+
+
+class PromptMessageModel(BaseModel):
+    """One message of the request, as the blocks it is built from."""
+
+    role: Literal["system", "user"]
+    blocks: list[PromptBlockModel] = Field(default_factory=list)
+
+
+class RunSettingModel(BaseModel):
+    """A setting that shapes the operation without appearing in its prompt.
+
+    Chunk sizes decide how the input is cut before extraction runs, so they change
+    what comes back while contributing no prompt text — they cannot be blocks, which
+    partition the message, and these are in none of it.
+    """
+
+    field: str
+    value: str | None = Field(default=None, description="Effective value; null when unset.")
+    kind: Literal["text", "boolean", "choice", "complex"] = Field(
+        description="Shape of the value, so a client can offer the right control."
+    )
+    editable: bool = Field(
+        default=False, description="Whether this bank may override the field via the bank config API."
+    )
+
+
+class PromptPreviewResponse(BaseModel):
+    """The messages one call of the requested operation would send.
+
+    `messages` is in send order, system first. Both are always present because a
+    mission is not necessarily in the system prompt: retain and consolidation keep
+    their system prompt bank-agnostic (so one provider-side cache serves every bank)
+    and carry the mission in the user message instead.
+
+    When `skipped_reason` is set the configuration means no prompt is sent at all —
+    `chunks` extraction mode stores each chunk verbatim and never calls an LLM — and
+    `messages` is empty.
+    """
+
+    messages: list[PromptMessageModel] = Field(
+        default_factory=list,
+        description="Request messages, in send order. Each is given as the blocks it is built from.",
+    )
+    strategy: str | None = Field(
+        default=None, description="The retain strategy these prompts were rendered under, if any."
+    )
+    strategies: list[str] = Field(
+        default_factory=list,
+        description="Names of the bank's retain strategies, so a client can offer them without a second call.",
+    )
+    run_settings: list[RunSettingModel] = Field(
+        default_factory=list,
+        description="Settings that shape the operation without appearing in its prompt, such as chunk sizes.",
+    )
+    response_schema: dict[str, Any] | None = Field(
+        default=None, description="JSON schema the response is constrained to, when the operation constrains it."
+    )
+    skipped_reason: str | None = Field(
+        default=None, description="Why no prompt is sent, when the configuration means none is."
+    )
+
+
+class DryRunExtractRequest(BaseModel):
+    """Request to run fact extraction ONLY (no resolution/links/embeddings/persistence).
+
+    Every field below the content/context/date is a prompt-affecting override applied just for this
+    call — used to preview what a candidate retain mission (or any extraction setting) would extract,
+    without changing the bank. Unset (null) fields fall back to the bank's resolved config.
+    """
+
+    content: str = Field(description="Text to extract facts from (e.g. a document or a single chunk).")
+    context: str = Field(default="", description="Optional context about the content.")
+    # Named `timestamp` to match the retain item payload (retain maps timestamp -> event_date internally).
+    timestamp: datetime | None = Field(
+        default=None, description="Reference timestamp for resolving relative times (ISO 8601)."
+    )
+    agent_name: str | None = Field(
+        default=None,
+        deprecated=True,
+        description=(
+            "Deprecated: describe the speaker in `context` instead. Narrator override (memory owner) "
+            "primed in the prompt; still honored for backwards compatibility."
+        ),
+    )
+    strategy: str | None = Field(
+        default=None,
+        description=(
+            "Name of a retain strategy to extract under (a key of the bank's `retain_strategies`). "
+            "Omit it and the bank's `retain_default_strategy` applies, exactly as it does for a "
+            "retain that names none."
+        ),
+    )
+    # --- prompt-affecting config overrides (null = use the bank's value) ---
+    retain_mission: str | None = None
+    retain_extraction_mode: str | None = None
+    retain_custom_instructions: str | None = None
+    retain_extract_causal_links: bool | None = None
+    retain_chunk_size: int | None = None
+    entity_labels: list[LabelGroup] | None = Field(
+        default=None, description="Controlled vocabulary for entity labels (overrides the bank's config for this call)"
+    )
+    entities_allow_free_form: bool | None = None
+    llm_output_language: str | None = None
+
+    _migrate_entity_labels = field_validator("entity_labels", mode="before")(_migrate_entity_labels_input)
+
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("content cannot be empty")
+        return v
+
+
+class DocumentListItem(OpenRowModel):
+    """One row of the document listing — a document's metadata without its text.
+
+    Extra keys are allowed and passed through: the rows used to be an open object, and
+    typing them must not drop a field an older or newer server also returns.
+    """
+
+    id: str = Field(description="Document ID")
+    bank_id: str = Field(default="", description="Bank the document belongs to")
+    content_hash: str | None = Field(default=None, description="Hash of the document text, for idempotent retain")
+    created_at: str = Field(default="", description="When the document was first retained (ISO 8601)")
+    updated_at: str = Field(default="", description="When the document was last written (ISO 8601)")
+    text_length: int = Field(default=0, description="Length of the stored document text in characters")
+    memory_unit_count: int = Field(default=0, description="Number of memory units extracted from this document")
+    retain_params: dict[str, Any] | None = Field(default=None, description="Parameters used during retain")
+    document_metadata: dict[str, Any] | None = Field(default=None, description="Document metadata")
+    tags: list[str] = FieldWithDefault(list, description="Tags associated with this document")
 
 
 class ListDocumentsResponse(BaseModel):
@@ -1328,7 +2521,7 @@ class ListDocumentsResponse(BaseModel):
         }
     )
 
-    items: list[dict[str, Any]]
+    items: list[DocumentListItem]
     total: int
     limit: int
     offset: int
@@ -1387,7 +2580,8 @@ class DocumentResponse(BaseModel):
 
     id: str
     bank_id: str
-    original_text: str
+    # None when document text storage is disabled (HINDSIGHT_API_STORE_DOCUMENT_TEXT=false).
+    original_text: str | None
     content_hash: str | None
     created_at: str
     updated_at: str
@@ -1398,6 +2592,19 @@ class DocumentResponse(BaseModel):
     tags: list[str] = FieldWithDefault(list, description="Tags associated with this document")
     document_metadata: dict[str, Any] | None = Field(default=None, description="Document metadata")
     retain_params: dict[str, Any] | None = Field(default=None, description="Parameters used during retain")
+    observation_scopes: str | list[list[str]] | None = Field(
+        default=None,
+        description="The observation_scopes spec configured at retain time (e.g. 'all_combinations', "
+        "'per_tag', or explicit tag-set lists), captured into retain_params. None when none was set "
+        "(default 'combined' scoping) or for documents retained before this was captured.",
+    )
+    attachments: list[ChunkAttachment] | None = Field(
+        default=None,
+        description=(
+            "Attachments referenced by this document, when it was retained with inline content. "
+            "Each carries a bank-scoped `url` serving the original bytes. Omitted when there are none."
+        ),
+    )
 
 
 class UpdateDocumentRequest(BaseModel):
@@ -1413,8 +2620,9 @@ class UpdateDocumentRequest(BaseModel):
 
     tags: list[str] | None = Field(
         default=None,
-        description="New tags for the document and its memory units. "
-        "Triggers observation invalidation and re-consolidation.",
+        description="The complete new set of tags for the document and its memory units — this "
+        "REPLACES the existing tags rather than adding to them, so omitting a tag drops it and "
+        "`[]` clears them all. Triggers observation invalidation and re-consolidation.",
     )
 
 
@@ -1422,6 +2630,96 @@ class UpdateDocumentResponse(BaseModel):
     """Response model for update document endpoint."""
 
     success: bool = True
+
+
+class UpdateMemoryRequest(BaseModel):
+    """Request model for curating a single memory unit (edit / invalidate / revert).
+
+    Provide ``text`` to correct the fact, and/or ``state`` to invalidate
+    ('invalidated') or revert ('valid') it. ``reason`` is optional free text
+    recorded on the memory. At least one of ``text`` or ``state`` must be set.
+    Only world/experience facts can be curated; observations are derived.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "state": "invalidated",
+                "reason": "superseded: server decommissioned 2026-06-01",
+            }
+        }
+    )
+
+    text: str | None = Field(
+        default=None,
+        description="New fact text. Re-embeds the memory, drops its derived "
+        "observations and links, and triggers re-consolidation.",
+    )
+    context: str | None = Field(
+        default=None,
+        description="New context for the fact. '' clears it; omit to leave unchanged.",
+    )
+    occurred_start: str | None = Field(
+        default=None,
+        description="New occurred-range start (ISO 8601). '' clears it; omit to leave unchanged.",
+    )
+    occurred_end: str | None = Field(
+        default=None,
+        description="New occurred-range end (ISO 8601). '' clears it; omit to leave unchanged.",
+    )
+    fact_type: str | None = Field(
+        default=None,
+        description="Reclassify the fact: 'world' or 'experience'. Omit to leave unchanged.",
+    )
+    entities: list[str] | None = Field(
+        default=None,
+        description="Replace the fact's entities. How each name is matched to an entity is "
+        "governed by 'resolve_entities'. '[]' detaches all entities. Omit to leave unchanged.",
+    )
+    resolve_entities: bool = Field(
+        default=True,
+        description="Whether the names in 'entities' are resolved against the entities already in "
+        "the bank. True (default) is what retain does: a similar existing entity is reused when it "
+        "scores above the match threshold, so a name close to one already in the bank may resolve "
+        "to that one instead of the one you wrote. False takes the names literally — an existing "
+        "entity is reused only on a case-insensitive name match, any other name creates a new "
+        "entity, and names in the same request are never merged with each other. Use False for "
+        "hand-authored corrections, where the name you sent is the answer rather than a guess. "
+        "Ignored when 'entities' is omitted.",
+    )
+    state: str | None = Field(
+        default=None,
+        description="Curation state: 'invalidated' to soft-retire the memory "
+        "(excluded from recall/consolidation, links and derived observations "
+        "pruned, moved to the archive) or 'valid' to revert. Reversible.",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="Optional free-text reason recorded when invalidating.",
+    )
+
+    @model_validator(mode="after")
+    def _require_an_edit(self) -> "UpdateMemoryRequest":
+        has_value_edit = any(
+            v is not None
+            for v in (
+                self.text,
+                self.context,
+                self.occurred_start,
+                self.occurred_end,
+                self.fact_type,
+                self.entities,
+                self.state,
+            )
+        )
+        has_date_clear = bool({"occurred_start", "occurred_end"} & self.model_fields_set)
+        if not has_value_edit and not has_date_clear:
+            raise ValueError("Provide at least one field to update.")
+        if self.state is not None and self.state not in ("valid", "invalidated"):
+            raise ValueError("state must be 'valid' or 'invalidated'.")
+        if self.fact_type is not None and self.fact_type not in ("world", "experience"):
+            raise ValueError("fact_type must be 'world' or 'experience'.")
+        return self
 
 
 class DeleteDocumentResponse(BaseModel):
@@ -1466,6 +2764,13 @@ class ChunkResponse(BaseModel):
     chunk_index: int
     chunk_text: str
     created_at: str
+    attachments: list[ChunkAttachment] | None = Field(
+        default=None,
+        description=(
+            "Attachments referenced by this chunk's text, when it was retained with inline content. "
+            "Each carries a bank-scoped `url` serving the original bytes. Omitted when there are none."
+        ),
+    )
 
 
 class ListChunksResponse(BaseModel):
@@ -1483,6 +2788,31 @@ class ReprocessDocumentResponse(BaseModel):
     success: bool
     operation_id: str
     items_count: int
+
+
+class DocumentImportSubmitResponse(BaseModel):
+    """Response for the async document-import endpoint (202).
+
+    The import runs in the background; poll the operations endpoint for status.
+    The imported/skipped counts (documents_imported, facts_imported,
+    observations_imported, etc.) are written to the operation's result_metadata.
+    """
+
+    operation_id: str
+    status: str = "pending"
+
+
+class DocumentExportSubmitResponse(BaseModel):
+    """Response for the async document-export endpoint (202).
+
+    The export runs in the background; poll the operations endpoint for status.
+    On completion the operation's ``result_metadata`` carries ``download_url``
+    (fetch the ZIP from GET /v1/default/files/download/{key}), ``storage_key``,
+    ``byte_size``, and ``filename``.
+    """
+
+    operation_id: str
+    status: str = "pending"
 
 
 class DeleteResponse(BaseModel):
@@ -1530,6 +2860,7 @@ class BankStatsResponse(BaseModel):
                 "pending_operations": 2,
                 "failed_operations": 0,
                 "last_consolidated_at": "2024-01-15T10:30:00Z",
+                "last_memory_write_at": "2024-01-15T11:05:00Z",
                 "pending_consolidation": 0,
                 "failed_consolidation": 0,
                 "total_observations": 45,
@@ -1553,12 +2884,73 @@ class BankStatsResponse(BaseModel):
     )
     # Consolidation stats
     last_consolidated_at: str | None = Field(default=None, description="When consolidation last ran (ISO format)")
-    pending_consolidation: int = Field(default=0, description="Number of memories not yet processed into observations")
+    last_memory_write_at: str | None = Field(
+        default=None,
+        description=(
+            "When a memory was last written in this bank — stored, edited, or consolidated (ISO format). "
+            "Null if the bank has no memories. A mental model whose `last_memory_seen_at` is at or after "
+            "this is up to date whatever its tags; an older one may need a refresh, which only the single "
+            "mental-model read can confirm."
+        ),
+    )
+    pending_consolidation: int = Field(
+        default=0,
+        description=(
+            "Number of source memories (world/experience) still queued for consolidation into "
+            "observations. Excludes memories whose consolidation permanently failed — those are "
+            "counted only in failed_consolidation — so this drains to 0 when the consolidator catches up."
+        ),
+    )
     failed_consolidation: int = Field(
         default=0,
         description="Number of source memories (world/experience) whose consolidation permanently failed and can be retried via the consolidation recovery endpoint.",
     )
     total_observations: int = Field(default=0, description="Total number of observations")
+
+
+class LlmOperationHealth(BaseModel):
+    """LLM connectivity status for a single operation. Status only — no provider/model/
+    endpoint/error, so the probe never discloses the LLM configuration."""
+
+    operation: Literal["retain", "consolidation", "reflect"] = Field(
+        # Distinct title so the generated clients don't collide this inline enum with the
+        # async-operation "operation" enum (progenitor names Rust types from the title).
+        title="LlmHealthOperation",
+        description="Operation whose LLM was probed",
+    )
+    ok: bool = Field(description="True only when the probe connected successfully")
+    status: Literal["connected", "not_configured", "auth_failed", "unreachable", "timeout"] = Field(
+        # Distinct title — otherwise this inline enum's default title "Status" collides
+        # with the async-operation status enum and breaks the generated Rust client/CLI.
+        title="LlmHealthStatus",
+        description="'connected'; 'not_configured' (provider is 'none'); 'auth_failed' (rejected — "
+        "usually a wrong/expired API key); 'unreachable' (call failed); 'timeout'",
+    )
+    latency_ms: float | None = Field(default=None, description="Round-trip latency of the probe call")
+
+
+class BankLlmHealthResponse(BaseModel):
+    """Per-bank LLM connectivity probe across retain/consolidation/reflect. Operations
+    that share a configuration are probed once. Discloses status only — never the
+    provider, model, endpoint, API key, or raw error."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "bank_id": "user123",
+                "operations": [
+                    {"operation": "retain", "ok": True, "status": "connected", "latency_ms": 412.0},
+                    {"operation": "consolidation", "ok": True, "status": "connected", "latency_ms": 412.0},
+                    {"operation": "reflect", "ok": False, "status": "not_configured", "latency_ms": None},
+                ],
+            }
+        }
+    )
+
+    bank_id: str = Field(description="Bank identifier")
+    operations: list[LlmOperationHealth] = Field(
+        description="Connectivity status per operation (retain, consolidation, reflect)"
+    )
 
 
 class MemoryTimeseriesBucket(BaseModel):
@@ -1616,6 +3008,9 @@ class DirectiveListResponse(BaseModel):
     """Response model for listing directives."""
 
     items: list[DirectiveResponse]
+    total: int = Field(description="Total number of directives matching the filter (not just this page)")
+    limit: int = Field(description="Page size that was applied")
+    offset: int = Field(description="Offset that was applied")
 
 
 class CreateDirectiveRequest(BaseModel):
@@ -1625,7 +3020,10 @@ class CreateDirectiveRequest(BaseModel):
     content: str = Field(description="The directive text to inject into prompts")
     priority: int = Field(default=0, description="Higher priority directives are injected first")
     is_active: bool = Field(default=True, description="Whether this directive is active")
-    tags: list[str] = FieldWithDefault(list, description="Tags for filtering")
+    tags: list[str] = FieldWithDefault(
+        list,
+        description="Directive execution scope. Empty means global; non-empty requires a matching reflect scope.",
+    )
 
 
 class UpdateDirectiveRequest(BaseModel):
@@ -1660,6 +3058,31 @@ class MentalModelTrigger(BaseModel):
         default=False,
         description="If true, refresh this mental model after observations consolidation (real-time mode)",
     )
+    refresh_cron: str | None = Field(
+        default=None,
+        description=(
+            "Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * *' for daily at 03:00 UTC) "
+            "for refreshing this mental model on a fixed schedule. Mutually exclusive with "
+            "refresh_after_consolidation — a model refreshes either after consolidation or on a cron "
+            "schedule, not both. A scheduled refresh only runs when the model is stale (new memories in "
+            "its scope since the last refresh); if nothing changed, the tick is skipped to avoid a "
+            "wasted LLM call. null = no schedule."
+        ),
+    )
+    min_refresh_interval_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Minimum seconds between two automatic refreshes of this mental model. A triggered "
+            "refresh that arrives sooner is not dropped: it is queued and parked until the window "
+            "expires, and every further trigger in the meantime folds into that one queued refresh, "
+            "so a burst of retains costs one refresh instead of one per retain. Applies to both "
+            "refresh_after_consolidation and refresh_cron. Explicit refreshes (API, MCP, control "
+            "plane) ignore it and run immediately. 0 disables the floor for this model; null falls "
+            "back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by "
+            "default, i.e. no floor)."
+        ),
+    )
     fact_types: list[Literal["world", "experience", "observation"]] | None = Field(
         default=None,
         description="Filter which fact types are retrieved during reflect. None means all types (world, experience, observation).",
@@ -1677,8 +3100,11 @@ class MentalModelTrigger(BaseModel):
         description=(
             "Override how the model's tags filter memories during refresh. "
             "If not set, defaults to 'all_strict' when the model has tags (security isolation) "
-            "or 'any' when the model has no tags. "
-            "Set to 'any' to include untagged memories alongside tagged ones during refresh."
+            "or 'any' when the model has no tags. Under 'all_strict' a memory must carry EVERY "
+            "one of the model's tags and untagged memories are excluded, which is why a model "
+            "tagged with labels its memories do not carry refreshes to empty content. "
+            "Set to 'all' to keep requiring the tags while including untagged memories, or to "
+            "'any' to include untagged memories alongside any single tag match."
         ),
     )
     tag_groups: list[TagGroup] | None = Field(
@@ -1710,6 +3136,26 @@ class MentalModelTrigger(BaseModel):
             "None means use the bank/global config default (recall_chunks_max_tokens)."
         ),
     )
+    response_schema: dict | None = Field(
+        default=None,
+        description=(
+            "Optional JSON Schema for structured output. When set, each refresh runs the same "
+            "structured-output extraction as reflect's response_schema and stores the parsed result "
+            "under reflect_response.structured_output alongside the markdown content."
+        ),
+    )
+    keep_trace: bool = Field(
+        default=False,
+        description=(
+            "If true, every refresh of this mental model records how it reached its result under "
+            "reflect_response.trace: the mode it ran in and why, the resolved scope and time window, "
+            "how many facts retrieval returned versus how many the agent used, the tool and LLM calls, "
+            "and any delta operations. Only the latest refresh's trace is kept. This is the only way to "
+            "diagnose a cron- or consolidation-driven refresh after the fact, since no human sees those "
+            "run. Tool outputs are reduced to result counts to keep the stored trace bounded; use "
+            "LLM request tracing for raw prompts and responses."
+        ),
+    )
 
     @field_validator("fact_types")
     @classmethod
@@ -1717,6 +3163,54 @@ class MentalModelTrigger(BaseModel):
         if v is not None and len(v) == 0:
             raise ValueError("fact_types must not be empty. Use null to include all fact types.")
         return v
+
+    @field_validator("tag_groups")
+    @classmethod
+    def validate_tag_groups_are_exact(cls, v: "list[TagGroup] | None") -> "list[TagGroup] | None":
+        # A trigger's scope is read by two paths that resolve differently: the refresh runs
+        # through reflect, which resolves fuzzy leaves, while the staleness check and the
+        # scope watermark build SQL straight from the stored groups and do not. A stored
+        # fuzzy leaf would therefore build content from the resolved tags while never being
+        # marked stale by them, and would drift as the bank's tag vocabulary changes.
+        # Resolution is a request-time step; stored scopes stay exact.
+        if v is not None and needs_resolution(v):
+            raise ValueError(
+                "resolve='fuzzy' is not supported in a trigger's tag_groups. A stored scope must "
+                "be exact; use it on a recall or reflect request instead."
+            )
+        return v
+
+    @field_validator("response_schema")
+    @classmethod
+    def validate_trigger_response_schema(cls, v: dict | None) -> dict | None:
+        if v is not None:
+            validate_response_schema(v)
+        return v
+
+    @field_validator("refresh_cron")
+    @classmethod
+    def validate_refresh_cron(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            return None
+        from croniter import croniter
+
+        if not croniter.is_valid(v):
+            raise ValueError(f"refresh_cron is not a valid cron expression: {v!r}")
+        return v
+
+    @model_validator(mode="after")
+    def validate_refresh_exclusivity(self) -> "MentalModelTrigger":
+        # A mental model refreshes either after consolidation (real-time) or on a
+        # cron schedule, never both — the two triggers would race and double-refresh.
+        if self.refresh_after_consolidation and self.refresh_cron:
+            raise ValueError(
+                "refresh_after_consolidation and refresh_cron are mutually exclusive: "
+                "a mental model refreshes either after consolidation or on a cron schedule, not both."
+            )
+        return self
 
 
 class MentalModelResponse(BaseModel):
@@ -1733,7 +3227,26 @@ class MentalModelResponse(BaseModel):
     tags: list[str] = FieldWithDefault(list)
     max_tokens: int | None = Field(default=None)
     trigger: MentalModelTrigger | None = Field(default=None)
-    last_refreshed_at: str | None = None
+    last_refreshed_at: str | None = Field(
+        default=None,
+        description=(
+            "When a refresh last finished for this model — wall-clock, in ISO format. Advances on "
+            "every refresh that completes, including one that found nothing new and preserved the "
+            "content, and on a direct edit of `content`. A refresh that failed leaves it alone. "
+            "This is the field to answer 'have I already refreshed this?'; it says nothing about "
+            "whether the model is behind the data, which is `last_memory_seen_at` / `is_stale`."
+        ),
+    )
+    last_memory_seen_at: str | None = Field(
+        default=None,
+        description=(
+            "How far through the bank's memories this model is written — the newest in-scope memory "
+            "the last refresh saw, in ISO format. Stands still when nothing in the model's scope has "
+            "been written, however often it is refreshed. At or after the bank's `last_memory_write_at` "
+            "(GET /stats) the model is provably up to date; when it is older, `is_stale` settles it "
+            "against the model's own scope. Null for a model no refresh has stamped yet."
+        ),
+    )
     created_at: str | None = None
     reflect_response: dict | None = Field(
         default=None,
@@ -1742,9 +3255,11 @@ class MentalModelResponse(BaseModel):
     is_stale: bool | None = Field(
         default=None,
         description=(
-            "True when new memories matching this mental model's tag/fact_type scope have been "
-            "ingested since last_refreshed_at, or consolidation has pending items. Only populated "
-            "when detail=full."
+            "True when memories matching this mental model's tag/fact_type scope have been written "
+            "since last_memory_seen_at — the same check that decides whether a scheduled refresh "
+            "does any work, so a model flagged here is one a refresh would actually rewrite. "
+            "Populated on both the single read and the list. Deletions are not observed: removing "
+            "an in-scope memory leaves no write behind, so it does not raise this flag."
         ),
     )
 
@@ -1753,6 +3268,217 @@ class MentalModelListResponse(BaseModel):
     """Response model for listing mental models."""
 
     items: list[MentalModelResponse]
+    total: int = Field(description="Total number of mental models matching the filter (not just this page)")
+    limit: int = Field(description="Page size that was applied")
+    offset: int = Field(description="Offset that was applied")
+
+
+# =========================================================================
+# KNOWLEDGE BASE (folders + pages over mental models, rendered as markdown)
+# =========================================================================
+
+
+class KnowledgeNode(BaseModel):
+    """A node in the knowledge-base tree — a folder or a page.
+
+    Pages carry ``description``/``tags`` from their backing mental model. The
+    knowledge base is client-managed (CRUD); ``managed`` lets a client tag a node
+    as system-owned vs. hand-authored.
+    """
+
+    id: str
+    kind: Literal["folder", "page"]
+    name: str
+    parent_id: str | None = None
+    mental_model_id: str | None = Field(default=None, description="Backing mental model id (pages only).")
+    managed: bool = Field(default=False, description="Client-set flag: true = system-owned, false = hand-authored.")
+    description: str | None = Field(default=None, description="Page source query (the page's `description`).")
+    tags: list[str] = FieldWithDefault(list)
+    timestamp: str | None = Field(default=None, description="Last refresh (page) or last update (folder).")
+    is_stale: bool | None = Field(
+        default=None,
+        description="Pages only, populated by the tree endpoint. True when a memory in *this page's* "
+        "scope — its tags and fact types — has been written since the page last read the memories. "
+        "That is the same check a scheduled refresh runs before spending an LLM call, so a flagged page "
+        "is one a refresh would actually rewrite. Deletions are not observed: removing an in-scope memory "
+        "leaves no write behind, so it does not raise this flag.",
+    )
+    trigger: MentalModelTrigger | None = Field(
+        default=None,
+        description="Pages only: the page's refresh settings — when it rebuilds itself "
+        "(`refresh_after_consolidation` or `refresh_cron`), in which mode, and over which facts. "
+        "This is the EFFECTIVE policy: a setting the page never stored is reported at its default, "
+        "so compare the fields you care about rather than the whole object against a patch you "
+        "sent. Absent on folders, which have no backing mental model, and on a page with no "
+        "trigger stored.",
+    )
+    children: list["KnowledgeNode"] = FieldWithDefault(list)
+
+
+class KnowledgeTreeResponse(BaseModel):
+    """The knowledge base as a nested folder/page tree."""
+
+    roots: list[KnowledgeNode]
+
+
+class CreateFolderRequest(BaseModel):
+    """Create a folder under an optional parent folder."""
+
+    name: str
+    parent_id: str | None = None
+
+
+class CreatePageRequest(BaseModel):
+    """Create a page (a mental model + tree node) under an optional parent folder."""
+
+    name: str
+    source_query: str
+    parent_id: str | None = None
+    tags: list[str] | None = Field(
+        default=None,
+        description=(
+            "Tags that SCOPE which memories this page is built from — not labels. Every tag here, "
+            "including a `type:<x>` tag used to set the page's rendered type, is part of the filter. "
+            "By default a tagged page matches with `all_strict`: a memory must carry EVERY one of "
+            "these tags, and untagged memories are excluded entirely. Tags invented for the page "
+            "(a topic, a document type) therefore match nothing unless your memories were retained "
+            "with those exact tags, and the page generates as 'I don't have information about this'. "
+            "Omit this field to build the page from the whole bank, or set `trigger.tags_match` to "
+            "'all' to require the tags while still including untagged memories."
+        ),
+    )
+    max_tokens: int | None = None
+    trigger: MentalModelTrigger | None = None
+
+
+class UpdateNodeRequest(BaseModel):
+    """Rename/move a node and/or update a page's options. Each field applies only
+    when present in the request body."""
+
+    name: str | None = None
+    parent_id: str | None = None
+    # Page-only options (updated on the backing mental model). Changing
+    # source_query schedules an async refresh so the page rebuilds.
+    source_query: str | None = None
+    tags: list[str] | None = Field(
+        default=None,
+        description=(
+            "Replaces the page's tags, which SCOPE which memories it is built from. Pass `[]` to "
+            "clear them and rebuild the page from the whole bank — the fix when a page generates "
+            "'I don't have information about this' because its tags match no memory. See the "
+            "matching rules on this field in `CreatePageRequest`; `trigger.tags_match` widens them."
+        ),
+    )
+    max_tokens: int | None = None
+    trigger: MentalModelTrigger | None = Field(
+        default=None,
+        description=(
+            "Refresh settings to change. Applied as a patch: only the fields present in this "
+            "object are updated, and the rest keep the page's current values — so moving a page "
+            "onto a schedule does not reset how it refreshes. Setting refresh_cron clears "
+            "refresh_after_consolidation and vice versa, since a page refreshes on one or the "
+            "other, never both."
+        ),
+    )
+
+
+class CreateKnowledgePageResponse(BaseModel):
+    """Result of creating a page: the node id, its mental model, and the refresh op."""
+
+    page_id: str
+    mental_model_id: str
+    operation_id: str | None = None
+
+
+class KnowledgePageResponse(BaseModel):
+    """A knowledge page rendered as a markdown document."""
+
+    id: str
+    name: str
+    type: str = Field(description="Page type — from a `type:<x>` tag, else 'knowledge-page'.")
+    description: str | None = Field(default=None, description="The source query that rebuilds the page.")
+    tags: list[str] = FieldWithDefault(list)
+    timestamp: str | None = Field(default=None, description="Last refresh time (falls back to creation).")
+    body: str | None = Field(default=None, description="The page's synthesized markdown body.")
+    markdown: str = Field(description="The full markdown document: YAML frontmatter + markdown body.")
+
+
+class KnowledgePageBundleFile(BaseModel):
+    """One file in a portable markdown bundle."""
+
+    path: str
+    content: str
+
+
+class KnowledgePageBundleResponse(BaseModel):
+    """A portable markdown bundle — a flat set of markdown files (index + pages + logs)."""
+
+    files: list[KnowledgePageBundleFile]
+
+
+class KnowledgePageSearchResult(BaseModel):
+    """One hybrid-search hit: a knowledge page and its fused relevance score."""
+
+    id: str
+    name: str
+    mental_model_id: str | None = None
+    snippet: str
+    score: float
+    updated_at: str | None = None
+
+
+class KnowledgePageSearchResponse(BaseModel):
+    """Ranked knowledge-page search results (BM25 + vector, RRF-fused)."""
+
+    results: list[KnowledgePageSearchResult]
+    total: int
+
+
+def _knowledge_node_model(node: dict[str, Any]) -> KnowledgeNode:
+    """Project an engine node dict into a (childless) KnowledgeNode."""
+    is_page = node.get("kind") == "page"
+    return KnowledgeNode(
+        id=node["id"],
+        kind=node["kind"],
+        name=node["name"],
+        parent_id=node.get("parent_id"),
+        mental_model_id=node.get("mental_model_id"),
+        managed=bool(node.get("managed")),
+        description=node.get("source_query") if is_page else None,
+        tags=list(node.get("tags") or []) if is_page else [],
+        timestamp=(node.get("last_refreshed_at") if is_page else node.get("updated_at")),
+        is_stale=node.get("is_stale") if is_page else None,
+        trigger=node.get("trigger") if is_page else None,
+    )
+
+
+def _build_knowledge_tree(nodes: list[dict[str, Any]]) -> list[KnowledgeNode]:
+    """Assemble the flat node list into a nested tree of roots."""
+    models = {n["id"]: _knowledge_node_model(n) for n in nodes}
+    roots: list[KnowledgeNode] = []
+    for node in nodes:
+        model = models[node["id"]]
+        parent_id = node.get("parent_id")
+        if parent_id and parent_id in models:
+            models[parent_id].children.append(model)
+        else:
+            roots.append(model)
+    return roots
+
+
+def _knowledge_page_response(node: dict[str, Any]) -> KnowledgePageResponse:
+    """Project a page node (with merged mental-model content) into a markdown document."""
+    page = page_markdown.page_type(node.get("tags"))
+    return KnowledgePageResponse(
+        id=node["id"],
+        name=node["name"],
+        type=page.type,
+        description=node.get("source_query"),
+        tags=page.display_tags,
+        timestamp=node.get("last_refreshed_at") or node.get("created_at"),
+        body=node.get("content"),
+        markdown=page_markdown.render_document(node),
+    )
 
 
 class CreateMentalModelRequest(BaseModel):
@@ -1848,20 +3574,37 @@ class BankTemplateConfig(BaseModel):
     reflect_mission: str | None = Field(default=None, description="Mission/context for Reflect operations")
     retain_mission: str | None = Field(default=None, description="Steers what gets extracted during retain")
     retain_extraction_mode: str | None = Field(
-        default=None, description="Fact extraction mode: 'concise' (default), 'verbose', or 'custom'"
+        default=None,
+        description="Fact extraction mode: 'concise' (default), 'verbose', 'custom', 'verbatim', or 'chunks'",
     )
     retain_custom_instructions: str | None = Field(
         default=None, description="Custom extraction prompt (when mode='custom')"
     )
-    retain_chunk_size: int | None = Field(default=None, description="Max token size for each content chunk")
+    retain_chunk_size: int | None = Field(default=None, description="Target max characters for each content chunk")
+    retain_structured_chunk_size: int | None = Field(
+        default=None,
+        description=(
+            "Max characters for a single JSONL line or conversation turn to keep whole; "
+            "defaults to retain_chunk_size when unset"
+        ),
+    )
     enable_observations: bool | None = Field(default=None, description="Toggle observation consolidation")
     observations_mission: str | None = Field(default=None, description="Controls what gets synthesised")
+    enable_text_search: bool | None = Field(
+        default=None, description="Toggle the keyword (BM25) arm during recall, leaving pure vector search"
+    )
+    enable_temporal_retrieval: bool | None = Field(
+        default=None, description="Toggle the temporal arm (and its date-aware query analysis) during recall"
+    )
+    enable_graph_retrieval: bool | None = Field(
+        default=None, description="Toggle the entity/link graph arm during recall"
+    )
+    enable_reranking: bool | None = Field(default=None, description="Toggle cross-encoder reranking during recall")
     disposition_skepticism: int | None = Field(default=None, ge=1, le=5, description="Skepticism trait (1-5)")
     disposition_literalism: int | None = Field(default=None, ge=1, le=5, description="Literalism trait (1-5)")
     disposition_empathy: int | None = Field(default=None, ge=1, le=5, description="Empathy trait (1-5)")
-    entity_labels: list[dict[str, Any]] | None = Field(
-        default=None, description="Controlled vocabulary for entity labels"
-    )
+    entity_labels: list[LabelGroup] | None = Field(default=None, description="Controlled vocabulary for entity labels")
+    _migrate_entity_labels = field_validator("entity_labels", mode="before")(_migrate_entity_labels_input)
     entities_allow_free_form: bool | None = Field(
         default=None, description="Allow entities outside the label vocabulary"
     )
@@ -1873,6 +3616,9 @@ class BankTemplateConfig(BaseModel):
     )
     retain_chunk_batch_size: int | None = Field(
         default=None, description="Max chunks per streaming batch (0 disables batching)"
+    )
+    retain_max_attachments_per_chunk: int | None = Field(
+        default=None, description="Hard cap on inline images in a single extraction chunk"
     )
     mcp_enabled_tools: list[str] | None = Field(
         default=None, description="MCP tool allowlist for this bank (None = all tools)"
@@ -1889,8 +3635,34 @@ class BankTemplateConfig(BaseModel):
     max_observations_per_scope: int | None = Field(
         default=None, description="Max observations to retain per consolidation scope"
     )
+    observation_scope_limits: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Per-scope overrides of max_observations_per_scope: "
+            '[{"scope": ["run_*", "shared"], "limit": 1}]. Each scope is a list of '
+            "fnmatch tag-globs; a consolidation scope matches under exact cover "
+            "(every tag matched by a glob and every glob matched by a tag). The first "
+            "matching rule wins; unmatched scopes fall back to max_observations_per_scope."
+        ),
+    )
     reflect_source_facts_max_tokens: int | None = Field(
         default=None, description="Max tokens of source facts per reflect call"
+    )
+    knowledge_page_default_trigger: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Trigger fields merged over the built-in knowledge-page default when a page is created "
+            '(e.g. {"refresh_cron": "0 * * * *"}). A trigger sent with the create request still wins.'
+        ),
+    )
+    mental_model_min_refresh_interval_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Minimum seconds between two automatic refreshes of the same mental model in this "
+            "bank. 0 (the default) means no floor. Overridable per model via the trigger's "
+            "min_refresh_interval_seconds."
+        ),
     )
     llm_gemini_safety_settings: list | None = Field(
         default=None, description="Per-bank Gemini/VertexAI safety filter settings"
@@ -1937,6 +3709,32 @@ class BankTemplateConfig(BaseModel):
     )
     experimental_structural_shadow_enabled: bool | None = Field(
         default=None, description="Enable experimental structural retrieval metrics without injecting its candidates."
+    )
+    audit_log_enabled: bool | None = Field(
+        default=None, description="Enable audit logging for this bank (overrides the server default)"
+    )
+    store_document_text: bool | None = Field(
+        default=None,
+        description="Persist raw source text (documents.original_text / chunks.chunk_text). "
+        "Set false to keep only derived facts.",
+    )
+    enable_auto_consolidation: bool | None = Field(
+        default=None, description="Automatically consolidate observations after retain"
+    )
+    consolidation_max_memories_per_round: int | None = Field(
+        default=None, description="Max memory units fed into a single consolidation round"
+    )
+    consolidation_llm_parallelism: int | None = Field(
+        default=None, description="Number of consolidation LLM batches processed concurrently"
+    )
+    recall_include_chunks: bool | None = Field(default=None, description="Include raw chunks in recall results")
+    recall_max_tokens: int | None = Field(default=None, description="Max tokens of results returned by recall")
+    recall_chunks_max_tokens: int | None = Field(
+        default=None, description="Max tokens of raw chunks returned by recall (when recall_include_chunks is set)"
+    )
+    memory_defense: dict | None = Field(
+        default=None,
+        description="Memory Defense policy for this bank (validated against the DefensePolicy schema on write)",
     )
 
     def get_config_updates(self) -> dict[str, Any]:
@@ -2075,58 +3873,261 @@ def validate_bank_template(manifest: "BankTemplateManifest") -> list[str]:
     if manifest.bank:
         bank = manifest.bank
         if bank.retain_extraction_mode is not None:
-            valid_modes = ("concise", "verbose", "custom", "chunks")
-            if bank.retain_extraction_mode not in valid_modes:
+            if bank.retain_extraction_mode not in RETAIN_EXTRACTION_MODES:
                 errors.append(
-                    f"bank.retain_extraction_mode: must be one of {valid_modes}, got '{bank.retain_extraction_mode}'"
+                    "bank.retain_extraction_mode: "
+                    f"must be one of {RETAIN_EXTRACTION_MODES}, got '{bank.retain_extraction_mode}'"
                 )
         if bank.retain_custom_instructions and bank.retain_extraction_mode != "custom":
             errors.append("bank.retain_custom_instructions: requires retain_extraction_mode='custom'")
     if manifest.mental_models:
+        seen_mental_model_ids: set[str] = set()
         for i, mm in enumerate(manifest.mental_models):
             if not mm.name.strip():
                 errors.append(f"mental_models[{i}].name: must not be empty")
             if not mm.source_query.strip():
                 errors.append(f"mental_models[{i}].source_query: must not be empty")
+            if mm.id in seen_mental_model_ids:
+                errors.append(f"mental_models[{i}].id: duplicate id '{mm.id}'")
+            seen_mental_model_ids.add(mm.id)
     if manifest.directives:
+        seen_directive_names: set[str] = set()
         for i, d in enumerate(manifest.directives):
             if not d.name.strip():
                 errors.append(f"directives[{i}].name: must not be empty")
             if not d.content.strip():
                 errors.append(f"directives[{i}].content: must not be empty")
+            if d.name in seen_directive_names:
+                errors.append(f"directives[{i}].name: duplicate name '{d.name}'")
+            seen_directive_names.add(d.name)
     return errors
 
 
+def load_default_bank_template_manifest() -> "BankTemplateManifest | None":
+    """Parse and semantically validate the configured default bank template."""
+    template_dict = get_config().default_bank_template
+    if not template_dict:
+        return None
+    manifest = BankTemplateManifest.model_validate(template_dict)
+    semantic_errors = validate_bank_template(manifest)
+    if semantic_errors:
+        raise ValueError("; ".join(semantic_errors))
+    return manifest
+
+
 async def apply_bank_template_manifest(
-    memory,
+    memory: MemoryEngine,
     bank_id: str,
     manifest: "BankTemplateManifest",
     request_context: "RequestContext",
 ) -> "BankTemplateImportResponse":
-    """Apply a validated BankTemplateManifest to an existing bank.
+    """Apply a client-provided BankTemplateManifest to a bank.
 
-    Shared by the /import endpoint and the default-template-on-create hook
-    driven by HINDSIGHT_API_DEFAULT_BANK_TEMPLATE. The bank MUST already
-    exist; caller is responsible for validation (Pydantic + validate_bank_template).
+    The authorization context creates a missing bank after validating every
+    requested operation. The caller remains responsible for manifest validation
+    (Pydantic + validate_bank_template). Server-owned defaults use
+    ``apply_default_bank_template_resources`` instead, so this function always
+    owns persistence of its client-provided config.
     """
-    config_applied = False
-    if manifest.bank:
-        config_updates = manifest.bank.get_config_updates()
-        if config_updates:
-            await memory._config_resolver.update_bank_config(bank_id, config_updates, request_context)
-            config_applied = True
+    config_updates = manifest.bank.get_config_updates() if manifest.bank else {}
+    bank_exists = (
+        await memory.get_bank_profile(
+            bank_id,
+            request_context=request_context,
+            create_if_missing=False,
+        )
+        is not None
+    )
 
+    # A missing bank receives the server-owned default template during
+    # provisioning. Project those resources into the authorization decision so
+    # the client's import is authorized as an update when the default owns the
+    # same key, while still keeping every client check before bank creation.
+    default_manifest: BankTemplateManifest | None = None
+    if not bank_exists:
+        try:
+            default_manifest = load_default_bank_template_manifest()
+        except (ValueError, ValidationError):
+            # Provisioning owns error logging and the best-effort fallback for a
+            # malformed server template. Client authorization must not change it.
+            pass
+    imported_mental_model_ids = {item.id for item in manifest.mental_models or []}
+    imported_directive_names = {item.name for item in manifest.directives or []}
+    default_mental_models = (default_manifest.mental_models or []) if default_manifest else []
+    default_directives = (default_manifest.directives or []) if default_manifest else []
+    projected_mental_model_ids = {item.id for item in default_mental_models} & imported_mental_model_ids
+    projected_directive_names = {item.name for item in default_directives} & imported_directive_names
+
+    # limit=None throughout the import path: a create/update decision per imported
+    # resource is only correct against the bank's *whole* set. Under the default
+    # page size a bank with more than 100 models would look like it lacked the
+    # ones past the first page, and the import would create duplicates.
+    existing_by_id: dict[str, dict[str, Any]] = {}
+    if bank_exists and manifest.mental_models:
+        existing = await memory.list_mental_models(
+            bank_id=bank_id, limit=None, detail="metadata", request_context=request_context
+        )
+        existing_by_id = {m["id"]: m for m in existing.items}
+
+    existing_by_name: dict[str, dict[str, Any]] = {}
+    if bank_exists and manifest.directives:
+        existing_directives = await memory.list_directives(
+            bank_id=bank_id, active_only=False, limit=None, request_context=request_context
+        )
+        existing_by_name = {d["name"]: d for d in existing_directives.items}
+
+    bank_writes: list[BankTemplateImportWrite] = []
+    if config_updates:
+        bank_writes.append(BankTemplateImportWrite(BankWriteOperation.UPDATE_BANK_CONFIG))
+    for mental_model in manifest.mental_models or []:
+        if mental_model.id in existing_by_id:
+            bank_writes.append(BankTemplateImportWrite(BankWriteOperation.UPDATE_MENTAL_MODEL, mental_model.id))
+        elif mental_model.id in projected_mental_model_ids:
+            # Default-template application is best-effort. Authorize both
+            # outcomes before provisioning so a failed default create can
+            # safely fall back to the client's create operation.
+            bank_writes.extend(
+                [
+                    BankTemplateImportWrite(BankWriteOperation.UPDATE_MENTAL_MODEL, mental_model.id),
+                    BankTemplateImportWrite(BankWriteOperation.CREATE_MENTAL_MODEL, mental_model.id),
+                ]
+            )
+        else:
+            bank_writes.append(BankTemplateImportWrite(BankWriteOperation.CREATE_MENTAL_MODEL, mental_model.id))
+    for directive in manifest.directives or []:
+        if directive.name in existing_by_name:
+            bank_writes.append(BankTemplateImportWrite(BankWriteOperation.UPDATE_DIRECTIVE, directive.name))
+        elif directive.name in projected_directive_names:
+            bank_writes.extend(
+                [
+                    BankTemplateImportWrite(BankWriteOperation.UPDATE_DIRECTIVE, directive.name),
+                    BankTemplateImportWrite(BankWriteOperation.CREATE_DIRECTIVE, directive.name),
+                ]
+            )
+        else:
+            bank_writes.append(BankTemplateImportWrite(BankWriteOperation.CREATE_DIRECTIVE, directive.name))
+
+    async with memory.bank_template_import_authorization(
+        bank_id,
+        config_updates=config_updates,
+        bank_writes=bank_writes,
+        mental_model_ids=[mental_model.id for mental_model in manifest.mental_models or []],
+        bank_exists=bank_exists,
+        request_context=request_context,
+    ):
+        # The snapshot above only chose which operation to authorize; a concurrent
+        # create or delete (and the server default template applied during
+        # provisioning) can flip a resource between create and update before this
+        # request writes. Re-read the committed state here, inside the scope and
+        # immediately before the writes, and decide against that instead.
+        if manifest.mental_models:
+            provisioned = await memory.list_mental_models(
+                bank_id=bank_id,
+                limit=None,
+                detail="metadata",
+                request_context=request_context,
+            )
+            existing_by_id = {item["id"]: item for item in provisioned.items}
+
+        if manifest.directives:
+            provisioned_directives = await memory.list_directives(
+                bank_id=bank_id,
+                active_only=False,
+                limit=None,
+                request_context=request_context,
+            )
+            existing_by_name = {item["name"]: item for item in provisioned_directives.items}
+
+        # Authorize whatever the fresh state now calls for. Resources whose
+        # classification held are already preauthorized and this is a no-op; only a
+        # flipped one reaches the validator, so an ordinary import still costs one
+        # decision per resource.
+        for mental_model in manifest.mental_models or []:
+            await memory.authorize_bank_template_import_write(
+                bank_id,
+                BankWriteOperation.UPDATE_MENTAL_MODEL
+                if mental_model.id in existing_by_id
+                else BankWriteOperation.CREATE_MENTAL_MODEL,
+                target=mental_model.id,
+                request_context=request_context,
+            )
+        for directive in manifest.directives or []:
+            await memory.authorize_bank_template_import_write(
+                bank_id,
+                BankWriteOperation.UPDATE_DIRECTIVE
+                if directive.name in existing_by_name
+                else BankWriteOperation.CREATE_DIRECTIVE,
+                target=directive.name,
+                request_context=request_context,
+            )
+
+        if config_updates:
+            await memory.update_bank_config(bank_id, config_updates, request_context=request_context)
+
+        return await _apply_bank_template_resources(
+            memory,
+            bank_id,
+            manifest,
+            existing_by_id,
+            existing_by_name,
+            request_context,
+            config_applied=bool(config_updates),
+        )
+
+
+async def apply_default_bank_template_resources(
+    memory: MemoryEngine,
+    bank_id: str,
+    manifest: "BankTemplateManifest",
+    request_context: "RequestContext",
+) -> None:
+    """Apply only the resources from a server-owned default template."""
+    existing_by_id: dict[str, dict[str, Any]] = {}
+    if manifest.mental_models:
+        existing = await memory.list_mental_models(
+            bank_id=bank_id, limit=None, detail="metadata", request_context=request_context
+        )
+        existing_by_id = {model["id"]: model for model in existing.items}
+
+    existing_by_name: dict[str, dict[str, Any]] = {}
+    if manifest.directives:
+        existing_directives = await memory.list_directives(
+            bank_id=bank_id,
+            active_only=False,
+            limit=None,
+            request_context=request_context,
+        )
+        existing_by_name = {directive["name"]: directive for directive in existing_directives.items}
+
+    await _apply_bank_template_resources(
+        memory,
+        bank_id,
+        manifest,
+        existing_by_id,
+        existing_by_name,
+        request_context,
+        config_applied=False,
+    )
+
+
+async def _apply_bank_template_resources(
+    memory: MemoryEngine,
+    bank_id: str,
+    manifest: "BankTemplateManifest",
+    existing_mental_models: dict[str, dict[str, Any]],
+    existing_directives: dict[str, dict[str, Any]],
+    request_context: "RequestContext",
+    *,
+    config_applied: bool,
+) -> "BankTemplateImportResponse":
+    """Apply template resources after the caller has handled config and access."""
     created_ids: list[str] = []
     updated_ids: list[str] = []
     operation_ids: list[str] = []
 
     if manifest.mental_models:
-        # Fetch existing mental models to decide create vs update
-        existing = await memory.list_mental_models(bank_id=bank_id, request_context=request_context)
-        existing_by_id = {m["id"]: m for m in existing}
-
         for mm in manifest.mental_models:
-            if mm.id in existing_by_id:
+            if mm.id in existing_mental_models:
                 await memory.update_mental_model(
                     bank_id=bank_id,
                     mental_model_id=mm.id,
@@ -2168,16 +4169,12 @@ async def apply_bank_template_manifest(
     directives_updated: list[str] = []
 
     if manifest.directives:
-        existing_directives = await memory.list_directives(
-            bank_id=bank_id, active_only=False, request_context=request_context
-        )
-        existing_by_name = {d["name"]: d for d in existing_directives}
-
         for directive in manifest.directives:
-            if directive.name in existing_by_name:
+            if directive.name in existing_directives:
                 await memory.update_directive(
                     bank_id=bank_id,
-                    directive_id=existing_by_name[directive.name]["id"],
+                    directive_id=existing_directives[directive.name]["id"],
+                    name=directive.name,
                     content=directive.content,
                     priority=directive.priority,
                     is_active=directive.is_active,
@@ -2209,6 +4206,28 @@ async def apply_bank_template_manifest(
     )
 
 
+class OperationProgress(BaseModel):
+    """Last-known progress snapshot for a long-running async operation.
+
+    Written at coarse phase/batch boundaries by the worker (consolidation, batch
+    retain). Lets an operator polling the operation status API distinguish a healthy
+    long-running job (``processed`` advancing across polls) from a frozen one (same
+    numbers, no movement in ``at``). Absent (``null``) on operations that never
+    reached a checkpoint — completed-instantly or pre-feature rows.
+    """
+
+    stage: str = Field(description="Coarse phase the operation last reported (e.g. 'processing_batch').")
+    at: str = Field(description="ISO-8601 timestamp when this snapshot was written.")
+    processed: int | None = Field(
+        default=None, description="Units of work finished so far (sub-batches, memories), when known."
+    )
+    total: int | None = Field(default=None, description="Total units of work for the operation, when known.")
+    detail: dict[str, int] | None = Field(
+        default=None,
+        description="Operation-specific counters (e.g. observations_created, round, items_in_sub_batch).",
+    )
+
+
 class OperationResponse(BaseModel):
     """Response model for a single async operation."""
 
@@ -2232,7 +4251,35 @@ class OperationResponse(BaseModel):
     task_type: str
     items_count: int
     document_id: str | None = None
+    filename: str | None = Field(
+        default=None,
+        description="Original filename for file-conversion operations (file_convert_retain); null for other task types.",
+    )
+    mental_model_id: str | None = Field(
+        default=None,
+        description=(
+            "Mental model this operation acted on (refresh_mental_model); null for other task types. "
+            "Without it the list cannot say which model an operation refreshed — `document_id` is null "
+            "for these, and the list carries no result_metadata. The single-operation read exposes the "
+            "same value under `result_metadata`."
+        ),
+    )
+    details: RefreshMentalModelOperationDetails | None = Field(
+        default=None,
+        description=(
+            "Typed, per-operation-type outcome detail, discriminated by its own `operation_type`. "
+            "Populated for `refresh_mental_model` operations that have finished; null for operation "
+            "types that report no typed detail, for operations still in flight, and for operations "
+            "recorded before this field existed. Unlike `result_metadata` this is a supported field — "
+            "new operation types add their own shape here rather than flattening fields onto the "
+            "operation."
+        ),
+    )
     created_at: str
+    updated_at: str | None = Field(
+        default=None,
+        description="When this operation's row last changed (claim, progress heartbeat, or completion).",
+    )
     status: str
     error_message: str | None
     retry_count: int | None = Field(
@@ -2244,9 +4291,28 @@ class OperationResponse(BaseModel):
         description=(
             "When the worker will next attempt this operation. For a pending "
             "operation, a value in the future indicates the task is waiting "
-            "rather than available for immediate pickup — for example, an "
-            "extension may have raised DeferOperation to park the task until "
-            "some backpressure window opens. Always null for completed tasks."
+            "rather than available for immediate pickup — a refresh_mental_model "
+            "held back by min_refresh_interval_seconds, or an extension raising "
+            "DeferOperation until some backpressure window opens. It is not cleared "
+            "when the task finally runs, so on a terminal operation it is a record of "
+            "the last wait rather than a pending one: read it together with status."
+        ),
+    )
+    progress: OperationProgress | None = Field(
+        default=None,
+        description="Last-known progress snapshot for a running operation; null if none was recorded.",
+    )
+
+
+class ConsolidationRequest(BaseModel):
+    """Request model for consolidation trigger endpoint."""
+
+    observation_scopes: list[list[str]] | None = Field(
+        default=None,
+        description=(
+            "Optional list of tag scopes to consolidate. Each scope is a list of tags. "
+            "Only unconsolidated memories whose tags contain all tags in at least one scope "
+            "will be processed. If omitted, all unconsolidated memories are processed."
         ),
     )
 
@@ -2272,6 +4338,7 @@ class OperationsListResponse(BaseModel):
                     {
                         "id": "550e8400-e29b-41d4-a716-446655440000",
                         "task_type": "retain",
+                        "items_count": 5,
                         "created_at": "2024-01-15T10:30:00Z",
                         "status": "pending",
                         "error_message": None,
@@ -2324,6 +4391,24 @@ class RetryOperationResponse(BaseModel):
     operation_id: str
 
 
+class DeleteOperationResponse(BaseModel):
+    """Response model for delete operation endpoint."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "success": True,
+                "message": "Operation 550e8400-e29b-41d4-a716-446655440000 deleted",
+                "operation_id": "550e8400-e29b-41d4-a716-446655440000",
+            }
+        }
+    )
+
+    success: bool
+    message: str
+    operation_id: str
+
+
 class ChildOperationStatus(BaseModel):
     """Status of a child operation (for batch operations)."""
 
@@ -2342,7 +4427,7 @@ class OperationStatusResponse(BaseModel):
             "example": {
                 "operation_id": "550e8400-e29b-41d4-a716-446655440000",
                 "status": "completed",
-                "operation_type": "refresh_mental_models",
+                "operation_type": "refresh_mental_model",
                 "created_at": "2024-01-15T10:30:00Z",
                 "updated_at": "2024-01-15T10:31:30Z",
                 "completed_at": "2024-01-15T10:31:30Z",
@@ -2366,14 +4451,29 @@ class OperationStatusResponse(BaseModel):
         default=None,
         description=(
             "When the worker will next attempt this operation. For a pending "
-            "operation, a value in the future indicates the task is parked "
-            "(e.g. by an extension raising DeferOperation) rather than awaiting "
-            "immediate pickup."
+            "operation, a value in the future indicates the task is parked — a "
+            "refresh_mental_model held back by min_refresh_interval_seconds, or an "
+            "extension raising DeferOperation — rather than awaiting immediate pickup."
         ),
+    )
+    progress: OperationProgress | None = Field(
+        default=None,
+        description="Last-known progress snapshot for a running operation; null if none was recorded.",
     )
     result_metadata: dict[str, Any] | None = Field(
         default=None,
         description="Internal metadata for debugging. Structure may change without notice. Not for production use.",
+    )
+    details: RefreshMentalModelOperationDetails | None = Field(
+        default=None,
+        description=(
+            "Typed, per-operation-type outcome detail, discriminated by its own `operation_type`. "
+            "Populated for `refresh_mental_model` operations that have finished; null for operation "
+            "types that report no typed detail, for operations still in flight, and for operations "
+            "recorded before this field existed. Unlike `result_metadata` this is a supported field — "
+            "new operation types add their own shape here rather than flattening fields onto the "
+            "operation."
+        ),
     )
     child_operations: list[ChildOperationStatus] | None = Field(
         default=None, description="Child operations for batch operations (if applicable)"
@@ -2407,7 +4507,15 @@ class FeaturesInfo(BaseModel):
     mcp: bool = Field(description="Whether MCP (Model Context Protocol) server is enabled")
     worker: bool = Field(description="Whether the background worker is enabled")
     bank_config_api: bool = Field(description="Whether per-bank configuration API is enabled")
+    bank_llm_health: bool = Field(description="Whether the per-bank LLM connectivity probe is enabled")
     file_upload_api: bool = Field(description="Whether file upload/conversion API is enabled")
+    document_export_api: bool = Field(description="Whether the document export endpoint is enabled")
+    document_import_api: bool = Field(description="Whether the document import endpoint is enabled")
+    audit_log: bool = Field(description="Whether audit logging is enabled by default (overridable per bank)")
+    llm_trace: bool = Field(description="Whether per-bank LLM request tracing is enabled")
+    store_document_text: bool = Field(
+        description="Whether raw source text is persisted. When false, document/chunk source text is not stored."
+    )
 
 
 class VersionResponse(BaseModel):
@@ -2416,13 +4524,19 @@ class VersionResponse(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "api_version": "0.4.0",
+                "api_version": "0.9.0",
                 "features": {
                     "observations": False,
                     "mcp": True,
                     "worker": True,
                     "bank_config_api": False,
+                    "bank_llm_health": True,
                     "file_upload_api": True,
+                    "document_export_api": True,
+                    "document_import_api": True,
+                    "audit_log": False,
+                    "llm_trace": False,
+                    "store_document_text": True,
                 },
             }
         }
@@ -2447,7 +4561,7 @@ class CreateWebhookRequest(BaseModel):
     secret: str | None = Field(default=None, description="HMAC-SHA256 signing secret (optional)")
     event_types: list[str] = Field(
         default=["consolidation.completed"],
-        description="List of event types to deliver. Currently supported: 'consolidation.completed'",
+        description="List of event types to deliver. Supported: 'retain.completed', 'consolidation.completed', 'memory_defense.triggered'.",
     )
     enabled: bool = Field(default=True, description="Whether this webhook is active")
     http_config: WebhookHttpConfig = Field(
@@ -2486,6 +4600,9 @@ class WebhookListResponse(BaseModel):
     """Response model for listing webhooks."""
 
     items: list[WebhookResponse]
+    total: int = Field(description="Total number of webhooks on the bank (ignores limit/offset)")
+    limit: int = Field(description="Maximum number of webhooks returned in this page")
+    offset: int = Field(description="Offset this page started at")
 
 
 class WebhookDeliveryResponse(BaseModel):
@@ -2506,7 +4623,7 @@ class WebhookDeliveryResponse(BaseModel):
     updated_at: str | None = None
 
     @classmethod
-    def from_async_operation_row(cls, row: dict) -> "WebhookDeliveryResponse":
+    def from_async_operation_row(cls, row: dict, *, expose_response_body: bool = False) -> "WebhookDeliveryResponse":
         import json as _json
 
         raw = row["task_payload"]
@@ -2535,7 +4652,10 @@ class WebhookDeliveryResponse(BaseModel):
             next_retry_at=row["next_retry_at"],
             last_error=row["error_message"],
             last_response_status=result_metadata.get("last_status_code"),
-            last_response_body=result_metadata.get("last_response_body"),
+            # The raw upstream body is withheld from API callers by default: it
+            # is an SSRF response-exfiltration primitive. Operators can opt in
+            # via HINDSIGHT_API_WEBHOOK_EXPOSE_RESPONSE_BODY. Status is always shown.
+            last_response_body=(result_metadata.get("last_response_body") if expose_response_body else None),
             last_attempt_at=result_metadata.get("last_attempt_at"),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
@@ -2557,7 +4677,6 @@ def _make_audited_http(audit_logger_getter: Callable[[], AuditLogger | None]):
     from datetime import datetime as _dt
     from datetime import timezone as _tz
     from functools import wraps
-    from typing import Callable as _Callable
 
     def audited(action: str, *, request_param: str | None = "request"):
         """Decorator that wraps an HTTP handler with audit logging.
@@ -2572,10 +4691,15 @@ def _make_audited_http(audit_logger_getter: Callable[[], AuditLogger | None]):
             @wraps(func)
             async def wrapper(*args, **kwargs):
                 al = audit_logger_getter()
-                if al is None or not al.is_enabled(action):
+                # Cheap bank-independent pre-filter first, then the per-bank
+                # decision (audit_log_enabled is overridable per bank).
+                if al is None or not al.action_allowed(action):
                     return await func(*args, **kwargs)
 
                 bank_id = kwargs.get("bank_id")
+                if not await al.should_log(action, bank_id, kwargs.get("request_context")):
+                    return await func(*args, **kwargs)
+
                 started_at = _dt.now(_tz.utc)
 
                 req_data = None
@@ -2596,7 +4720,12 @@ def _make_audited_http(audit_logger_getter: Callable[[], AuditLogger | None]):
 
                 try:
                     result = await func(*args, **kwargs)
-                    if hasattr(result, "model_dump"):
+                    if hasattr(result, "model_dump_json"):
+                        # One Rust pass to the JSON the row stores, instead of model_dump(mode="json")
+                        # building a Python dict of the whole response on the request path and the
+                        # writer re-encoding it. Same document either way.
+                        entry.response_json = result.model_dump_json()
+                    elif hasattr(result, "model_dump"):
                         entry.response = result.model_dump(mode="json")
                     elif isinstance(result, dict):
                         entry.response = result
@@ -2639,6 +4768,14 @@ def create_app(
         In that case, you should call memory.initialize() manually before starting the server
         and memory.close() when shutting down.
     """
+
+    # Arm profiling here as well as in main(): with `--workers N`, uvicorn spawns worker
+    # processes that import the app but never run main(), so arming only there profiles
+    # the supervisor -- which does nothing but waitpid() -- and reports an empty process
+    # while every request is served elsewhere. install() is idempotent.
+    from hindsight_api.profiling import install as _install_profiling
+
+    _install_profiling()
     # Load HTTP extension from environment if not provided
     if http_extension is None:
         http_extension = load_extension("HTTP", HttpExtension)
@@ -2655,42 +4792,45 @@ def create_app(
         import socket
 
         from hindsight_api.config import get_config
+        from hindsight_api.loop_lag import install as _install_loop_lag
         from hindsight_api.worker import WorkerPoller
 
         config = get_config()
+
+        # Started here rather than at import time because it needs a running loop, and it must run
+        # on the loop that actually serves requests — that is the only one whose lag says anything.
+        _install_loop_lag(config.loop_lag_report_seconds, metric=config.loop_lag_metric)
+
         poller = None
         poller_task = None
+        loop_watchdog = None
 
-        # Initialize OpenTelemetry metrics
+        # Initialize OpenTelemetry metrics. Remember the collector we displace so
+        # shutdown can put it back: the collector is a module global, so an app
+        # that starts and stops otherwise leaves its own collector — holding a
+        # closed DB pool — installed for the rest of the process (#3780).
+        previous_metrics_collector = get_metrics_collector()
         try:
             prometheus_reader = initialize_metrics(service_name="hindsight-api", service_version="1.0.0")
             create_metrics_collector()
             app.state.prometheus_reader = prometheus_reader
+            if config.metrics_worker_label:
+                # With --workers N a scrape of /metrics reaches one random worker; make every
+                # worker's series part of every scrape (see hindsight_api.metrics_multiworker).
+                from hindsight_api.metrics_multiworker import start_worker_metrics
+
+                app.state.worker_metrics = start_worker_metrics(max(1, config.workers))
             logging.info("Metrics initialized - available at /metrics endpoint")
         except Exception as e:
             logging.warning(f"Failed to initialize metrics: {e}. Metrics will be disabled (using no-op collector).")
             app.state.prometheus_reader = None
             # Metrics collector is already initialized as no-op by default
 
-        # Initialize OpenTelemetry tracing if enabled
-        if config.otel_traces_enabled:
-            if not config.otel_exporter_otlp_endpoint:
-                logging.warning("OTEL tracing enabled but no endpoint configured. Tracing disabled.")
-            else:
-                from hindsight_api.tracing import create_span_recorder, initialize_tracing
+        # Initialize OpenTelemetry tracing if enabled. Shared with the standalone
+        # worker entrypoint so both processes honour the same configuration.
+        from hindsight_api.tracing import initialize_tracing_from_config
 
-                try:
-                    initialize_tracing(
-                        service_name=config.otel_service_name,
-                        endpoint=config.otel_exporter_otlp_endpoint,
-                        headers=config.otel_exporter_otlp_headers,
-                        deployment_environment=config.otel_deployment_environment,
-                    )
-                    create_span_recorder()
-                    logging.info("OpenTelemetry tracing enabled and configured")
-                except Exception as e:
-                    logging.error(f"Failed to initialize tracing: {e}")
-                    logging.warning("Continuing without tracing")
+        initialize_tracing_from_config(config)
 
         # Startup: Initialize database and memory system (migrations run inside initialize if enabled)
         if initialize_memory:
@@ -2703,12 +4843,22 @@ def create_app(
                 metrics_collector.set_db_pool(memory._pool)
                 logging.info("DB pool metrics configured")
 
+        # Start the event-loop stall watchdog (logs the culprit stack if a task
+        # blocks the loop, so a failing /health can be told apart from pool exhaustion).
+        from ..loop_watchdog import start_loop_watchdog
+
+        loop_watchdog = start_loop_watchdog(asyncio.get_running_loop())
+
         # Start worker poller if the backend supports it.
         # All current backends (PostgreSQL, Oracle) support async worker/poller.
         if config.worker_enabled and memory._backend.supports_worker_poller:
             from ..config import DEFAULT_DATABASE_SCHEMA
+            from ..utils import warn_if_container_default_worker_id
 
+            warn_if_container_default_worker_id(config.worker_id)
             worker_id = config.worker_id or socket.gethostname()
+            worker_id_source = "HINDSIGHT_API_WORKER_ID" if config.worker_id else "hostname (default)"
+            logging.info(f"Worker id: {worker_id} (source: {worker_id_source})")
             # Convert default schema to None for SQL compatibility (no schema prefix)
             schema = None if config.database_schema == DEFAULT_DATABASE_SCHEMA else config.database_schema
             poller = WorkerPoller(
@@ -2720,6 +4870,8 @@ def create_app(
                 tenant_extension=memory._tenant_extension,
                 max_slots=config.worker_max_slots,
                 slot_reservations=config.worker_slot_reservations,
+                consolidation_bank_priority=config.worker_consolidation_bank_priority or None,
+                on_wall_timeout=memory.on_task_wall_timeout,
             )
             poller_task = asyncio.create_task(poller.run())
             logging.info(f"Worker poller started (worker_id={worker_id})")
@@ -2741,6 +4893,10 @@ def create_app(
             logging.info("HTTP extension started")
 
         yield
+
+        # Stop the loop watchdog first so it doesn't fire during teardown.
+        if loop_watchdog is not None:
+            loop_watchdog.stop()
 
         # Shutdown worker poller if running
         if poller is not None:
@@ -2767,6 +4923,14 @@ def create_app(
         await memory.close()
         logging.info("Memory system closed")
 
+        # Flush any spans still queued in the BatchSpanProcessor.
+        from hindsight_api.tracing import shutdown_tracing
+
+        shutdown_tracing()
+
+        # Put back whatever collector was installed before startup (#3780).
+        reset_metrics_collector(previous_metrics_collector)
+
     from hindsight_api import __version__
     from hindsight_api.config import get_config
 
@@ -2787,12 +4951,21 @@ def create_app(
         root_path=config.base_path,
     )
 
+    # Drop null fields from responses (omit `"x": null`) for routes where it's wire-safe.
+    # Must be set before any route is registered so @app.<method> decorators pick it up.
+    app.router.route_class = ExcludeNoneRoute
+
     # IMPORTANT: Set memory on app.state immediately, don't wait for lifespan
     # This is required for mounted sub-applications where lifespan may not fire
     app.state.memory = memory
     app.state.audit_logger = memory.audit_logger
 
-    app.add_middleware(GZipMiddleware, minimum_size=1024)
+    # Compressing a recall response costs ~5% of the request's CPU. Tunable so a deployment
+    # that is CPU-bound rather than bandwidth-bound can raise the floor past its response size.
+    # A negative floor drops the middleware entirely.
+    gzip_min_size = get_config().gzip_min_size
+    if gzip_min_size >= 0:
+        app.add_middleware(GZipMiddleware, minimum_size=gzip_min_size)
 
     # ---------------------------------------------------------------------------
     # Patch OpenAPI schema: align ValidationError with Pydantic v2 error format
@@ -2814,107 +4987,17 @@ def create_app(
 
     app.openapi = _patched_openapi  # type: ignore[assignment]
 
-    # Add unknown parameters detection middleware
-    @app.middleware("http")
-    async def unknown_params_middleware(request, call_next):
-        """Detect unknown query params and body fields, log warning and set response header."""
-        import inspect
+    # Unknown-param reporting and HTTP metrics used to be two
+    # `@app.middleware("http")` handlers. Both are gone: that decorator installs a
+    # Starlette BaseHTTPMiddleware, whose per-request child task and memory-stream
+    # hops cost ~3x the throughput of the whole endpoint on cheap routes. The
+    # reporting now happens in the route class (already resolved, nothing to
+    # re-discover) and the metrics in a pure-ASGI middleware installed below.
+    app.router.route_class = UnknownParamsRoute
 
-        from starlette.routing import Match
-
-        ignored_params: list[str] = []
-
-        # --- Query parameters ---
-        if request.query_params:
-            for route in app.routes:
-                match, _ = route.matches(request.scope)
-                if match == Match.FULL:
-                    endpoint = getattr(route, "endpoint", None)
-                    if endpoint:
-                        sig = inspect.signature(endpoint)
-                        declared = set(sig.parameters.keys())
-                        path_params = set(getattr(route, "param_convertors", {}).keys()) | set(
-                            request.path_params.keys()
-                        )
-                        known_query = declared - path_params
-                        for name in request.query_params:
-                            if name not in known_query and name not in path_params:
-                                ignored_params.append(name)
-                    break
-
-        # --- Body fields ---
-        body_ignored: list[str] = []
-        content_type = request.headers.get("content-type", "")
-        if request.method in ("POST", "PUT", "PATCH") and "application/json" in content_type:
-            try:
-                body_bytes = await request.body()
-                if body_bytes:
-                    body_json = json.loads(body_bytes)
-                    if isinstance(body_json, dict):
-                        for route in app.routes:
-                            match, _ = route.matches(request.scope)
-                            if match == Match.FULL:
-                                endpoint = getattr(route, "endpoint", None)
-                                if endpoint:
-                                    sig = inspect.signature(endpoint)
-                                    for param in sig.parameters.values():
-                                        ann = param.annotation
-                                        if isinstance(ann, type) and issubclass(ann, BaseModel):
-                                            known_fields = set(ann.model_fields.keys())
-                                            for field in ann.model_fields.values():
-                                                # Pydantic models can expose public JSON names via aliases
-                                                # (for example RetainRequest.async_ is sent as "async").
-                                                # Treat aliases as known fields so valid client payloads are
-                                                # not reported as ignored parameters.
-                                                if isinstance(field.alias, str):
-                                                    known_fields.add(field.alias)
-                                            for key in body_json:
-                                                if key not in known_fields:
-                                                    body_ignored.append(key)
-                                            break
-                                break
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                pass
-
-        all_ignored = ignored_params + body_ignored
-
-        response = await call_next(request)
-
-        if all_ignored:
-            ignored_str = ", ".join(all_ignored)
-            logger.warning(
-                "Unknown parameters ignored: [%s] for %s %s",
-                ignored_str,
-                request.method,
-                request.url.path,
-            )
-            response.headers["X-Ignored-Params"] = ignored_str
-
-        return response
-
-    # Add HTTP metrics middleware
-    @app.middleware("http")
-    async def http_metrics_middleware(request, call_next):
-        """Record HTTP request metrics."""
-        # Normalize endpoint path to reduce cardinality
-        # Replace UUIDs and numeric IDs with placeholders
-        import re
-
-        from starlette.requests import Request
-
-        path = request.url.path
-        # Replace UUIDs
-        path = re.sub(r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "/{id}", path)
-        # Replace numeric IDs
-        path = re.sub(r"/\d+(?=/|$)", "/{id}", path)
-
-        status_code = [500]  # Default to 500, will be updated
-        metrics_collector = get_metrics_collector()
-
-        with metrics_collector.record_http_request(request.method, path, lambda: status_code[0]):
-            response = await call_next(request)
-            status_code[0] = response.status_code
-            return response
+    # Per-operation admission control, consulted by the `admit_for` dependency on
+    # the heavy routes. One controller per app so the limits are a process budget.
+    app.state.admission = build_controller_from_config(config)
 
     # Register all routes
     _register_routes(app)
@@ -2922,16 +5005,123 @@ def create_app(
     # Mount HTTP extension router if available
     if http_extension:
         extension_router = http_extension.get_router(memory)
+        # include_router does not apply the app's route_class to a router's own
+        # routes, so without this the extension loses the unknown-param reporting
+        # the old middleware gave it (it sat above the router).
+        use_unknown_params_routes(extension_router)
         app.include_router(extension_router, prefix="/ext", tags=["Extension"])
         logging.info("HTTP extension router mounted at /ext/")
 
         # Mount root router if provided (for well-known endpoints, etc.)
         root_router = http_extension.get_root_router(memory)
         if root_router:
+            use_unknown_params_routes(root_router)
             app.include_router(root_router)
             logging.info("HTTP extension root router mounted")
 
+    # Client-disconnect cancellation for recall/reflect. Added LAST so it sits
+    # OUTSIDE the @app.middleware("http") (BaseHTTPMiddleware) layers above —
+    # that placement is mandatory: BaseHTTPMiddleware breaks
+    # Request.is_disconnected(), so the only way to observe an abandoned request
+    # is to own the raw ASGI receive channel from outside it (issue #2122).
+    app.add_middleware(ClientDisconnectCancellationMiddleware)
+    # Pure ASGI, so unlike the BaseHTTPMiddleware it replaces it adds no task hop:
+    # records the request metrics and attaches X-Ignored-Params for the route class.
+    app.add_middleware(HttpObservabilityMiddleware)
+
+    _instrument_app_for_tracing(app, config)
+
     return app
+
+
+# Endpoints whose HTTP span should be renamed after the Hindsight operation it
+# performs, as (method, path pattern with the bank id captured, operation name).
+# Matched against the concrete request path, so an extension that mounts these
+# routes under a different prefix is still recognised.
+_TRACED_OPERATION_ROUTES: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    ("POST", re.compile(r"/banks/(?P<bank_id>[^/]+)/memories/recall/?$"), "recall"),
+    ("POST", re.compile(r"/banks/(?P<bank_id>[^/]+)/memories/dry-run-extract/?$"), "dry_run_extract"),
+    ("POST", re.compile(r"/banks/(?P<bank_id>[^/]+)/memories/?$"), "retain"),
+    ("POST", re.compile(r"/banks/(?P<bank_id>[^/]+)/reflect/?$"), "reflect"),
+    ("POST", re.compile(r"/banks/(?P<bank_id>[^/]+)/files/retain/?$"), "file_convert_retain"),
+)
+
+
+def _name_server_span_after_operation(span: "Span", scope: dict[str, Any]) -> None:
+    """
+    Rename the HTTP server span after the Hindsight operation the request runs.
+
+    Trace viewers name a trace after its root span, and the ASGI instrumentation's
+    root is an HTTP span named ``{method} {http.route}`` per OTel semantic
+    conventions. That makes every trace read as a URL template
+    ("POST /v1/default/banks/{bank_id}/memories") rather than as the operation it
+    performed, and buries the ``hindsight.*`` span that carries the real meaning
+    one level down where it can no longer title the trace.
+
+    Renaming only the operation endpoints keeps ordinary CRUD routes on their
+    semconv names, and ``http.route``/``http.request.method`` stay on the span
+    either way, so grouping by route is unaffected.
+    """
+    if not span.is_recording():
+        return
+    method = scope.get("method", "")
+    path = scope.get("path", "")
+    for route_method, pattern, operation in _TRACED_OPERATION_ROUTES:
+        if route_method != method:
+            continue
+        match = pattern.search(path)
+        if match is None:
+            continue
+        span.update_name(f"hindsight.{operation}")
+        span.set_attribute("hindsight.operation", operation)
+        span.set_attribute("hindsight.bank_id", match.group("bank_id"))
+        return
+
+
+def _instrument_app_for_tracing(app: FastAPI, config: HindsightConfig | StaticConfigProxy) -> None:
+    """
+    Make incoming requests continue the caller's trace instead of starting a new one.
+
+    The ASGI instrumentation extracts W3C traceparent/tracestate from the request
+    headers and opens a SERVER span; every span the engine opens while handling
+    that request (hindsight.recall, hindsight.retain, the GenAI child spans, ...)
+    then nests under the caller's trace through the ambient context, with no
+    changes at those call sites (issue #3604). Requests without a traceparent
+    still start their own root trace, so this is backwards compatible.
+
+    Must run here rather than in the lifespan: instrument_app patches
+    Starlette.build_middleware_stack, which is built before the lifespan handler
+    runs. The tracer it captures is a proxy that resolves lazily, so the provider
+    installed later by initialize_tracing_from_config is picked up correctly.
+    """
+    if not config.otel_traces_enabled or not config.otel_exporter_otlp_endpoint:
+        return
+
+    try:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+        # Probe and metrics scrapes would otherwise dominate the trace stream.
+        # OTEL_PYTHON_FASTAPI_EXCLUDED_URLS, when set, takes precedence.
+        excluded_urls = os.getenv("OTEL_PYTHON_FASTAPI_EXCLUDED_URLS") or "health,metrics"
+        FastAPIInstrumentor.instrument_app(
+            app,
+            excluded_urls=excluded_urls,
+            # Fires right after the server span is created, and the ASGI
+            # instrumentation never renames it afterwards (the route is already
+            # resolved at creation), so an update_name() here is the final name.
+            server_request_hook=_name_server_span_after_operation,
+            # Two reasons, both load-bearing. Per-ASGI-message spans triple the
+            # span count per request while saying nothing the request span
+            # doesn't. And excluding "receive" makes the instrumentation pass the
+            # raw receive callable through untouched instead of wrapping it,
+            # which is what keeps ClientDisconnectCancellationMiddleware able to
+            # observe an abandoned request (issue #2122).
+            exclude_spans=["receive", "send"],
+        )
+        logging.info("OpenTelemetry HTTP server instrumentation enabled (trace context propagation)")
+    except Exception as e:
+        logging.error(f"Failed to instrument HTTP server for tracing: {e}")
+        logging.warning("Continuing without incoming trace-context propagation")
 
 
 def _register_routes(app: FastAPI):
@@ -2940,25 +5130,71 @@ def _register_routes(app: FastAPI):
     # Create audit decorator bound to this app's audit logger
     audited = _make_audited_http(lambda: getattr(app.state, "audit_logger", None))
 
-    def get_request_context(authorization: str | None = Header(default=None)) -> RequestContext:
+    def get_request_context(request: Request, authorization: str | None = Header(default=None)) -> RequestContext:
         """
-        Extract request context from Authorization header.
+        Extract request context from the Authorization header.
 
         Supports:
         - Bearer token: "Bearer <api_key>"
         - Direct API key: "<api_key>"
 
         Returns RequestContext with extracted API key (may be None if no auth header).
+
+        Any header named in HINDSIGHT_API_EXTENSION_PASSTHROUGH_HEADERS is also
+        copied into ``extra_headers`` for extensions to read. That allowlist is
+        empty by default, so no other header reaches extension code unless an
+        operator opts in.
         """
+        # Dependency-resolution start, read by api_recall to split `http_to_handler`.
+        request.scope.setdefault("hs_deps_t0", time.time())
         api_key = None
         if authorization:
             if authorization.lower().startswith("bearer "):
                 api_key = authorization[7:].strip()
             else:
                 api_key = authorization.strip()
-        return RequestContext(api_key=api_key)
+        extra_headers = collect_passthrough_headers(request.headers.raw, get_config().extension_passthrough_headers)
+        return RequestContext(api_key=api_key, extra_headers=extra_headers)
 
-    def precheck_for(operation: str):
+    def admit_for(operation: PrecheckOperation):
+        """Build a FastAPI dependency that holds an admission permit for the request.
+
+        Yield-style so the permit is held for the whole request and released once the
+        response has been produced. Declared alongside ``precheck_for`` on the heavy
+        routes: FastAPI resolves dependencies before deserialising the body, so an
+        overloaded server refuses without ever reading the payload.
+
+        Returns 503 with ``Retry-After`` rather than queueing indefinitely — see
+        :mod:`hindsight_api.api.admission` for why the wait, not the concurrency, is
+        the thing worth bounding.
+        """
+
+        async def _admit_dep(request: Request):
+            controller = getattr(app.state, "admission", None)
+            if controller is None:
+                yield
+                return
+            # Recall and reflect carry a disconnect token (see api/disconnect.py). A
+            # queued request whose client has gone gives up its place immediately,
+            # which is what makes a patient deadline affordable.
+            abandoned = get_scope_cancellation_token(request.scope)
+            try:
+                async with controller.admit(str(operation), abandoned=abandoned):
+                    yield
+            except AdmissionAbandoned:
+                # Nobody left to answer. Close the request without spending a slot
+                # or building a response.
+                raise HTTPException(status_code=499, detail="client disconnected while queued") from None
+            except AdmissionRejected as e:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(f"Server is at capacity for '{e.lane}' ({e.limit} concurrent); try again shortly."),
+                    headers={"Retry-After": str(e.retry_after_seconds)},
+                ) from None
+
+        return _admit_dep
+
+    def precheck_for(operation: PrecheckOperation):
         """
         Build a FastAPI dependency that runs ``OperationValidator.precheck``.
 
@@ -2987,6 +5223,7 @@ def _register_routes(app: FastAPI):
 
         async def _precheck_dep(
             bank_id: str,
+            request: Request,
             request_context: RequestContext = Depends(get_request_context),
         ) -> None:
             validator = getattr(app.state.memory, "_operation_validator", None)
@@ -2994,35 +5231,71 @@ def _register_routes(app: FastAPI):
                 return
             from hindsight_api.extensions import PrecheckContext
 
+            _t0_dep_auth = time.time()
             await app.state.memory._authenticate_tenant(request_context)
+            get_metrics_collector().record_recall_phase("dep_auth", time.time() - _t0_dep_auth)
+            cl_header = request.headers.get("content-length")
+            content_length: int | None = None
+            if cl_header is not None:
+                try:
+                    parsed = int(cl_header)
+                except ValueError:
+                    parsed = -1
+                if parsed >= 0:
+                    content_length = parsed
             ctx = PrecheckContext(
                 operation=operation,
                 bank_id=bank_id,
                 request_context=request_context,
+                content_length=content_length,
             )
+            _t0_dep_precheck = time.time()
             result = await validator.precheck(ctx)
+            get_metrics_collector().record_recall_phase("dep_precheck", time.time() - _t0_dep_precheck)
             if not result.allowed:
                 raise HTTPException(
                     status_code=result.status_code,
                     detail=result.reason or "Operation not allowed",
                 )
 
+            request.scope["hs_deps_done"] = time.time()
+
         return _precheck_dep
 
     # Global exception handler for authentication errors
     @app.exception_handler(AuthenticationError)
     async def authentication_error_handler(request, exc: AuthenticationError):
-        from fastapi.responses import JSONResponse
-
         return JSONResponse(
             status_code=401,
             content={"detail": str(exc)},
         )
 
+    # A bank briefly closed to writes — a store migrating it between backends holds it for a few
+    # seconds. 503 + Retry-After rather than a 500: nothing is broken, and the difference decides
+    # whether a client retries or reports a failure to the user.
+    from ..engine.memories.base import StoreWriteUnavailable
+
+    @app.exception_handler(StoreWriteUnavailable)
+    async def store_write_unavailable_handler(request, exc: StoreWriteUnavailable):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": str(exc)},
+            headers={"Retry-After": str(getattr(exc, "retry_after", 30))},
+        )
+
+    async def _readiness_response() -> JSONResponse:
+        """Shared body of /health and /health/ready: 200 if healthy, 503 if not."""
+        health = await app.state.memory.health_check()
+        status_code = 200 if health.get("status") == "healthy" else 503
+        return JSONResponse(content=health, status_code=status_code)
+
     @app.get(
         "/health",
         summary="Health check endpoint",
-        description="Checks the health of the API and database connection",
+        description="Readiness check: verifies the API can reach the database. "
+        "Alias of /health/ready. Use /health/live for liveness probes — this one "
+        "fails whenever the database is unreachable, which must gate traffic, not "
+        "restart the process.",
         tags=["Monitoring"],
     )
     async def health_endpoint():
@@ -3031,11 +5304,43 @@ def _register_routes(app: FastAPI):
 
         Returns 200 if healthy, 503 if unhealthy.
         """
-        from fastapi.responses import JSONResponse
+        return await _readiness_response()
 
-        health = await app.state.memory.health_check()
-        status_code = 200 if health.get("status") == "healthy" else 503
-        return JSONResponse(content=health, status_code=status_code)
+    @app.get(
+        "/health/ready",
+        summary="Readiness probe",
+        description="Returns 200 when the API can serve traffic (database reachable), "
+        "503 otherwise. Identical to /health, which stays supported as its alias.",
+        tags=["Monitoring"],
+        operation_id="get_readiness",
+    )
+    async def readiness_endpoint():
+        """
+        Readiness probe that verifies database connectivity.
+
+        Returns 200 if ready, 503 if not. A 503 should remove this pod from the
+        Service; it must not restart it.
+        """
+        return await _readiness_response()
+
+    @app.get(
+        "/health/live",
+        response_model=LivenessResponse,
+        summary="Liveness probe",
+        description="Returns 200 whenever the process can serve a request. Performs no "
+        "database access, so a slow or unreachable database never restarts the pod. "
+        "Point livenessProbe here and readinessProbe at /health.",
+        tags=["Monitoring"],
+        operation_id="get_liveness",
+    )
+    async def liveness_endpoint() -> LivenessResponse:
+        """
+        Liveness probe: in-process only, never touches the database.
+
+        Answering at all is the check — Hindsight serves requests and task work on
+        one event loop, so a wedged loop cannot respond within the probe timeout.
+        """
+        return liveness_response()
 
     @app.get(
         "/version",
@@ -3053,8 +5358,8 @@ def _register_routes(app: FastAPI):
         Returns version info and feature flags that can be used by clients
         to determine which capabilities are available.
 
-        Note: observations flag shows the global default. Individual banks
-        may override this setting via bank-specific configuration.
+        Note: the observations and audit_log flags show the global default.
+        Individual banks may override these via bank-specific configuration.
         """
         from hindsight_api import __version__
         from hindsight_api.config import _get_raw_config
@@ -3067,7 +5372,13 @@ def _register_routes(app: FastAPI):
                 mcp=config.mcp_enabled,
                 worker=config.worker_enabled,
                 bank_config_api=config.enable_bank_config_api,
+                bank_llm_health=config.enable_bank_llm_health,
                 file_upload_api=config.enable_file_upload_api,
+                document_export_api=config.enable_document_export_api,
+                document_import_api=config.enable_document_import_api,
+                audit_log=config.audit_log_enabled,
+                llm_trace=config.llm_trace_enabled,
+                store_document_text=config.store_document_text,
             ),
         )
 
@@ -3082,21 +5393,23 @@ def _register_routes(app: FastAPI):
         from fastapi.responses import Response
         from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-        metrics_data = generate_latest()
+        worker_metrics = getattr(app.state, "worker_metrics", None)
+        metrics_data = worker_metrics.render() if worker_metrics is not None else generate_latest()
         return Response(content=metrics_data, media_type=CONTENT_TYPE_LATEST)
 
     @app.get(
         "/v1/default/banks/{bank_id}/graph",
         response_model=GraphDataResponse,
         summary="Get memory graph data",
-        description="Retrieve graph data for visualization, optionally filtered by type (world/experience/opinion).",
+        description="Retrieve graph data for visualization, optionally filtered by type (world/experience/observation).",
         operation_id="get_graph",
         tags=["Memory"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_graph(
         bank_id: str,
         type: str | None = None,
-        limit: int = 1000,
+        limit: int = Query(default=1000, ge=0),
         q: str | None = None,
         tags: list[str] | None = Query(None),
         tags_match: str = "all_strict",
@@ -3123,27 +5436,29 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/graph: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/graph")
 
     @app.get(
         "/v1/default/banks/{bank_id}/memories/list",
         response_model=ListMemoryUnitsResponse,
         summary="List memory units",
-        description="List memory units with pagination and optional full-text search. Supports filtering by type. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC).",
+        description="List memory units with pagination and optional full-text search. Supports filtering by type, source document, and linked entity ID. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC).",
         operation_id="list_memories",
         tags=["Memory"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list(
         bank_id: str,
         type: str | None = None,
         q: str | None = None,
         consolidation_state: str | None = None,
-        limit: int = 100,
-        offset: int = 0,
+        state: str | None = None,
+        document_id: str | None = None,
+        entity_id: str | None = None,
+        tags: list[str] | None = Query(default=None),
+        tags_match: TagsMatch = Query(default="any"),
+        limit: int = Query(default=100, ge=0),
+        offset: int = Query(default=0, ge=0),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """
@@ -3154,10 +5469,18 @@ def _register_routes(app: FastAPI):
 
         Args:
             bank_id: Memory Bank ID (from path)
-            type: Filter by fact type (world, experience, opinion)
+            type: Filter by fact type (world, experience, observation)
             q: Search query for full-text search (searches text and context)
             consolidation_state: Filter by consolidation state for source memories
                 (world/experience). One of 'failed', 'pending', or 'done'.
+            document_id: Filter to a single source document.
+            entity_id: Filter to memory units linked to this entity ID (via stored
+                entity links, not text/semantic match). Combining with
+                state='invalidated' returns no results (the archive has no links).
+            tags: Optional list of tag names to filter by.
+            tags_match: How to combine tags: 'any' (OR, default) or 'all' (AND) both
+                also include untagged memories; 'any_strict'/'all_strict' exclude
+                untagged; 'exact' matches the tag set exactly.
             limit: Maximum number of results (default: 100)
             offset: Offset for pagination (default: 0)
         """
@@ -3167,10 +5490,16 @@ def _register_routes(app: FastAPI):
                 fact_type=type,
                 search_query=q,
                 consolidation_state=consolidation_state,
+                state=state,
+                document_id=document_id,
+                entity_id=entity_id,
+                tags=tags,
+                tags_match=tags_match,
                 limit=limit,
                 offset=offset,
                 request_context=request_context,
             )
+            await _attach_to_memories(app.state.memory, bank_id, data.get("items") or [], request_context)
             return data
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -3179,11 +5508,142 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/memories/list")
 
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/memories/list: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+    async def _require_dry_run_enabled() -> None:
+        """Feature-flag gate for dry-run extraction.
+
+        Declared as a dependency BEFORE ``precheck_for(PrecheckOperation.DRY_RUN_EXTRACT)`` so a
+        disabled route returns 404 regardless of tenant/billing state — FastAPI
+        resolves path-operation dependencies in signature order, so this runs
+        first and preserves the original "disabled → 404" contract.
+        """
+        if not get_config().enable_dry_run_extract:
+            raise HTTPException(
+                status_code=404,
+                detail="Dry-run extraction is disabled. Set HINDSIGHT_API_ENABLE_DRY_RUN_EXTRACT=true to re-enable.",
+            )
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/memories/dry-run-extract",
+        response_model=DryRunExtractionResult,
+        summary="Dry-run fact extraction (preview, no persistence)",
+        description=(
+            "Preview what the retain step would extract from text WITHOUT changing the bank — no "
+            "entity resolution, links, embeddings, or persistence. Returns the candidate facts and "
+            "the LLM token usage. Every prompt-affecting setting (retain mission, extraction mode, "
+            "chunk size, …) is overridable in the body to A/B a candidate config against the bank's "
+            "current one. This is a read-only tool: nothing is stored."
+        ),
+        operation_id="dry_run_extract_memories",
+        tags=["Memory"],
+    )
+    async def api_dry_run_extract(
+        bank_id: str,
+        body: DryRunExtractRequest,
+        request_context: RequestContext = Depends(get_request_context),
+        _enabled: None = Depends(_require_dry_run_enabled),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.DRY_RUN_EXTRACT)),
+    ):
+        try:
+            override_fields = (
+                "retain_mission",
+                "retain_extraction_mode",
+                "retain_custom_instructions",
+                "retain_extract_causal_links",
+                "retain_chunk_size",
+                "entity_labels",
+                "entities_allow_free_form",
+                "llm_output_language",
+            )
+            overrides = {f: getattr(body, f) for f in override_fields if getattr(body, f) is not None}
+            # Normalize typed LabelGroup models back to plain dicts so the resolved-config path
+            # downstream sees the same shape it gets from the bank's stored config.
+            if "entity_labels" in overrides:
+                overrides["entity_labels"] = [lg.model_dump() for lg in overrides["entity_labels"]]
+            return await app.state.memory.extract_dry_run(
+                bank_id,
+                body.content,
+                context=body.context or "",
+                event_date=body.timestamp,
+                strategy=body.strategy,
+                overrides=overrides,
+                agent_name=body.agent_name,
+                request_context=request_context,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/memories/dry-run-extract")
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/prompts/preview",
+        response_model=PromptPreviewResponse,
+        summary="Preview an operation's prompts (no LLM call)",
+        description=(
+            "Render the exact system and user messages retain, consolidation or reflect would send "
+            "for this bank, without calling an LLM, reading memories, or changing anything. "
+            "Everything that shapes the prompt comes from the bank; the runtime data an operation "
+            "would be given is a fixed placeholder. Both messages are returned: retain and "
+            "consolidation keep their system prompt bank-agnostic (one provider-side cache serves "
+            "every bank) and carry the mission in the user message instead."
+        ),
+        operation_id="preview_prompt",
+        tags=["Banks"],
+    )
+    async def api_preview_prompt(
+        bank_id: str,
+        body: PromptPreviewRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        try:
+            preview = await app.state.memory.preview_prompt(
+                bank_id,
+                body.operation,
+                strategy=body.strategy,
+                request_context=request_context,
+            )
+            return PromptPreviewResponse(
+                messages=[
+                    PromptMessageModel(
+                        role=m.role,
+                        blocks=[
+                            PromptBlockModel(
+                                text=b.text,
+                                source=b.source,
+                                field=b.field,
+                                section=b.section,
+                                heading=b.heading,
+                                active=b.active,
+                                value=b.value,
+                                kind=b.kind,
+                                choices=b.choices,
+                                editable=b.editable,
+                            )
+                            for b in m.blocks
+                        ],
+                    )
+                    for m in preview.messages
+                ],
+                strategy=preview.strategy,
+                strategies=preview.strategies,
+                run_settings=[
+                    RunSettingModel(field=r.field, value=r.value, kind=r.kind, editable=r.editable)
+                    for r in preview.run_settings
+                ],
+                response_schema=preview.response_schema,
+                skipped_reason=preview.skipped_reason,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/prompts/preview")
 
     @app.get(
         "/v1/default/banks/{bank_id}/memories/{memory_id}",
@@ -3206,6 +5666,7 @@ def _register_routes(app: FastAPI):
             )
             if data is None:
                 raise HTTPException(status_code=404, detail=f"Memory unit '{memory_id}' not found")
+            await _attach_to_memories(app.state.memory, bank_id, [data], request_context)
             return data
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
@@ -3214,11 +5675,63 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/memories/{memory_id}")
 
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/memories/{memory_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+    @app.patch(
+        "/v1/default/banks/{bank_id}/memories/{memory_id}",
+        summary="Curate memory unit",
+        description="Edit a memory's text and/or change its curation state "
+        "(invalidate / revert). Invalidated memories are excluded from recall, "
+        "consolidation, and graph maintenance but kept for audit (reversible). "
+        "Only world/experience facts can be curated; observations are derived.",
+        operation_id="update_memory",
+        tags=["Memory"],
+    )
+    @audited("update_memory")
+    async def api_update_memory(
+        bank_id: str,
+        memory_id: str,
+        request: UpdateMemoryRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Curate a single memory unit (edit text / invalidate / revert)."""
+        try:
+            occurred_start = (
+                ""
+                if "occurred_start" in request.model_fields_set and request.occurred_start is None
+                else request.occurred_start
+            )
+            occurred_end = (
+                ""
+                if "occurred_end" in request.model_fields_set and request.occurred_end is None
+                else request.occurred_end
+            )
+            data = await app.state.memory.update_memory_unit(
+                bank_id=bank_id,
+                memory_id=memory_id,
+                text=request.text,
+                context=request.context,
+                occurred_start=occurred_start,
+                occurred_end=occurred_end,
+                new_fact_type=request.fact_type,
+                entities=request.entities,
+                resolve_entities=request.resolve_entities,
+                state=request.state,
+                reason=request.reason,
+                request_context=request_context,
+            )
+            if data is None:
+                raise HTTPException(status_code=404, detail=f"Memory unit '{memory_id}' not found")
+            await _attach_to_memories(app.state.memory, bank_id, [data], request_context)
+            return data
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"PATCH /v1/default/banks/{bank_id}/memories/{memory_id}")
 
     @app.get(
         "/v1/default/banks/{bank_id}/memories/{memory_id}/history",
@@ -3244,23 +5757,23 @@ def _register_routes(app: FastAPI):
             return data
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/memories/{memory_id}/history: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/memories/{memory_id}/history")
 
     @app.post(
         "/v1/default/banks/{bank_id}/memories/recall",
         response_model=RecallResponse,
         summary="Recall memory",
         description="Recall memory using semantic similarity and spreading activation.\n\n"
-        "The type parameter is optional and must be one of:\n"
+        "The `types` parameter is optional and may contain any of:\n"
         "- `world`: General knowledge about people, places, events, and things that happen\n"
-        "- `experience`: Memories about experience, conversations, actions taken, and tasks performed",
+        "- `experience`: Memories about experience, conversations, actions taken, and tasks performed\n"
+        "- `observation`: Consolidated knowledge synthesized from facts\n\n"
+        "If `types` is omitted, all fact types are recalled.",
         operation_id="recall_memories",
         tags=["Memory"],
     )
@@ -3268,19 +5781,38 @@ def _register_routes(app: FastAPI):
     async def api_recall(
         bank_id: str,
         request: RecallRequest,
+        http_request: Request,
         request_context: RequestContext = Depends(get_request_context),
-        _precheck: None = Depends(precheck_for("recall")),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.RECALL)),
+        _admit: None = Depends(admit_for(PrecheckOperation.RECALL)),
     ):
         """Run a recall and return results with trace."""
         import time
 
         handler_start = time.time()
         metrics = get_metrics_collector()
+        # Everything before this line — routing, body parsing, dependency resolution (auth among
+        # them) — is outside every timer the endpoint sets, so `pre=` cannot see it and a cost
+        # there reads as unattributed request time.
+        _asgi_t0 = http_request.scope.get("hs_asgi_t0")
+        if _asgi_t0:
+            metrics.record_recall_phase("http_to_handler", max(0.0, handler_start - _asgi_t0))
+            # Split it: middleware+routing, dependency resolution, then body read + validation.
+            # `http_to_handler` was a third of a recall with only its auth call timed, so the rest
+            # of it — Starlette routing, the two dependencies, and reading the request body off the
+            # socket — was a single opaque block.
+            _deps_t0 = http_request.scope.get("hs_deps_t0")
+            _deps_done = http_request.scope.get("hs_deps_done")
+            if _deps_t0:
+                metrics.record_recall_phase("mw_and_routing", max(0.0, _deps_t0 - _asgi_t0))
+            if _deps_t0 and _deps_done:
+                metrics.record_recall_phase("deps_total", max(0.0, _deps_done - _deps_t0))
+            if _deps_done:
+                metrics.record_recall_phase("body_parse", max(0.0, handler_start - _deps_done))
 
         # Validate query length to prevent expensive operations on oversized queries
         max_query_tokens = get_config().recall_max_query_tokens
-        encoding = _get_tiktoken_encoding()
-        query_tokens = len(encoding.encode(request.query))
+        query_tokens = count_tokens(request.query)
         if query_tokens > max_query_tokens:
             raise HTTPException(
                 status_code=400,
@@ -3288,7 +5820,7 @@ def _register_routes(app: FastAPI):
             )
 
         try:
-            # Default to world and experience if not specified (exclude observation)
+            # Default to all fact types if not specified
             fact_types = request.types if request.types else list(VALID_RECALL_FACT_TYPES)
 
             # Parse query_timestamp if provided
@@ -3323,32 +5855,24 @@ def _register_routes(app: FastAPI):
                 "recall", bank_id=bank_id, source="api", budget=request.budget.value, max_tokens=request.max_tokens
             ):
                 recall_start = time.time()
-                # why: HINDSIGHT_API_RECALL_USES_EXP routes all /recall traffic through the
-                # experimental recall_exp_async pipeline (full recall + entity enrichment +
-                # KNN diversity clustering). Dropped params on this branch: budget,
-                # enable_trace, include_entities/chunks/source_facts, tag_groups, question_date.
-                if os.environ.get("HINDSIGHT_API_RECALL_USES_EXP", "").lower() in ("1", "true", "yes"):
-                    logging.info(
-                        f"[RECALL HTTP] bank={bank_id} routing via recall_exp_async "
-                        f"(HINDSIGHT_API_RECALL_USES_EXP=on)"
-                    )
-                    core_result = await app.state.memory.recall_exp_async(
-                        bank_id=bank_id,
-                        query=request.query,
-                        max_tokens=request.max_tokens,
-                        fact_type=fact_types,
-                        request_context=request_context,
-                        tags=request.tags,
-                        tags_match=request.tags_match,
-                    )
-                else:
-                    core_result = await app.state.memory.recall_async(
+                # Cancel the recall if the client disconnects: the engine checks
+                # request_context at each stage boundary and aborts abandoned
+                # work rather than running it to completion (issue #2122).
+                # [FORK] Keep cancellation and every request filter on the diversity route.
+                recall_method = (
+                    app.state.memory.recall_exp_async if get_config().recall_uses_exp else app.state.memory.recall_async
+                )
+                core_result = await run_cancellable_on_disconnect(
+                    http_request,
+                    request_context,
+                    recall_method(
                         bank_id=bank_id,
                         query=request.query,
                         budget=request.budget,
                         max_tokens=request.max_tokens,
                         enable_trace=request.trace,
                         fact_type=fact_types,
+                        prefer_observations=request.prefer_observations,
                         question_date=question_date,
                         include_entities=include_entities,
                         max_entity_tokens=max_entity_tokens,
@@ -3361,7 +5885,14 @@ def _register_routes(app: FastAPI):
                         tags=request.tags,
                         tags_match=request.tags_match,
                         tag_groups=request.tag_groups,
-                    )
+                        min_scores=request.min_scores,
+                        temporal_window=request.temporal_window,
+                    ),
+                    operation="recall",
+                    bank_id=bank_id,
+                )
+                engine_done = time.time()
+                metrics.record_recall_phase("engine_call", engine_done - recall_start, diagnostic=True)
 
             # Convert core MemoryFact objects to API RecallResult objects (excluding internal metrics)
             def _fact_to_result(fact: "MemoryFact") -> RecallResult:
@@ -3379,13 +5910,35 @@ def _register_routes(app: FastAPI):
                     chunk_id=fact.chunk_id,
                     tags=fact.tags,
                     source_fact_ids=fact.source_fact_ids,
+                    scores=fact.scores,
                 )
 
             recall_results = [_fact_to_result(fact) for fact in core_result.results]
+            await _attach_to_recall_results(
+                app.state.memory,
+                bank_id,
+                recall_results,
+                request_context,
+                carried={
+                    fact.id: (fact.document_id, fact.attachment_ids)
+                    for fact in core_result.results
+                    if fact.attachment_ids is not None
+                },
+            )
 
             # Convert chunks from engine to HTTP API format
             chunks_response = None
             if core_result.chunks:
+                # A chunk's images are named by the placeholders in its own text,
+                # so one lookup for the whole response resolves them all — no
+                # per-chunk query, and no second copy of the document→image edge.
+                referenced = [
+                    attachment_id
+                    for chunk_info in core_result.chunks.values()
+                    for attachment_id in iter_placeholder_ids(chunk_info.chunk_text or "")
+                ]
+                attachment_records = await app.state.memory.resolve_attachments(bank_id, referenced, request_context)
+
                 chunks_response = {}
                 for chunk_id, chunk_info in core_result.chunks.items():
                     chunks_response[chunk_id] = ChunkData(
@@ -3393,6 +5946,7 @@ def _register_routes(app: FastAPI):
                         text=chunk_info.chunk_text,
                         chunk_index=chunk_info.chunk_index,
                         truncated=chunk_info.truncated,
+                        attachments=chunk_attachments_of(bank_id, chunk_info.chunk_text or "", attachment_records),
                     )
 
             # Convert core EntityState objects to API EntityStateResponse objects
@@ -3422,10 +5976,16 @@ def _register_routes(app: FastAPI):
                 entities=entities_response,
                 chunks=chunks_response,
                 source_facts=source_facts_response,
+                source_facts_truncated=core_result.source_facts_truncated,
             )
 
             handler_duration = time.time() - handler_start
-            recall_duration = time.time() - recall_start
+            # END OF THE ENGINE CALL, not end of handler. Measured at the end, this window also
+            # covered response building, and `post_recall` — computed as the remainder — was then
+            # ~0 by construction. That made a slow response-assembly path unreadable: the line
+            # said pre=0 post=0 and put every millisecond into `recall`, whatever spent it.
+            metrics.record_recall_phase("post_engine", max(0.0, time.time() - engine_done))
+            recall_duration = engine_done - recall_start
             post_recall = handler_duration - pre_recall - recall_duration
             if handler_duration > 1.0:
                 logging.info(
@@ -3472,6 +6032,7 @@ def _register_routes(app: FastAPI):
     async def api_recall_exp(
         bank_id: str,
         request: RecallExpRequest,
+        http_request: Request,
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Run baseline recall or an explicitly requested experimental recall variant."""
@@ -3481,8 +6042,7 @@ def _register_routes(app: FastAPI):
         metrics = get_metrics_collector()
 
         max_query_tokens = get_config().recall_max_query_tokens
-        encoding = _get_tiktoken_encoding()
-        query_tokens = len(encoding.encode(request.query))
+        query_tokens = count_tokens(request.query)
         if query_tokens > max_query_tokens:
             raise HTTPException(
                 status_code=400,
@@ -3491,6 +6051,28 @@ def _register_routes(app: FastAPI):
 
         try:
             fact_types = request.types if request.types else list(VALID_RECALL_FACT_TYPES)
+
+            question_date = None
+            if request.query_timestamp:
+                try:
+                    question_date = datetime.fromisoformat(request.query_timestamp.replace("Z", "+00:00"))
+                except ValueError as e:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid query_timestamp format. Expected ISO format (e.g., '2023-05-30T23:40:00'): {str(e)}",
+                    ) from e
+
+            include_entities = request.include.entities is not None
+            max_entity_tokens = request.include.entities.max_tokens if include_entities else 500
+
+            include_chunks = request.include.chunks is not None
+            max_chunk_tokens = request.include.chunks.max_tokens if include_chunks else 8192
+
+            include_source_facts = request.include.source_facts is not None
+            max_source_facts_tokens = request.include.source_facts.max_tokens if include_source_facts else 4096
+            max_source_facts_tokens_per_observation = (
+                request.include.source_facts.max_tokens_per_observation if include_source_facts else -1
+            )
 
             def _fact_to_result(fact: "MemoryFact") -> RecallResult:
                 return RecallResult(
@@ -3516,32 +6098,83 @@ def _register_routes(app: FastAPI):
                 budget=request.budget.value,
                 max_tokens=request.max_tokens,
             ):
+                recall_kwargs = dict(
+                    bank_id=bank_id,
+                    query=request.query,
+                    budget=request.budget,
+                    max_tokens=request.max_tokens,
+                    enable_trace=request.trace,
+                    fact_type=fact_types,
+                    prefer_observations=request.prefer_observations,
+                    question_date=question_date,
+                    include_entities=include_entities,
+                    max_entity_tokens=max_entity_tokens,
+                    include_chunks=include_chunks,
+                    max_chunk_tokens=max_chunk_tokens,
+                    include_source_facts=include_source_facts,
+                    max_source_facts_tokens=max_source_facts_tokens,
+                    max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,
+                    request_context=request_context,
+                    tags=request.tags,
+                    tags_match=request.tags_match,
+                    tag_groups=request.tag_groups,
+                    min_scores=request.min_scores,
+                    temporal_window=request.temporal_window,
+                )
                 if request.experimental_variant == "entity_tools":
-                    core_result = await app.state.memory.recall_exp_async(
-                        bank_id=bank_id,
-                        query=request.query,
-                        max_tokens=request.max_tokens,
-                        fact_type=fact_types,
-                        request_context=request_context,
-                        tags=request.tags,
-                        tags_match=request.tags_match,
+                    recall_coro = app.state.memory.recall_exp_async(
+                        **recall_kwargs,
                         cluster_threshold=request.cluster_threshold,
                     )
                 else:
-                    core_result = await app.state.memory.recall_async(
-                        bank_id=bank_id,
-                        query=request.query,
-                        budget=request.budget,
-                        max_tokens=request.max_tokens,
-                        enable_trace=request.trace,
-                        fact_type=fact_types,
-                        request_context=request_context,
-                        tags=request.tags,
-                        tags_match=request.tags_match,
-                        tag_groups=request.tag_groups,
-                    )
+                    recall_coro = app.state.memory.recall_async(**recall_kwargs)
+                core_result = await run_cancellable_on_disconnect(
+                    http_request,
+                    request_context,
+                    recall_coro,
+                    operation="recall_exp",
+                    bank_id=bank_id,
+                )
 
             recall_results = [_fact_to_result(fact) for fact in core_result.results]
+            chunks_response = None
+            if core_result.chunks:
+                referenced = [
+                    attachment_id
+                    for chunk_info in core_result.chunks.values()
+                    for attachment_id in iter_placeholder_ids(chunk_info.chunk_text or "")
+                ]
+                attachment_records = await app.state.memory.resolve_attachments(bank_id, referenced, request_context)
+
+                chunks_response = {}
+                for chunk_id, chunk_info in core_result.chunks.items():
+                    chunks_response[chunk_id] = ChunkData(
+                        id=chunk_id,
+                        text=chunk_info.chunk_text,
+                        chunk_index=chunk_info.chunk_index,
+                        truncated=chunk_info.truncated,
+                        attachments=chunk_attachments_of(bank_id, chunk_info.chunk_text or "", attachment_records),
+                    )
+
+            entities_response = None
+            if core_result.entities:
+                entities_response = {}
+                for name, state in core_result.entities.items():
+                    entities_response[name] = EntityStateResponse(
+                        entity_id=state.entity_id,
+                        canonical_name=state.canonical_name,
+                        observations=[
+                            EntityObservationResponse(text=obs.text, mentioned_at=obs.mentioned_at)
+                            for obs in state.observations
+                        ],
+                    )
+
+            source_facts_response = None
+            if core_result.source_facts:
+                source_facts_response = {
+                    fact_id: _fact_to_result(fact) for fact_id, fact in core_result.source_facts.items()
+                }
+
             handler_duration = time.time() - handler_start
             if handler_duration > 1.0:
                 logging.info(
@@ -3549,7 +6182,14 @@ def _register_routes(app: FastAPI):
                     f"shadow={request.experimental_shadow} duration={handler_duration:.3f}s "
                     f"results={len(recall_results)}"
                 )
-            return RecallResponse(results=recall_results, trace=core_result.trace)
+            return RecallResponse(
+                results=recall_results,
+                trace=core_result.trace,
+                entities=entities_response,
+                chunks=chunks_response,
+                source_facts=source_facts_response,
+                source_facts_truncated=core_result.source_facts_truncated,
+            )
         except HTTPException:
             raise
         except OperationValidationError as e:
@@ -3697,11 +6337,11 @@ def _register_routes(app: FastAPI):
         "/v1/default/banks/{bank_id}/reflect",
         response_model=ReflectResponse,
         summary="Reflect and generate answer",
-        description="Reflect and formulate an answer using bank identity, world facts, and opinions.\n\n"
+        description="Reflect and formulate an answer using bank identity, world facts, observations, and mental models.\n\n"
         "This endpoint:\n"
         "1. Retrieves experience (conversations and events)\n"
         "2. Retrieves world facts relevant to the query\n"
-        "3. Retrieves existing opinions (bank's perspectives)\n"
+        "3. Retrieves observations and mental models (bank's synthesized perspectives)\n"
         "4. Uses LLM to formulate a contextual answer\n"
         "5. Returns plain text answer and the facts used",
         operation_id="reflect",
@@ -3711,8 +6351,10 @@ def _register_routes(app: FastAPI):
     async def api_reflect(
         bank_id: str,
         request: ReflectRequest,
+        http_request: Request,
         request_context: RequestContext = Depends(get_request_context),
-        _precheck: None = Depends(precheck_for("reflect")),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.REFLECT)),
+        _admit: None = Depends(admit_for(PrecheckOperation.REFLECT)),
     ):
         metrics = get_metrics_collector()
 
@@ -3724,20 +6366,31 @@ def _register_routes(app: FastAPI):
 
             # Use the memory system's reflect_async method (record metrics)
             with metrics.record_operation("reflect", bank_id=bank_id, source="api", budget=request.budget.value):
-                core_result = await app.state.memory.reflect_async(
+                # Cancel the reflect if the client disconnects: the agent loop
+                # checks request_context between iterations and the nested recall
+                # checks at its stage boundaries, so abandoned work stops instead
+                # of running to completion (issue #2122).
+                core_result = await run_cancellable_on_disconnect(
+                    http_request,
+                    request_context,
+                    app.state.memory.reflect_async(
+                        bank_id=bank_id,
+                        query=query,
+                        budget=request.budget,
+                        context=None,  # Deprecated, now concatenated with query
+                        max_tokens=request.max_tokens,
+                        response_schema=request.response_schema,
+                        request_context=request_context,
+                        tags=request.tags,
+                        tags_match=request.tags_match,
+                        tag_groups=request.tag_groups,
+                        apply_all_directives=request.apply_all_directives,
+                        fact_types=request.fact_types,
+                        exclude_mental_models=request.exclude_mental_models,
+                        exclude_mental_model_ids=request.exclude_mental_model_ids,
+                    ),
+                    operation="reflect",
                     bank_id=bank_id,
-                    query=query,
-                    budget=request.budget,
-                    context=None,  # Deprecated, now concatenated with query
-                    max_tokens=request.max_tokens,
-                    response_schema=request.response_schema,
-                    request_context=request_context,
-                    tags=request.tags,
-                    tags_match=request.tags_match,
-                    tag_groups=request.tag_groups,
-                    fact_types=request.fact_types,
-                    exclude_mental_models=request.exclude_mental_models,
-                    exclude_mental_model_ids=request.exclude_mental_model_ids,
                 )
 
             # Build based_on (memories + mental_models + directives) if facts are requested
@@ -3805,6 +6458,7 @@ def _register_routes(app: FastAPI):
                 text=core_result.text,
                 based_on=based_on_result,
                 structured_output=core_result.structured_output,
+                structured_output_error=core_result.structured_output_error,
                 usage=core_result.usage,
                 trace=trace_result,
             )
@@ -3815,6 +6469,27 @@ def _register_routes(app: FastAPI):
             raise
         except LLMNotAvailableError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        except ReflectNoAnswerError as e:
+            # The loop ran but produced no answer (a done call with an empty answer,
+            # a final synthesis that returned nothing). Reflect used to substitute a
+            # placeholder sentence and return 200, which read as a real answer to
+            # every caller and got stored as one (#2959). There is nothing to
+            # return, so this is a failure like any other.
+            logger.warning("Reflect produced no answer in bank %s: %s", bank_id, e)
+            raise HTTPException(status_code=500, detail=str(e))
+        except ReflectToolCallError as e:
+            # The configured model/transport can't drive reflect's tool-calling loop.
+            # The request itself is fine, so this is a server-side (500) failure, not a
+            # 4xx -- but log at warning, not error: it's a misconfiguration, not a bug.
+            logger.warning("Reflect tool-calling failure in bank %s: %s", bank_id, e)
+            raise HTTPException(status_code=500, detail=str(e))
+        except ReflectToolExecutionError as e:
+            # A retrieval tool raised, so the loop could not finish gathering the
+            # evidence it was asked for. Answering anyway would return a confident
+            # reply built on a partial (often empty) evidence set, which callers
+            # store as a real answer (#2894). Returning the failure lets them retry.
+            logger.warning("Reflect retrieval failure in bank %s: %s", bank_id, e)
+            raise HTTPException(status_code=500, detail=str(e))
         except TimeoutError as e:
             logger.error("Timeout in /v1/default/banks/%s/reflect: %s", bank_id, e)
             raise HTTPException(
@@ -3822,33 +6497,35 @@ def _register_routes(app: FastAPI):
                 detail=str(e) or "Reflect operation timed out. Consider reducing the budget or simplifying the query.",
             )
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/reflect: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/reflect")
 
     @app.get(
         "/v1/default/banks",
         response_model=BankListResponse,
-        summary="List all memory banks",
-        description="Get a list of all agents with their profiles",
+        summary="List memory banks",
+        description=(
+            "List banks with their profiles and summary stats, most recently written first "
+            "(`last_write_at` descending), with pagination and optional search."
+        ),
         operation_id="list_banks",
         tags=["Banks"],
     )
-    async def api_list_banks(request_context: RequestContext = Depends(get_request_context)):
-        """Get list of all banks with their profiles."""
+    async def api_list_banks(
+        q: str | None = Query(None, description="Case-insensitive substring filter on bank ID or name (e.g. 'alice')"),
+        limit: int = Query(default=100, ge=0, description="Maximum number of banks to return"),
+        offset: int = Query(default=0, ge=0, description="Offset for pagination"),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Get one page of banks with their profiles."""
         try:
-            banks = await app.state.memory.list_banks(request_context=request_context)
-            return BankListResponse(banks=banks)
+            data = await app.state.memory.list_banks(
+                search_query=q, limit=limit, offset=offset, request_context=request_context
+            )
+            return BankListResponse(**data)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, "/v1/default/banks")
 
     @app.get(
         "/v1/default/banks/{bank_id}/stats",
@@ -3857,14 +6534,21 @@ def _register_routes(app: FastAPI):
         description="Get statistics about nodes and links for a specific agent",
         operation_id="get_agent_stats",
         tags=["Banks"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_stats(
         bank_id: str,
+        refresh: bool = Query(
+            default=False,
+            description="Force a fresh recompute, bypassing the cached value (and refreshing the cache).",
+        ),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Get statistics about memory nodes and links for a memory bank."""
         try:
-            stats = await app.state.memory.get_bank_stats(bank_id, request_context=request_context)
+            stats = await app.state.memory.get_bank_stats(
+                bank_id, request_context=request_context, force_refresh=refresh
+            )
             nodes_by_type = stats["node_counts"]
             links_by_type = stats["link_counts"]
             links_by_fact_type = stats["link_counts_by_fact_type"]
@@ -3888,6 +6572,8 @@ def _register_routes(app: FastAPI):
                 failed_operations=ops.get("failed", 0),
                 operations_by_status=ops,
                 last_consolidated_at=stats["last_consolidated_at"],
+                # .get(): a row cached by an older build has no watermark key.
+                last_memory_write_at=stats.get("last_memory_write_at"),
                 pending_consolidation=stats["pending_consolidation"],
                 failed_consolidation=stats.get("failed_consolidation", 0),
                 total_observations=stats["total_observations"],
@@ -3897,11 +6583,42 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/stats")
 
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/stats: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+    @app.post(
+        "/v1/default/banks/{bank_id}/health/llm",
+        response_model=BankLlmHealthResponse,
+        summary="Test the bank's LLM connectivity",
+        description="Probe the LLMs this bank would use for retain / consolidation / reflect with one minimal call "
+        "each (configs shared across operations are probed once), so you can discover 'not configured / unreachable' "
+        "instead of a silent stall. Deliberate action (makes a real provider call); not for polling. Returns status "
+        "only — never the provider, model, endpoint, API key, or raw error. Disable with "
+        "HINDSIGHT_API_ENABLE_BANK_LLM_HEALTH=false.",
+        operation_id="test_bank_llm",
+        tags=["Banks"],
+    )
+    async def api_bank_llm_health(bank_id: str, request_context: RequestContext = Depends(get_request_context)):
+        """Probe per-bank LLM connectivity."""
+        if not get_config().enable_bank_llm_health:
+            raise HTTPException(
+                status_code=404,
+                detail="Bank LLM health check is disabled. Set HINDSIGHT_API_ENABLE_BANK_LLM_HEALTH=true to enable.",
+            )
+        try:
+            result = await app.state.memory.check_bank_llm(bank_id, request_context=request_context)
+            return BankLlmHealthResponse(
+                bank_id=result.bank_id,
+                operations=[
+                    LlmOperationHealth(operation=op.operation, ok=op.ok, status=op.status, latency_ms=op.latency_ms)
+                    for op in result.operations
+                ],
+            )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/health/llm")
 
     @app.get(
         "/v1/default/banks/{bank_id}/stats/memories-timeseries",
@@ -3910,6 +6627,7 @@ def _register_routes(app: FastAPI):
         description="Memories ingested over a period, bucketed by time and broken down by fact type.",
         operation_id="get_memories_timeseries",
         tags=["Banks"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_memories_timeseries(
         bank_id: str,
@@ -3935,11 +6653,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/stats/memories-timeseries: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/stats/memories-timeseries")
 
     @app.get(
         "/v1/default/banks/{bank_id}/entities",
@@ -3948,11 +6662,12 @@ def _register_routes(app: FastAPI):
         description="List all entities (people, organizations, etc.) known by the bank, ordered by mention count. Supports pagination.",
         operation_id="list_entities",
         tags=["Entities"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_entities(
         bank_id: str,
-        limit: int = Query(default=100, description="Maximum number of entities to return"),
-        offset: int = Query(default=0, description="Offset for pagination"),
+        limit: int = Query(default=100, ge=0, description="Maximum number of entities to return"),
+        offset: int = Query(default=0, ge=0, description="Offset for pagination"),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """List entities for a memory bank with pagination."""
@@ -3971,11 +6686,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/entities: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/entities")
 
     @app.get(
         "/v1/default/banks/{bank_id}/entities/graph",
@@ -3984,10 +6695,11 @@ def _register_routes(app: FastAPI):
         description="Return a graph of entities (nodes) and their co-occurrences (edges) for visualization.",
         operation_id="get_entity_graph",
         tags=["Entities"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_entity_graph(
         bank_id: str,
-        limit: int = Query(default=1000, description="Maximum number of co-occurrence edges to return"),
+        limit: int = Query(default=1000, ge=0, description="Maximum number of co-occurrence edges to return"),
         min_count: int = Query(default=1, description="Minimum cooccurrence_count to include an edge"),
         request_context: RequestContext = Depends(get_request_context),
     ):
@@ -4001,11 +6713,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/entities/graph: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/entities/graph")
 
     @app.get(
         "/v1/default/banks/{bank_id}/entities/{entity_id}",
@@ -4039,14 +6747,12 @@ def _register_routes(app: FastAPI):
             )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/entities/{entity_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/entities/{entity_id}")
 
     @app.post(
         "/v1/default/banks/{bank_id}/entities/{entity_id}/regenerate",
@@ -4080,41 +6786,61 @@ def _register_routes(app: FastAPI):
         description="List user-curated living documents that stay current.",
         operation_id="list_mental_models",
         tags=["Mental Models"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_mental_models(
         bank_id: str,
         tags_filter: list[str] | None = Query(None, alias="tags", description="Filter by tags"),
         tags_match: Literal["any", "all", "exact"] = Query("any", description="How to match tags"),
         detail: Literal["metadata", "content", "full"] = Query(
-            "full",
-            description="Detail level: 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response)",
+            "metadata",
+            description=(
+                "Detail level: 'metadata' (names/tags/staleness — the default), "
+                "'content' (adds content/config), 'full' (includes reflect_response). "
+                "Content is opt-in: it is returned only when explicitly requested."
+            ),
         ),
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
         request_context: RequestContext = Depends(get_request_context),
     ):
-        """List mental models for a bank."""
+        """List mental models for a bank.
+
+        Defaults to metadata only (id, name, tags, staleness, timestamps).
+        Content is now opt-in via ``detail=content``/``full`` rather than the
+        default: returning every model's synthesized content by default bloated
+        callers' context and let a single list pull a whole bank's synthesized
+        knowledge in bulk. To read one model, prefer
+        GET .../mental-models/{id} (get_mental_model).
+
+        Note that ``detail=content``/``full`` still validates as one
+        ``LIST_MENTAL_MODELS`` bank read, not as one read per returned model —
+        the default is what keeps bulk content off the wire, not the
+        authorization surface.
+        """
         try:
-            mental_models = await app.state.memory.list_mental_models(
+            page = await app.state.memory.list_mental_models(
                 bank_id=bank_id,
                 tags=tags_filter,
                 tags_match=tags_match,
                 detail=detail,
                 limit=limit,
                 offset=offset,
+                with_staleness=True,
                 request_context=request_context,
             )
-            return MentalModelListResponse(items=[MentalModelResponse(**m) for m in mental_models])
+            return MentalModelListResponse(
+                items=[MentalModelResponse(**m) for m in page.items],
+                total=page.total,
+                limit=limit,
+                offset=offset,
+            )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in GET /v1/default/banks/{bank_id}/mental-models: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/mental-models")
 
     @app.get(
         "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}",
@@ -4152,11 +6878,7 @@ def _register_routes(app: FastAPI):
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in GET /v1/default/banks/{bank_id}/mental-models/{mental_model_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/mental-models/{mental_model_id}")
 
     @app.get(
         "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/history",
@@ -4187,13 +6909,7 @@ def _register_routes(app: FastAPI):
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(
-                f"Error in GET /v1/default/banks/{bank_id}/mental-models/{mental_model_id}/history: {error_detail}"
-            )
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/mental-models/{mental_model_id}/history")
 
     @app.post(
         "/v1/default/banks/{bank_id}/mental-models",
@@ -4210,7 +6926,7 @@ def _register_routes(app: FastAPI):
         bank_id: str,
         body: CreateMentalModelRequest,
         request_context: RequestContext = Depends(get_request_context),
-        _precheck: None = Depends(precheck_for("mental_model_create")),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.MENTAL_MODEL_CREATE)),
     ):
         """Create a mental model (async - returns operation_id)."""
         try:
@@ -4240,11 +6956,7 @@ def _register_routes(app: FastAPI):
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in POST /v1/default/banks/{bank_id}/mental-models: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/mental-models")
 
     @app.post(
         "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh",
@@ -4259,7 +6971,7 @@ def _register_routes(app: FastAPI):
         bank_id: str,
         mental_model_id: str,
         request_context: RequestContext = Depends(get_request_context),
-        _precheck: None = Depends(precheck_for("mental_model_refresh")),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.MENTAL_MODEL_REFRESH)),
     ):
         """Refresh a mental model by re-running its source query (async)."""
         try:
@@ -4278,13 +6990,57 @@ def _register_routes(app: FastAPI):
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except Exception as e:
-            import traceback
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh")
 
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(
-                f"Error in POST /v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh: {error_detail}"
+    @app.post(
+        "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/dry-run-refresh",
+        response_model=MentalModelDryRunRefreshResult,
+        summary="Dry-run mental model refresh (preview, no persistence)",
+        description=(
+            "Preview what a refresh would do to this mental model WITHOUT changing it — no content, "
+            "structured document, watermark, or last_refreshed_at is written. Returns the mode the "
+            "refresh ran in and why (delta silently falls back to full when there is no baseline or the "
+            "source query changed), the resolved tag scope and time window it read, how many facts "
+            "retrieval returned versus how many the reflect agent actually used, the delta operations "
+            "it emitted, and a unified diff from the stored content to the content it would write.\n\n"
+            "This is the production refresh pipeline with two writes skipped — the content and the "
+            "watermark — and nothing about it is configurable, so what it reports is what the next "
+            "refresh will do. Because nothing is persisted, a delta dry run reads exactly the window "
+            "the next real refresh would, and repeating it reads that same window again.\n\n"
+            "It costs the same LLM tokens as a refresh and is validated the same way."
+        ),
+        operation_id="dry_run_refresh_mental_model",
+        tags=["Mental Models"],
+    )
+    @audited("dry_run_refresh_mental_model", request_param=None)
+    async def api_dry_run_refresh_mental_model(
+        bank_id: str,
+        mental_model_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.MENTAL_MODEL_REFRESH)),
+    ):
+        """Preview a mental model refresh without persisting anything."""
+        try:
+            result = await app.state.memory.dry_run_refresh_mental_model(
+                bank_id,
+                mental_model_id,
+                request_context=request_context,
             )
-            raise HTTPException(status_code=500, detail=str(e))
+            if result is None:
+                raise HTTPException(status_code=404, detail=f"Mental model {mental_model_id} not found")
+            return result
+        except LLMNotAvailableError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except (AuthenticationError, HTTPException):
+            raise
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except Exception as e:
+            raise _internal_error(
+                e, f"POST /v1/default/banks/{bank_id}/mental-models/{mental_model_id}/dry-run-refresh"
+            )
 
     @app.post(
         "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/clear",
@@ -4320,13 +7076,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(
-                f"Error in POST /v1/default/banks/{bank_id}/mental-models/{mental_model_id}/clear: {error_detail}"
-            )
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/mental-models/{mental_model_id}/clear")
 
     @app.patch(
         "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}",
@@ -4352,7 +7102,13 @@ def _register_routes(app: FastAPI):
                 source_query=body.source_query,
                 max_tokens=body.max_tokens,
                 tags=body.tags,
-                trigger=body.trigger.model_dump() if body.trigger else None,
+                # Only the fields the client actually set: the engine patches them over
+                # the model's current trigger. A full dump would carry this model's own
+                # defaults (mode="full", exclude_mental_models=False, no cron) into every
+                # update, so changing one setting silently reset the rest — which for a
+                # knowledge page meant losing delta mode and its observation-only scope.
+                # Same fix as #3506, which corrected only the page routes.
+                trigger=body.trigger.model_dump(exclude_unset=True) if body.trigger else None,
                 request_context=request_context,
             )
             if mental_model is None:
@@ -4363,11 +7119,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in PATCH /v1/default/banks/{bank_id}/mental-models/{mental_model_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"PATCH /v1/default/banks/{bank_id}/mental-models/{mental_model_id}")
 
     @app.delete(
         "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}",
@@ -4399,11 +7151,327 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
+            raise _internal_error(e, f"DELETE /v1/default/banks/{bank_id}/mental-models/{mental_model_id}")
 
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in DELETE /v1/default/banks/{bank_id}/mental-models/{mental_model_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+    # =========================================================================
+    # KNOWLEDGE BASE ENDPOINTS (folders + pages, markdown)
+    # =========================================================================
+    # A hierarchy of folders and pages over mental models. Pages render to markdown
+    # documents (markdown body + YAML frontmatter); see api/page_markdown.py. The static
+    # sub-paths (/tree, /folders, /pages, /graph, /export) are declared before
+    # the /pages/{id} and /nodes/{id} path-parameter routes so they win.
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/knowledge-base/tree",
+        response_model=KnowledgeTreeResponse,
+        summary="Get the knowledge-base tree",
+        description="Return the knowledge base as a nested tree of folders and pages.",
+        operation_id="get_knowledge_base_tree",
+        tags=["Knowledge Base"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
+    )
+    async def api_knowledge_base_tree(
+        bank_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Return the folder/page tree for a bank."""
+        try:
+            nodes = await app.state.memory.list_knowledge_nodes(
+                bank_id=bank_id, with_staleness=True, request_context=request_context
+            )
+            return KnowledgeTreeResponse(roots=_build_knowledge_tree(nodes))
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/knowledge-base/tree")
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/knowledge-base/folders",
+        response_model=KnowledgeNode,
+        status_code=201,
+        summary="Create a knowledge-base folder",
+        description="Create a folder, optionally nested under a parent folder.",
+        operation_id="create_knowledge_folder",
+        tags=["Knowledge Base"],
+    )
+    async def api_create_knowledge_folder(
+        bank_id: str,
+        body: CreateFolderRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Create a folder node."""
+        try:
+            node = await app.state.memory.create_knowledge_folder(
+                bank_id=bank_id,
+                name=body.name,
+                parent_id=body.parent_id,
+                request_context=request_context,
+            )
+            return _knowledge_node_model(node)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/knowledge-base/folders")
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/knowledge-base/pages",
+        response_model=CreateKnowledgePageResponse,
+        status_code=201,
+        summary="Create a knowledge-base page",
+        description="Create a page (a mental model + tree node). Content is generated asynchronously; "
+        "use the returned operation_id to track completion.",
+        operation_id="create_knowledge_page",
+        tags=["Knowledge Base"],
+    )
+    async def api_create_knowledge_page(
+        bank_id: str,
+        body: CreatePageRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Create a page node (async content generation)."""
+        try:
+            node = await app.state.memory.create_knowledge_page(
+                bank_id=bank_id,
+                name=body.name,
+                source_query=body.source_query,
+                content="Generating content...",
+                parent_id=body.parent_id,
+                tags=body.tags if body.tags else None,
+                max_tokens=body.max_tokens,
+                # Only what the client actually set: the engine merges these over the
+                # knowledge-page defaults, and a full dump would drown them in this model's
+                # own field defaults (mode="full", exclude_mental_models=False) — which is
+                # how every page created with a trigger lost its delta refresh (#3506).
+                trigger=body.trigger.model_dump(exclude_unset=True) if body.trigger else None,
+                request_context=request_context,
+            )
+            if node is None:
+                raise HTTPException(status_code=409, detail=f"A page named '{body.name}' already exists in this folder")
+            result = await app.state.memory.submit_async_refresh_mental_model(
+                bank_id=bank_id,
+                mental_model_id=node["mental_model_id"],
+                request_context=request_context,
+            )
+            return CreateKnowledgePageResponse(
+                page_id=node["id"],
+                mental_model_id=node["mental_model_id"],
+                operation_id=result["operation_id"],
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/knowledge-base/pages")
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/knowledge-base/export",
+        response_model=KnowledgePageBundleResponse,
+        summary="Export the knowledge base as a markdown bundle",
+        description="Return a portable markdown bundle: a nested index.md, one <id>.md per page, and history logs.",
+        operation_id="export_knowledge_base",
+        tags=["Knowledge Base"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
+    )
+    async def api_export_knowledge_base(
+        bank_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Export a bank's knowledge base as a flat markdown bundle."""
+        try:
+            export = await app.state.memory.export_knowledge_base(bank_id=bank_id, request_context=request_context)
+            files = [
+                KnowledgePageBundleFile(
+                    path=page_markdown.INDEX_FILENAME, content=page_markdown.render_index(export.nodes)
+                )
+            ]
+            for page in export.pages:
+                files.append(
+                    KnowledgePageBundleFile(
+                        path=page_markdown.page_filename(page.node_id),
+                        content=page_markdown.render_document(page.page),
+                    )
+                )
+                if page.history:
+                    files.append(
+                        KnowledgePageBundleFile(
+                            path=page_markdown.log_filename(page.node_id),
+                            content=page_markdown.render_log(page.page, page.history),
+                        )
+                    )
+            return KnowledgePageBundleResponse(files=files)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/knowledge-base/export")
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/knowledge-base/search",
+        response_model=KnowledgePageSearchResponse,
+        summary="Hybrid search over knowledge pages (BM25 + vector)",
+        description=(
+            "Doc-level hybrid search across a bank's knowledge pages: a full-text (BM25) match "
+            "and a vector-similarity match, Reciprocal-Rank-Fusion fused. No reranker — tuned for latency."
+        ),
+        operation_id="search_knowledge_base",
+        tags=["Knowledge Base"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
+    )
+    async def api_search_knowledge_base(
+        bank_id: str,
+        q: str = Query(..., description="Search query", min_length=1),
+        limit: int = Query(10, ge=1, le=50, description="Maximum results to return"),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Return knowledge pages ranked by fused BM25 + vector relevance."""
+        try:
+            results = await app.state.memory.search_knowledge_pages(
+                bank_id=bank_id, query=q, limit=limit, request_context=request_context
+            )
+            return KnowledgePageSearchResponse(
+                results=[KnowledgePageSearchResult(**r) for r in results],
+                total=len(results),
+            )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/knowledge-base/search")
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/knowledge-base/pages/{page_id}",
+        response_model=KnowledgePageResponse,
+        summary="Get a knowledge-base page",
+        description="Return a single page as a markdown document (frontmatter + markdown body).",
+        operation_id="get_knowledge_page",
+        tags=["Knowledge Base"],
+    )
+    async def api_get_knowledge_page(
+        bank_id: str,
+        page_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Get a single page as a markdown document."""
+        try:
+            node = await app.state.memory.get_knowledge_page(
+                bank_id=bank_id, page_id=page_id, request_context=request_context
+            )
+            if node is None:
+                raise HTTPException(status_code=404, detail=f"Knowledge page '{page_id}' not found")
+            return _knowledge_page_response(node)
+        except (AuthenticationError, HTTPException):
+            raise
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except Exception as e:
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/knowledge-base/pages/{page_id}")
+
+    @app.patch(
+        "/v1/default/banks/{bank_id}/knowledge-base/nodes/{node_id}",
+        response_model=KnowledgeNode,
+        summary="Rename/move a knowledge-base node or update a page's options",
+        description="Rename a node (set `name`), move it under another folder (set `parent_id`, null "
+        "for the root), and/or update a page's options (`source_query`, `tags`, `max_tokens`, `trigger`). "
+        "Changing `source_query` schedules an async refresh so the page rebuilds against the new question. "
+        "`trigger` is applied as a patch: the fields you send are updated and the rest keep the page's "
+        "current values.",
+        operation_id="update_knowledge_node",
+        tags=["Knowledge Base"],
+    )
+    async def api_update_knowledge_node(
+        bank_id: str,
+        node_id: str,
+        body: UpdateNodeRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Rename/move a node and/or update a page's options."""
+        try:
+            # parent_id is applied only when present in the body, so passing null
+            # moves the node to the root (distinct from "not provided"), which is
+            # what KEEP_PARENT stands in for. Page options live on the backing
+            # mental model and each applies only when supplied (so tags=[] clears,
+            # distinct from "not provided").
+            page_fields = {"source_query", "tags", "max_tokens", "trigger"} & body.model_fields_set
+            if body.name is None and "parent_id" not in body.model_fields_set and not page_fields:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Provide name, parent_id, source_query, tags, max_tokens, and/or trigger to update",
+                )
+            # One call, one transaction: a rename must not survive the move that
+            # fails after it, which is what left clients retrying against a tree
+            # they never asked for.
+            updated = await app.state.memory.update_knowledge_node(
+                bank_id=bank_id,
+                node_id=node_id,
+                name=body.name,
+                parent_id=body.parent_id if "parent_id" in body.model_fields_set else KEEP_PARENT,
+                source_query=body.source_query if "source_query" in page_fields else None,
+                tags=body.tags if "tags" in page_fields else None,
+                max_tokens=body.max_tokens if "max_tokens" in page_fields else None,
+                # Only the trigger fields the client stated: the engine patches them over
+                # the page's current trigger, and a full dump would carry this model's own
+                # defaults (mode="full", exclude_mental_models=False) into every update.
+                trigger=(body.trigger.model_dump(exclude_unset=True) if body.trigger else None),
+                request_context=request_context,
+            )
+            if updated is None:
+                raise HTTPException(status_code=404, detail=f"Knowledge node '{node_id}' not found")
+            # A new source query means the content is stale — rebuild it. Scheduled
+            # only once the patch has committed, so a refresh is never queued for a
+            # change that rolled back.
+            if "source_query" in page_fields and body.source_query is not None and updated.get("mental_model_id"):
+                await app.state.memory.submit_async_refresh_mental_model(
+                    bank_id=bank_id,
+                    mental_model_id=updated["mental_model_id"],
+                    request_context=request_context,
+                )
+            return _knowledge_node_model(updated)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except (AuthenticationError, HTTPException):
+            raise
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except Exception as e:
+            raise _internal_error(e, f"PATCH /v1/default/banks/{bank_id}/knowledge-base/nodes/{node_id}")
+
+    @app.delete(
+        "/v1/default/banks/{bank_id}/knowledge-base/nodes/{node_id}",
+        summary="Delete a knowledge-base node",
+        description="Delete a folder or page and its whole subtree (pages' mental models are removed too).",
+        operation_id="delete_knowledge_node",
+        tags=["Knowledge Base"],
+    )
+    async def api_delete_knowledge_node(
+        bank_id: str,
+        node_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Delete a node and its subtree."""
+        try:
+            deleted = await app.state.memory.delete_knowledge_node(
+                bank_id=bank_id, node_id=node_id, request_context=request_context
+            )
+            if not deleted:
+                raise HTTPException(status_code=404, detail=f"Knowledge node '{node_id}' not found")
+            return {"status": "deleted"}
+        except (AuthenticationError, HTTPException):
+            raise
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except Exception as e:
+            raise _internal_error(e, f"DELETE /v1/default/banks/{bank_id}/knowledge-base/nodes/{node_id}")
 
     # =========================================================================
     # DIRECTIVES ENDPOINTS
@@ -4413,14 +7481,22 @@ def _register_routes(app: FastAPI):
         "/v1/default/banks/{bank_id}/directives",
         response_model=DirectiveListResponse,
         summary="List directives",
-        description="List hard rules that are injected into prompts.",
+        description="List directive definitions. Unlike reflect, an omitted tag filter returns all directives.",
         operation_id="list_directives",
         tags=["Directives"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_directives(
         bank_id: str,
-        tags_filter: list[str] | None = Query(None, alias="tags", description="Filter by tags"),
-        tags_match: Literal["any", "all", "exact"] = Query("any", description="How to match tags"),
+        tags_filter: list[str] | None = Query(
+            None,
+            alias="tags",
+            description="Filter directives by execution scope. Omit or pass [] to list all directives.",
+        ),
+        tags_match: Literal["any", "all", "exact"] = Query(
+            "any",
+            description="How tagged directives match the requested scope. Untagged/global directives are included.",
+        ),
         active_only: bool = Query(True, description="Only return active directives"),
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
@@ -4428,7 +7504,7 @@ def _register_routes(app: FastAPI):
     ):
         """List directives for a bank."""
         try:
-            directives = await app.state.memory.list_directives(
+            page = await app.state.memory.list_directives(
                 bank_id=bank_id,
                 tags=tags_filter,
                 tags_match=tags_match,
@@ -4437,17 +7513,18 @@ def _register_routes(app: FastAPI):
                 offset=offset,
                 request_context=request_context,
             )
-            return DirectiveListResponse(items=[DirectiveResponse(**d) for d in directives])
+            return DirectiveListResponse(
+                items=[DirectiveResponse(**d) for d in page.items],
+                total=page.total,
+                limit=limit,
+                offset=offset,
+            )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in GET /v1/default/banks/{bank_id}/directives: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/directives")
 
     @app.get(
         "/v1/default/banks/{bank_id}/directives/{directive_id}",
@@ -4477,17 +7554,13 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in GET /v1/default/banks/{bank_id}/directives/{directive_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/directives/{directive_id}")
 
     @app.post(
         "/v1/default/banks/{bank_id}/directives",
         response_model=DirectiveResponse,
         summary="Create directive",
-        description="Create a hard rule that will be injected into prompts.",
+        description="Create a global or tag-scoped hard rule for reflect prompts.",
         operation_id="create_directive",
         tags=["Directives"],
     )
@@ -4516,11 +7589,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in POST /v1/default/banks/{bank_id}/directives: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/directives")
 
     @app.patch(
         "/v1/default/banks/{bank_id}/directives/{directive_id}",
@@ -4557,11 +7626,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in PATCH /v1/default/banks/{bank_id}/directives/{directive_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"PATCH /v1/default/banks/{bank_id}/directives/{directive_id}")
 
     @app.delete(
         "/v1/default/banks/{bank_id}/directives/{directive_id}",
@@ -4591,19 +7656,16 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in DELETE /v1/default/banks/{bank_id}/directives/{directive_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"DELETE /v1/default/banks/{bank_id}/directives/{directive_id}")
 
     @app.get(
         "/v1/default/banks/{bank_id}/documents",
         response_model=ListDocumentsResponse,
         summary="List documents",
-        description="List documents with pagination and optional search. Documents are the source content from which memory units are extracted.",
+        description="List documents with pagination and optional search, most recently written first (`updated_at` descending). Documents are the source content from which memory units are extracted.",
         operation_id="list_documents",
         tags=["Documents"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_documents(
         bank_id: str,
@@ -4614,8 +7676,8 @@ def _register_routes(app: FastAPI):
         tags_match: str = Query(
             "any_strict", description="How to match tags: 'any', 'all', 'any_strict', 'all_strict'"
         ),
-        limit: int = 100,
-        offset: int = 0,
+        limit: int = Query(default=100, ge=0),
+        offset: int = Query(default=0, ge=0),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """
@@ -4645,11 +7707,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/documents: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/documents")
 
     @app.get(
         "/v1/default/banks/{bank_id}/documents/{document_id:path}/chunks",
@@ -4685,17 +7743,27 @@ def _register_routes(app: FastAPI):
             )
             if result is None:
                 raise HTTPException(status_code=404, detail="Document not found")
+            items = result.get("items") or []
+            by_chunk = await app.state.memory.attachments_for_chunks(
+                bank_id,
+                [c["chunk_id"] for c in items if c.get("chunk_id")],
+                request_context,
+                # The page already holds each chunk's text; a store-owned bank resolves from it.
+                carried_texts={
+                    c["chunk_id"]: (c.get("document_id"), c.get("chunk_text")) for c in items if c.get("chunk_id")
+                },
+            )
+            for chunk in items:
+                records = by_chunk.get(chunk.get("chunk_id"))
+                if records:
+                    chunk["attachments"] = [_attachment_payload(bank_id, record) for record in records]
             return result
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/documents/{document_id}/chunks: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/documents/{document_id}/chunks")
 
     @app.post(
         "/v1/default/banks/{bank_id}/documents/{document_id:path}/reprocess",
@@ -4738,11 +7806,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/documents/{document_id}/reprocess: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/documents/{document_id}/reprocess")
 
     @app.get(
         "/v1/default/banks/{bank_id}/documents/{document_id:path}",
@@ -4766,17 +7830,28 @@ def _register_routes(app: FastAPI):
             document = await app.state.memory.get_document(document_id, bank_id, request_context=request_context)
             if not document:
                 raise HTTPException(status_code=404, detail="Document not found")
+            # A store-owned bank's document carries its attachment names from the record just
+            # read; taken off so the payload is the same shape on either backend, and handed on so
+            # the engine does not read that record a second time.
+            stored_names = document.pop("attachment_filenames", None)
+            by_document = await app.state.memory.attachments_for_documents(
+                bank_id,
+                [document_id],
+                request_context,
+                # Used only for a store-owned bank, which has no document edge to read; a null
+                # text (full text not kept) makes the engine fall back to the chunk texts.
+                carried_texts={document_id: document.get("original_text")},
+                carried_filenames=None if stored_names is None else {document_id: stored_names},
+            )
+            if by_document.get(document_id):
+                document["attachments"] = [_attachment_payload(bank_id, record) for record in by_document[document_id]]
             return document
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/documents/{document_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/documents/{document_id}")
 
     @app.get(
         "/v1/default/banks/{bank_id}/tags",
@@ -4787,6 +7862,7 @@ def _register_routes(app: FastAPI):
         "Use `source=mental_models` to list tags used on mental models instead of memories.",
         operation_id="list_tags",
         tags=["Memory"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_tags(
         bank_id: str,
@@ -4799,8 +7875,8 @@ def _register_routes(app: FastAPI):
             default="memories",
             description="Where to read tags from: 'memories' (memory_units, default) or 'mental_models'.",
         ),
-        limit: int = Query(default=100, description="Maximum number of tags to return"),
-        offset: int = Query(default=0, description="Offset for pagination"),
+        limit: int = Query(default=100, ge=0, description="Maximum number of tags to return"),
+        offset: int = Query(default=0, ge=0, description="Offset for pagination"),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """
@@ -4842,11 +7918,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/tags: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/tags")
 
     @app.get(
         "/v1/default/chunks/{chunk_id:path}",
@@ -4867,26 +7939,40 @@ def _register_routes(app: FastAPI):
             chunk = await app.state.memory.get_chunk(chunk_id, request_context=request_context)
             if not chunk:
                 raise HTTPException(status_code=404, detail="Chunk not found")
+            # This route is not bank-scoped in its path; the chunk carries the bank
+            # it belongs to, and attachments_for_chunks authorizes against it.
+            chunk_bank = chunk.get("bank_id")
+            if chunk_bank:
+                by_chunk = await app.state.memory.attachments_for_chunks(
+                    chunk_bank,
+                    [chunk_id],
+                    request_context,
+                    carried_texts={chunk_id: (chunk.get("document_id"), chunk.get("chunk_text"))},
+                )
+                if by_chunk.get(chunk_id):
+                    chunk["attachments"] = [_attachment_payload(chunk_bank, record) for record in by_chunk[chunk_id]]
             return chunk
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/chunks/{chunk_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/chunks/{chunk_id}")
 
     @app.patch(
         "/v1/default/banks/{bank_id}/documents/{document_id:path}",
         response_model=UpdateDocumentResponse,
         summary="Update document",
         description="Update mutable fields on a document without re-processing its content.\n\n"
-        "**Tags** (`tags`): Propagated to all associated memory units. Observations derived from "
+        "**Tags** (`tags`): The array REPLACES the document's tags, it is not merged into them — "
+        "send the complete set you want the document to end up with, and any tag you leave out is "
+        "dropped. An empty array (`[]`) therefore clears every tag; only omitting the field "
+        "entirely is rejected (422).\n\n"
+        "The new tags are propagated to all associated memory units. Observations derived from "
         "those units are invalidated and queued for re-consolidation under the new tags. "
-        "Co-source memories from other documents that shared those observations are also reset.\n\n"
+        "Co-source memories from other documents that shared those observations are also reset. "
+        "Tags are compared as a set, so re-sending the tags a document already has (in any order) "
+        "changes nothing and queues no re-consolidation.\n\n"
         "At least one field must be provided.",
         operation_id="update_document",
         tags=["Documents"],
@@ -4923,11 +8009,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in PATCH /v1/default/banks/{bank_id}/documents/{document_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"PATCH /v1/default/banks/{bank_id}/documents/{document_id}")
 
     @app.delete(
         "/v1/default/banks/{bank_id}/documents/{document_id:path}",
@@ -4970,11 +8052,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/documents/{document_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/documents/{document_id}")
 
     @app.get(
         "/v1/default/banks/{bank_id}/operations",
@@ -4983,6 +8061,7 @@ def _register_routes(app: FastAPI):
         description="Get a list of async operations for a specific agent, with optional filtering by status and operation type. Results are sorted by most recent first.",
         operation_id="list_operations",
         tags=["Operations"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_operations(
         bank_id: str,
@@ -5021,18 +8100,15 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/operations: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/operations")
 
     @app.get(
         "/v1/default/banks/{bank_id}/operations/{operation_id}",
         response_model=OperationStatusResponse,
         summary="Get operation status",
-        description="Get the status of a specific async operation. Returns 'pending', 'completed', or 'failed'. "
-        "Completed operations are removed from storage, so 'completed' means the operation finished successfully.",
+        description="Get the status of a specific async operation. Returns 'pending', 'processing', 'completed', "
+        "'failed', or 'cancelled'. Completed operations remain queryable with their payload for the configured "
+        "retention window and are pruned afterward.",
         operation_id="get_operation_status",
         tags=["Operations"],
     )
@@ -5062,17 +8138,19 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in GET /v1/default/banks/{bank_id}/operations/{operation_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/operations/{operation_id}")
 
     @app.delete(
         "/v1/default/banks/{bank_id}/operations/{operation_id}",
         response_model=CancelOperationResponse,
-        summary="Cancel a pending async operation",
-        description="Cancel a pending async operation by removing it from the queue",
+        summary="Cancel a pending or in-flight async operation",
+        description=(
+            "Cancel a queued or running async operation. A 'pending' operation is never started. "
+            "A 'processing' one is cancelled cooperatively: the row is marked 'cancelled' immediately "
+            "and the worker running it stops at its next checkpoint, so work already in flight may "
+            "finish the batch it is on. This also clears operations stranded in 'processing' by a "
+            "crashed worker. Returns 409 for operations that already reached a terminal state."
+        ),
         operation_id="cancel_operation",
         tags=["Operations"],
     )
@@ -5080,7 +8158,7 @@ def _register_routes(app: FastAPI):
     async def api_cancel_operation(
         bank_id: str, operation_id: str, request_context: RequestContext = Depends(get_request_context)
     ):
-        """Cancel a pending async operation."""
+        """Cancel a pending or in-flight async operation."""
         try:
             # Validate UUID format
             try:
@@ -5097,11 +8175,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/operations/{operation_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/operations/{operation_id}")
 
     @app.post(
         "/v1/default/banks/{bank_id}/operations/{operation_id}/retry",
@@ -5131,63 +8205,74 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/operations/{operation_id}/retry")
 
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in POST /v1/default/banks/{bank_id}/operations/{operation_id}/retry: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    @app.get(
-        "/v1/default/banks/{bank_id}/profile",
-        response_model=BankProfileResponse,
-        summary="Get memory bank profile",
-        description="Get disposition traits and mission for a memory bank. Returns 404 if the bank does not exist.",
-        operation_id="get_bank_profile",
-        tags=["Banks"],
-        deprecated=True,
+    @app.delete(
+        "/v1/default/banks/{bank_id}/operations/{operation_id}/delete",
+        response_model=DeleteOperationResponse,
+        summary="Delete a terminal async operation",
+        description="Permanently remove a failed, cancelled, or completed async operation record",
+        operation_id="delete_operation",
+        tags=["Operations"],
     )
-    async def api_get_bank_profile(bank_id: str, request_context: RequestContext = Depends(get_request_context)):
-        """Get memory bank profile (disposition + mission)."""
+    @audited("delete_operation", request_param=None)
+    async def api_delete_operation(
+        bank_id: str, operation_id: str, request_context: RequestContext = Depends(get_request_context)
+    ):
+        """Delete a terminal async operation record."""
         try:
-            # Read endpoints must not have create-as-side-effect: a client
-            # holding onto a stale bank_id (e.g., a UI polling after the user
-            # changed context) would otherwise silently re-create the bank in
-            # an unrelated tenant. Surface a missing bank as 404.
-            profile = await app.state.memory.get_bank_profile(
-                bank_id, request_context=request_context, create_if_missing=False
-            )
-            if profile is None:
-                raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
-            # Convert DispositionTraits object to dict for Pydantic
-            disposition_dict = (
-                profile["disposition"].model_dump()
-                if hasattr(profile["disposition"], "model_dump")
-                else dict(profile["disposition"])
-            )
-            mission = profile.get("mission") or ""
-            return BankProfileResponse(
-                bank_id=bank_id,
-                name=profile["name"],
-                disposition=DispositionTraits(**disposition_dict),
-                mission=mission,
-                background=mission,  # Backwards compat
-            )
+            try:
+                uuid.UUID(operation_id)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid operation_id format: {operation_id}")
+
+            result = await app.state.memory.delete_operation(bank_id, operation_id, request_context=request_context)
+            return DeleteOperationResponse(**result)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
+            raise _internal_error(e, f"DELETE /v1/default/banks/{bank_id}/operations/{operation_id}/delete")
 
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/profile: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+    # The bank "profile" (disposition traits + mission) is no longer a surface of
+    # its own: both live in the bank configuration, which
+    # ``_get_bank_profile_authenticated`` already treated as the source of truth by
+    # overlaying it on top of the legacy DB columns. The three endpoints below are
+    # retired — they stay in the spec (so generated SDK methods are not deleted out
+    # from under callers) but always answer 410 with the config call to use instead.
+    # Their request bodies and `request_context` are declared but unused on purpose:
+    # dropping the body would change the generated signatures, which is the breakage
+    # this shape exists to avoid, and keeping the dependency means an unauthenticated
+    # caller still gets 401 rather than learning the route is gone.
+    _PROFILE_RETIRED_DETAIL = (
+        "The bank profile endpoints have been removed. Disposition traits and the reflect mission are bank "
+        "configuration: read them from GET /v1/default/banks/{bank_id}/config as `disposition_skepticism`, "
+        "`disposition_literalism`, `disposition_empathy` and `reflect_mission`, and write them with "
+        "PATCH /v1/default/banks/{bank_id}/config. The `name` field this endpoint also returned was a "
+        "display-only label; read it from GET /v1/default/banks."
+    )
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/profile",
+        response_model=BankProfileResponse,
+        summary="Get memory bank profile (removed — use GET .../config)",
+        description=f"**Removed.** {_PROFILE_RETIRED_DETAIL}",
+        operation_id="get_bank_profile",
+        tags=["Banks"],
+        deprecated=True,
+    )
+    async def api_get_bank_profile(bank_id: str, request_context: RequestContext = Depends(get_request_context)):
+        """Removed bank-profile read — always 410, pointing at the bank config API."""
+        raise HTTPException(status_code=410, detail=_PROFILE_RETIRED_DETAIL)
 
     @app.put(
         "/v1/default/banks/{bank_id}/profile",
         response_model=BankProfileResponse,
-        summary="Update memory bank disposition",
-        description="Update bank's disposition traits (skepticism, literalism, empathy)",
+        summary="Update memory bank disposition (removed — use PATCH .../config)",
+        description=f"**Removed.** {_PROFILE_RETIRED_DETAIL}",
         operation_id="update_bank_disposition",
         tags=["Banks"],
         deprecated=True,
@@ -5195,44 +8280,19 @@ def _register_routes(app: FastAPI):
     async def api_update_bank_disposition(
         bank_id: str, request: UpdateDispositionRequest, request_context: RequestContext = Depends(get_request_context)
     ):
-        """Update bank disposition traits."""
-        try:
-            # Update disposition
-            await app.state.memory.update_bank_disposition(
-                bank_id, request.disposition.model_dump(), request_context=request_context
-            )
-
-            # Get updated profile
-            profile = await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
-            disposition_dict = (
-                profile["disposition"].model_dump()
-                if hasattr(profile["disposition"], "model_dump")
-                else dict(profile["disposition"])
-            )
-            mission = profile.get("mission") or ""
-            return BankProfileResponse(
-                bank_id=bank_id,
-                name=profile["name"],
-                disposition=DispositionTraits(**disposition_dict),
-                mission=mission,
-                background=mission,  # Backwards compat
-            )
-        except OperationValidationError as e:
-            raise HTTPException(status_code=e.status_code, detail=e.reason)
-        except (AuthenticationError, HTTPException):
-            raise
-        except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/profile: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+        """Removed disposition write — always 410, pointing at the bank config API."""
+        raise HTTPException(status_code=410, detail=_PROFILE_RETIRED_DETAIL)
 
     @app.post(
         "/v1/default/banks/{bank_id}/background",
         response_model=BackgroundResponse,
-        summary="Add/merge memory bank background (deprecated)",
-        description="Deprecated: Use PUT /mission instead. This endpoint now updates the mission field.",
+        summary="Add/merge memory bank background (removed — use PATCH .../config)",
+        description=(
+            "**Removed.** The bank background was folded into the reflect mission. Write it with "
+            "PATCH /v1/default/banks/{bank_id}/config as `reflect_mission`. That call replaces the value "
+            "rather than merging into it, so read the current mission from GET .../config first if you "
+            "relied on this endpoint's append behaviour."
+        ),
         operation_id="add_bank_background",
         tags=["Banks"],
         deprecated=True,
@@ -5240,23 +8300,16 @@ def _register_routes(app: FastAPI):
     async def api_add_bank_background(
         bank_id: str, request: AddBackgroundRequest, request_context: RequestContext = Depends(get_request_context)
     ):
-        """Deprecated: Add or merge bank background. Now updates mission field."""
-        try:
-            result = await app.state.memory.merge_bank_mission(
-                bank_id, request.content, request_context=request_context
-            )
-            mission = result.get("mission") or ""
-            return BackgroundResponse(mission=mission, background=mission)
-        except OperationValidationError as e:
-            raise HTTPException(status_code=e.status_code, detail=e.reason)
-        except (AuthenticationError, HTTPException):
-            raise
-        except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/background: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+        """Removed background merge — always 410, pointing at the bank config API."""
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                "The bank background endpoint has been removed. The background was folded into the reflect "
+                "mission: write it with PATCH /v1/default/banks/{bank_id}/config as `reflect_mission`. That "
+                "call replaces the value rather than merging into it, so read the current mission from "
+                "GET /v1/default/banks/{bank_id}/config first if you relied on this endpoint's append behaviour."
+            ),
+        )
 
     @app.put(
         "/v1/default/banks/{bank_id}",
@@ -5272,24 +8325,15 @@ def _register_routes(app: FastAPI):
     ):
         """Create or update an agent with disposition and mission."""
         try:
-            # Ensure bank exists by getting profile (auto-creates with defaults)
-            await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
-
-            # Update name if provided (stored in DB for display only, deprecated)
-            if request.name is not None:
-                await app.state.memory.update_bank(
-                    bank_id,
-                    name=request.name,
-                    request_context=request_context,
-                )
-
-            # Apply all config overrides (includes reflect_mission, disposition, retain settings)
+            # The engine validates and authorizes all requested changes before
+            # creating a missing bank.
             config_updates = request.get_config_updates()
-            if config_updates:
-                await app.state.memory._config_resolver.update_bank_config(bank_id, config_updates, request_context)
-
-            # Get final profile
-            final_profile = await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
+            final_profile = await app.state.memory.update_bank(
+                bank_id,
+                name=request.name,
+                config_updates=config_updates or None,
+                request_context=request_context,
+            )
             disposition_dict = (
                 final_profile["disposition"].model_dump()
                 if hasattr(final_profile["disposition"], "model_dump")
@@ -5305,14 +8349,12 @@ def _register_routes(app: FastAPI):
             )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}")
 
     @app.patch(
         "/v1/default/banks/{bank_id}",
@@ -5328,24 +8370,16 @@ def _register_routes(app: FastAPI):
     ):
         """Partially update an agent's profile (name, mission, disposition)."""
         try:
-            # Ensure bank exists
-            await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
-
-            # Update name if provided (stored in DB for display only, deprecated)
-            if request.name is not None:
-                await app.state.memory.update_bank(
-                    bank_id,
-                    name=request.name,
-                    request_context=request_context,
-                )
-
-            # Apply all config overrides (includes reflect_mission, disposition, retain settings)
+            # Update every requested field through one engine call so all
+            # authorization and validation completes before either write.
             config_updates = request.get_config_updates()
-            if config_updates:
-                await app.state.memory._config_resolver.update_bank_config(bank_id, config_updates, request_context)
-
-            # Get final profile
-            final_profile = await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
+            final_profile = await app.state.memory.update_bank(
+                bank_id,
+                name=request.name,
+                config_updates=config_updates or None,
+                create_if_missing=False,
+                request_context=request_context,
+            )
             disposition_dict = (
                 final_profile["disposition"].model_dump()
                 if hasattr(final_profile["disposition"], "model_dump")
@@ -5361,14 +8395,12 @@ def _register_routes(app: FastAPI):
             )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in PATCH /v1/default/banks/{bank_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"PATCH /v1/default/banks/{bank_id}")
 
     @app.delete(
         "/v1/default/banks/{bank_id}",
@@ -5396,11 +8428,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in DELETE /v1/default/banks/{bank_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"DELETE /v1/default/banks/{bank_id}")
 
     # =====================================================================
     # Bank Template Import / Export
@@ -5416,6 +8444,23 @@ def _register_routes(app: FastAPI):
         "Use dry_run=true to validate the manifest without applying changes.",
         operation_id="import_bank_template",
         tags=["Bank Templates"],
+        # Keep parsing and validation in the handler so malformed JSON and
+        # template errors retain the API's established 400 response format,
+        # while publishing the typed manifest schema for OpenAPI clients.
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "title": "Manifest",
+                            "description": "Bank template manifest",
+                            "$ref": "#/components/schemas/BankTemplateManifest",
+                        }
+                    }
+                },
+            }
+        },
     )
     @audited("import_bank_template", request_param=None)
     async def api_import_bank_template(
@@ -5426,7 +8471,7 @@ def _register_routes(app: FastAPI):
     ):
         """Import a bank template manifest."""
         try:
-            # Parse raw JSON and validate against the Pydantic model manually
+            # Parse and validate against the Pydantic model manually
             # so we can return clean error messages instead of raw 422s.
             raw_body = await request.json()
             from pydantic import ValidationError
@@ -5456,14 +8501,16 @@ def _register_routes(app: FastAPI):
                     dry_run=True,
                 )
 
-            # Ensure bank exists (auto-creates with defaults if needed)
-            await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
-
             return await apply_bank_template_manifest(
                 memory=app.state.memory,
                 bank_id=bank_id,
                 manifest=body,
                 request_context=request_context,
+            )
+        except BankConfigPersistenceConflictError as e:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Bank '{e.bank_id}' changed or was deleted during template import; retry the import.",
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -5472,11 +8519,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in POST /v1/default/banks/{bank_id}/import: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/import")
 
     @app.get(
         "/v1/default/banks/{bank_id}/export",
@@ -5486,6 +8529,7 @@ def _register_routes(app: FastAPI):
         "The exported manifest can be imported into another bank to replicate the setup.",
         operation_id="export_bank_template",
         tags=["Bank Templates"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_export_bank_template(
         bank_id: str,
@@ -5503,19 +8547,27 @@ def _register_routes(app: FastAPI):
             # Get bank-specific config overrides (not the fully resolved config,
             # so the template only contains what was explicitly set on this bank)
             await app.state.memory._authenticate_tenant(request_context)
-            bank_overrides = await app.state.memory._config_resolver._load_bank_config(bank_id)
+            # Fresh, not cached: this exports what is stored ON the bank, and a template taken
+            # right after a config edit must not carry the values that edit replaced.
+            bank_overrides = await app.state.memory._config_resolver._load_bank_config(bank_id, cached=False)
 
             # Filter to only BankTemplateConfig fields (exclude credentials, static fields)
             template_config_fields = set(BankTemplateConfig.model_fields.keys())
             filtered_overrides = {k: v for k, v in bank_overrides.items() if k in template_config_fields}
             bank_config = BankTemplateConfig(**filtered_overrides) if filtered_overrides else None
 
-            # Get mental models
+            # Get mental models (limit=None — an export that stopped at the
+            # default page size would silently drop the rest of the bank).
+            # detail="config" because a template carries how a model is built,
+            # never what it currently says: the loop below reads source_query,
+            # tags, max_tokens and trigger and nothing else. Asking for content
+            # would pull every model's synthesized body across the wire, and
+            # report a read of it, for a field this endpoint discards.
             mental_models_raw = await app.state.memory.list_mental_models(
-                bank_id=bank_id, request_context=request_context
+                bank_id=bank_id, limit=None, detail="config", request_context=request_context
             )
             template_mental_models: list[BankTemplateMentalModel] = []
-            for mm in mental_models_raw:
+            for mm in mental_models_raw.items:
                 trigger_data = mm.get("trigger", {})
                 trigger = MentalModelTrigger(**trigger_data) if trigger_data else MentalModelTrigger()
                 template_mental_models.append(
@@ -5529,12 +8581,12 @@ def _register_routes(app: FastAPI):
                     )
                 )
 
-            # Get directives
+            # Get directives (limit=None for the same reason as the models above)
             directives_raw = await app.state.memory.list_directives(
-                bank_id=bank_id, active_only=False, request_context=request_context
+                bank_id=bank_id, active_only=False, limit=None, request_context=request_context
             )
             template_directives: list[BankTemplateDirective] = []
-            for d in directives_raw:
+            for d in directives_raw.items:
                 template_directives.append(
                     BankTemplateDirective(
                         name=d["name"],
@@ -5556,11 +8608,262 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/export")
 
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in GET /v1/default/banks/{bank_id}/export: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+    # =====================================================================
+    # Document Transfer (Export / Import between banks — no LLM re-extraction)
+    # =====================================================================
+
+    @app.get(
+        # Dedicated path (not under /documents/) to avoid colliding with the
+        # greedy GET /documents/{document_id:path} route, which would otherwise
+        # capture "export"/"import" as a document id.
+        "/v1/default/banks/{bank_id}/document-transfer",
+        summary="Export documents (removed — use POST .../document-transfer/export)",
+        description="**Removed.** The synchronous whole-bank export loaded the entire bank into memory and "
+        "held a database connection for the full request, which could exhaust memory and take down the shared "
+        "API on large banks. Use the asynchronous POST /v1/default/banks/{bank_id}/document-transfer/export "
+        "instead: it returns an operation_id, runs the export in the background, and exposes a download URL on "
+        "completion.",
+        operation_id="export_documents_sync_removed",
+        tags=["Document Transfer"],
+        deprecated=True,
+    )
+    async def api_export_documents_removed(
+        bank_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Removed synchronous export — always 410, pointing at the async endpoint."""
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                "Synchronous document export has been removed because it could take down the shared API on "
+                f"large banks. Submit an async export via POST /v1/default/banks/{bank_id}/document-transfer/export, "
+                f"poll GET /v1/default/banks/{bank_id}/operations/{{operation_id}}, then download the archive from "
+                "the download_url in the operation's result_metadata."
+            ),
+        )
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/document-transfer/export",
+        response_model=DocumentExportSubmitResponse,
+        status_code=202,
+        summary="Export documents (async)",
+        description="Submit an async export of a bank's documents (extracted facts, entity names, causal links, "
+        "chunks) as a transfer ZIP archive. Embeddings and database ids are not included — importing re-embeds "
+        "with the target bank's model and re-resolves entities. Runs as a background operation to avoid pinning "
+        "the API on large banks. Returns an operation_id; poll "
+        "GET /v1/default/banks/{bank_id}/operations/{operation_id}. On completion the operation's result_metadata "
+        "carries download_url (fetch the ZIP from GET /v1/default/files/download/{key}), storage_key, byte_size, "
+        "and filename. Pass document_id query params to export specific documents, or omit to export the whole "
+        "bank; include_observations=true carries consolidated observations and include_knowledge_base=true carries "
+        "Mental Models plus Knowledge Pages (all whole-bank export only).",
+        operation_id="export_documents",
+        tags=["Document Transfer"],
+    )
+    async def api_export_documents(
+        bank_id: str,
+        document_id: list[str] | None = Query(default=None, description="Document id(s) to export; omit for all"),
+        include_observations: bool = Query(
+            default=False, description="Also export consolidated observations (restored on import; whole-bank only)"
+        ),
+        include_knowledge_base: bool = Query(
+            default=False,
+            description="Also export Mental Models and Knowledge Pages (restored on import; whole-bank only)",
+        ),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Submit an async document-export operation for a bank."""
+        try:
+            if not get_config().enable_document_export_api:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Document export API is disabled. "
+                    "Set HINDSIGHT_API_ENABLE_DOCUMENT_EXPORT_API=true to enable.",
+                )
+            profile = await app.state.memory.get_bank_profile(
+                bank_id, request_context=request_context, create_if_missing=False
+            )
+            if profile is None:
+                raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
+
+            try:
+                submission = await app.state.memory.submit_export_documents_async(
+                    bank_id,
+                    request_context,
+                    list(document_id) if document_id else None,
+                    include_observations=include_observations,
+                    include_knowledge_base=include_knowledge_base,
+                )
+            except ValueError as e:
+                # e.g. include_observations combined with a document_id subset.
+                raise HTTPException(status_code=400, detail=str(e))
+            return DocumentExportSubmitResponse(operation_id=submission["operation_id"])
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/document-transfer/export")
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/document-transfer",
+        response_model=DocumentImportSubmitResponse,
+        status_code=202,
+        summary="Import documents (async)",
+        description="Submit a transfer archive (produced by the export endpoint) for import into a bank. Runs as a "
+        "background operation: facts are re-embedded with the target bank's embedding model and entities are "
+        "re-resolved — no LLM extraction. Returns an operation_id; poll "
+        "GET /v1/default/banks/{bank_id}/operations/{operation_id} for status and the imported/skipped counts in "
+        "result_metadata. Use on_conflict to control existing document ids: skip (default), replace, or new-id.",
+        operation_id="import_documents",
+        tags=["Document Transfer"],
+    )
+    @audited("import_documents", request_param=None)
+    async def api_import_documents(
+        bank_id: str,
+        file: UploadFile = File(..., description="Transfer ZIP archive"),
+        on_conflict: str = Query(default="skip", description="skip | replace | new-id"),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Submit a transfer archive for async import into a bank."""
+        try:
+            if not get_config().enable_document_import_api:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Document import API is disabled. "
+                    "Set HINDSIGHT_API_ENABLE_DOCUMENT_IMPORT_API=true to enable.",
+                )
+            if on_conflict not in ("skip", "replace", "new-id"):
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid on_conflict '{on_conflict}' (expected skip|replace|new-id)"
+                )
+            archive_bytes = await file.read()
+            try:
+                submission = await app.state.memory.import_documents_async(
+                    bank_id, archive_bytes, request_context, on_conflict
+                )
+            except ValueError as e:
+                # Invalid archive / unsupported schema version — fail fast.
+                raise HTTPException(status_code=400, detail=str(e))
+            return DocumentImportSubmitResponse(operation_id=submission["operation_id"])
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/document-transfer")
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/attachments/{attachment_id}",
+        summary="Fetch an attachment retained inline with a document",
+        description="Serve the bytes of an attachment retained as inline content. The id is the one "
+        "inside a placeholder token, and is returned on `attachments[].url` by recall and by the "
+        "document/chunk/memory reads — so an agent can show or reason over the original behind an "
+        "attachment-derived fact.\n\n"
+        "Bytes are served with the Content-Type the caller declared at retain. Access is authorized "
+        "against the bank; a missing attachment and an invisible bank both return 404, so the endpoint "
+        "cannot be used to probe what a bank holds.",
+        operation_id="get_bank_attachment",
+        tags=["Memory"],
+        # An explicit response_class stops FastAPI adding its default
+        # application/json media type next to the binary one, which made the
+        # generated clients decode the bytes as JSON text (#4292).
+        response_class=Response,
+        responses={200: {"content": {"application/octet-stream": _BINARY_SCHEMA}, "description": "Attachment bytes"}},
+    )
+    async def api_get_bank_attachment(
+        bank_id: str,
+        attachment_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Serve one of a bank's retained inline attachments."""
+
+        try:
+            attachment = await app.state.memory.retrieve_bank_attachment(bank_id, attachment_id, request_context)
+            if attachment is None:
+                raise HTTPException(status_code=404, detail="Attachment not found")
+            return Response(
+                content=attachment.data,
+                media_type=attachment.media_type,
+                headers={
+                    # Content-addressed: the bytes at this URL can never change, so
+                    # it is safe to cache indefinitely. Private, because the URL is
+                    # only meaningful with the bank's credentials.
+                    "Cache-Control": "private, max-age=31536000, immutable",
+                    # Serve exactly what the caller declared, and nothing else: the
+                    # accepted-type list is deliberately open, so a browser must not
+                    # be free to sniff a stored file into some *other* type. Note
+                    # the bytes are still served inline under their own declared
+                    # type — a bank writer who stores active content (SVG, HTML) can
+                    # have it execute in this origin, which is accepted here because
+                    # bank writers are trusted.
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/attachments/{attachment_id}")
+
+    @app.get(
+        "/v1/default/files/download/{key:path}",
+        summary="Download a stored file (async export archive)",
+        description="Stream a file previously written to file storage — currently the transfer ZIP produced by "
+        "an async document export. The key comes from the export operation's result_metadata (storage_key / "
+        "download_url). Access is authorized against the bank the key belongs to.",
+        operation_id="download_file",
+        tags=["Document Transfer"],
+        response_class=Response,
+        responses={200: {"content": {"application/zip": _BINARY_SCHEMA}, "description": "Stored file"}},
+    )
+    async def api_download_file(
+        key: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Download a bank-scoped stored file (export archive) by storage key."""
+
+        try:
+            if not get_config().enable_document_export_api:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Document export API is disabled. "
+                    "Set HINDSIGHT_API_ENABLE_DOCUMENT_EXPORT_API=true to enable.",
+                )
+            # Only bank-scoped keys are downloadable. Parse the bank id out of the
+            # "tenants/{schema}/banks/{bank_id}/..." key — or the "banks/{bank_id}/..."
+            # layout written before keys carried the tenant (request validation, so it
+            # belongs here); the engine method then authorizes the caller against that
+            # bank, in their own tenant, and retrieves the file, so a caller can't fetch
+            # another tenant's or bank's archive (IDOR guard). The unguessable uuid in
+            # the key is defence in depth, not the access control.
+            parts = key.split("/")
+            if ".." in parts:
+                raise HTTPException(status_code=404, detail="File not found")
+            if len(parts) > 4 and parts[0] == "tenants" and parts[2] == "banks" and parts[3]:
+                bank_id = unquote(parts[3])
+            elif len(parts) > 2 and parts[0] == "banks" and parts[1]:
+                bank_id = parts[1]
+            else:
+                raise HTTPException(status_code=404, detail="File not found")
+
+            data = await app.state.memory.retrieve_bank_file(bank_id, key, request_context)
+            if data is None:
+                raise HTTPException(status_code=404, detail="File not found")
+
+            return Response(
+                content=data,
+                media_type="application/zip",
+                headers={"Content-Disposition": f'attachment; filename="{bank_id}-documents.zip"'},
+            )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"GET /v1/default/files/download/{key}")
 
     @app.get(
         "/v1/bank-template-schema",
@@ -5597,11 +8900,41 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
+            raise _internal_error(e, f"DELETE /v1/default/banks/{bank_id}/observations")
 
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in DELETE /v1/default/banks/{bank_id}/observations: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+    @app.get(
+        "/v1/default/banks/{bank_id}/observations/scopes",
+        response_model=ObservationScopesResponse,
+        summary="List observation scopes",
+        description=(
+            "Enumerate the distinct scopes across a bank's observations. Each observation lives "
+            "under a scope: the exact set of tags it was consolidated with. Returns every distinct "
+            "scope (tag order normalized) with the number of observations in it; the empty tag list "
+            "is the global/untagged scope. Use a returned scope with the graph endpoint "
+            "(tags=<scope> & tags_match=exact) to filter observations to exactly that scope. "
+            "Paged: `total` reports every distinct scope in the bank."
+        ),
+        operation_id="list_observation_scopes",
+        tags=["Memory"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
+    )
+    async def api_list_observation_scopes(
+        bank_id: str,
+        limit: int = Query(default=100, ge=0, le=1000, description="Maximum number of scopes to return"),
+        offset: int = Query(default=0, ge=0, description="Offset for pagination"),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """List the distinct observation scopes (exact tag sets) for a bank."""
+        try:
+            return await app.state.memory.list_observation_scopes(
+                bank_id, limit=limit, offset=offset, request_context=request_context
+            )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/observations/scopes")
 
     @app.post(
         "/v1/default/banks/{bank_id}/consolidation/recover",
@@ -5626,11 +8959,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in POST /v1/default/banks/{bank_id}/consolidation/recover: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/consolidation/recover")
 
     @app.delete(
         "/v1/default/banks/{bank_id}/memories/{memory_id}/observations",
@@ -5661,65 +8990,44 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(
-                f"Error in DELETE /v1/default/banks/{bank_id}/memories/{memory_id}/observations: {error_detail}"
-            )
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"DELETE /v1/default/banks/{bank_id}/memories/{memory_id}/observations")
 
     @app.get(
         "/v1/default/banks/{bank_id}/config",
         response_model=BankConfigResponse,
         summary="Get bank configuration",
         description="Get fully resolved configuration for a bank including all hierarchical overrides (global → tenant → bank). "
-        "The 'config' field contains all resolved config values. The 'overrides' field shows only bank-specific overrides.",
+        "The 'config' field contains all resolved config values. The 'overrides' field shows only bank-specific overrides. "
+        "Always available: HINDSIGHT_API_ENABLE_BANK_CONFIG_API gates only the write operations on this resource.",
         operation_id="get_bank_config",
         tags=["Banks"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_get_bank_config(bank_id: str, request_context: RequestContext = Depends(get_request_context)):
-        """Get configuration for a bank with all hierarchical overrides applied."""
-        if not get_config().enable_bank_config_api:
-            raise HTTPException(
-                status_code=404,
-                detail="Bank configuration API is disabled. Set HINDSIGHT_API_ENABLE_BANK_CONFIG_API=true to re-enable.",
-            )
+        """Get configuration for a bank with all hierarchical overrides applied.
+
+        Deliberately not gated on ``enable_bank_config_api``: that flag exists to stop
+        clients *changing* per-bank configuration, and a bank must always be able to
+        read its own resolved settings — it is the only surface exposing disposition
+        traits and the reflect mission since the profile endpoints were retired.
+        """
         try:
-            # Authenticate and set schema context for multi-tenant DB queries
-            await app.state.memory._authenticate_tenant(request_context)
-            if app.state.memory._operation_validator:
-                from hindsight_api.extensions import BankReadContext
-
-                ctx = BankReadContext(bank_id=bank_id, operation="get_bank_config", request_context=request_context)
-                await app.state.memory._validate_operation(
-                    app.state.memory._operation_validator.validate_bank_read(ctx)
-                )
-
-            # Get resolved config from config resolver
-            config_dict = await app.state.memory._config_resolver.get_bank_config(bank_id, request_context)
-
-            # Get bank-specific overrides only
-            bank_overrides = await app.state.memory._config_resolver._load_bank_config(bank_id)
-
-            return BankConfigResponse(bank_id=bank_id, config=config_dict, overrides=bank_overrides)
+            state = await app.state.memory.get_bank_config(bank_id, request_context=request_context)
+            return BankConfigResponse(bank_id=bank_id, config=state.config, overrides=state.overrides)
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in GET /v1/default/banks/{bank_id}/config: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/config")
 
     @app.patch(
         "/v1/default/banks/{bank_id}/config",
         response_model=BankConfigResponse,
         summary="Update bank configuration",
-        description="Update configuration overrides for a bank. Only hierarchical fields can be overridden (LLM settings, retention parameters, etc.). "
-        "Keys can be provided in Python field format (llm_provider) or environment variable format (HINDSIGHT_API_LLM_PROVIDER).",
+        description="Update configuration overrides for a bank. Only hierarchical behavioral settings can be "
+        "overridden (retention parameters, recall settings, etc.). Keys can be provided in Python field format "
+        "(retain_extraction_mode) or environment variable format (HINDSIGHT_API_RETAIN_EXTRACTION_MODE).",
         operation_id="update_bank_config",
         tags=["Banks"],
     )
@@ -5734,24 +9042,12 @@ def _register_routes(app: FastAPI):
                 detail="Bank configuration API is disabled. Set HINDSIGHT_API_ENABLE_BANK_CONFIG_API=true to re-enable.",
             )
         try:
-            # Authenticate and set schema context for multi-tenant DB queries
-            await app.state.memory._authenticate_tenant(request_context)
-            if app.state.memory._operation_validator:
-                from hindsight_api.extensions import BankWriteContext
-
-                ctx = BankWriteContext(bank_id=bank_id, operation="update_bank_config", request_context=request_context)
-                await app.state.memory._validate_operation(
-                    app.state.memory._operation_validator.validate_bank_write(ctx)
-                )
-
-            # Update config via config resolver (validates configurable fields and permissions)
-            await app.state.memory._config_resolver.update_bank_config(bank_id, request.updates, request_context)
-
-            # Return updated config
-            config_dict = await app.state.memory._config_resolver.get_bank_config(bank_id, request_context)
-            bank_overrides = await app.state.memory._config_resolver._load_bank_config(bank_id)
-
-            return BankConfigResponse(bank_id=bank_id, config=config_dict, overrides=bank_overrides)
+            state = await app.state.memory.update_bank_config(
+                bank_id,
+                request.updates,
+                request_context=request_context,
+            )
+            return BankConfigResponse(bank_id=bank_id, config=state.config, overrides=state.overrides)
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except ValueError as e:
@@ -5760,11 +9056,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in PATCH /v1/default/banks/{bank_id}/config: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"PATCH /v1/default/banks/{bank_id}/config")
 
     @app.delete(
         "/v1/default/banks/{bank_id}/config",
@@ -5784,34 +9076,14 @@ def _register_routes(app: FastAPI):
                 detail="Bank configuration API is disabled. Set HINDSIGHT_API_ENABLE_BANK_CONFIG_API=true to re-enable.",
             )
         try:
-            # Authenticate and set schema context for multi-tenant DB queries
-            await app.state.memory._authenticate_tenant(request_context)
-            if app.state.memory._operation_validator:
-                from hindsight_api.extensions import BankWriteContext
-
-                ctx = BankWriteContext(bank_id=bank_id, operation="reset_bank_config", request_context=request_context)
-                await app.state.memory._validate_operation(
-                    app.state.memory._operation_validator.validate_bank_write(ctx)
-                )
-
-            # Reset config via config resolver
-            await app.state.memory._config_resolver.reset_bank_config(bank_id)
-
-            # Return updated config (should match defaults now)
-            config_dict = await app.state.memory._config_resolver.get_bank_config(bank_id, request_context)
-            bank_overrides = await app.state.memory._config_resolver._load_bank_config(bank_id)
-
-            return BankConfigResponse(bank_id=bank_id, config=config_dict, overrides=bank_overrides)
+            state = await app.state.memory.reset_bank_config(bank_id, request_context=request_context)
+            return BankConfigResponse(bank_id=bank_id, config=state.config, overrides=state.overrides)
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in DELETE /v1/default/banks/{bank_id}/config: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"DELETE /v1/default/banks/{bank_id}/config")
 
     @app.post(
         "/v1/default/banks/{bank_id}/consolidate",
@@ -5821,11 +9093,20 @@ def _register_routes(app: FastAPI):
         operation_id="trigger_consolidation",
         tags=["Banks"],
     )
-    @audited("consolidation", request_param=None)
-    async def api_trigger_consolidation(bank_id: str, request_context: RequestContext = Depends(get_request_context)):
+    @audited("consolidation")
+    async def api_trigger_consolidation(
+        bank_id: str,
+        request: ConsolidationRequest | None = None,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
         """Trigger consolidation for a bank (async)."""
         try:
-            result = await app.state.memory.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
+            observation_scopes = request.observation_scopes if request else None
+            result = await app.state.memory.submit_async_consolidation(
+                bank_id=bank_id,
+                request_context=request_context,
+                observation_scopes=observation_scopes,
+            )
             return ConsolidationResponse(
                 operation_id=result["operation_id"],
                 deduplicated=result.get("deduplicated", False),
@@ -5835,15 +9116,36 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in POST /v1/default/banks/{bank_id}/consolidate: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/consolidate")
 
     # =========================================================================
     # Webhook Endpoints
     # =========================================================================
+
+    def _validate_webhook_destination(url: str | None) -> None:
+        """Reject webhook URLs that point at private/internal addresses (SSRF).
+
+        Registration-time, syntactic-only check (scheme + IP-literal hosts).
+        DNS-name hosts are resolved and pinned at delivery time by the guarded
+        transport; this just gives callers immediate 400 feedback for the
+        obvious cases. ``None`` (unchanged on PATCH) is a no-op.
+        """
+        if url is None:
+            return
+        from hindsight_api.webhooks.url_guard import WebhookURLError, parse_allowlist, validate_url_syntax
+
+        allowlist = parse_allowlist(get_config().webhook_allowed_hosts)
+        try:
+            validate_url_syntax(url, allowlist)
+        except WebhookURLError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    def _parse_webhook_id(webhook_id: str) -> uuid.UUID:
+        """Parse a webhook path parameter without turning client input into a 500."""
+        try:
+            return uuid.UUID(webhook_id)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid webhook ID") from None
 
     @app.post(
         "/v1/default/banks/{bank_id}/webhooks",
@@ -5862,6 +9164,7 @@ def _register_routes(app: FastAPI):
     ):
         """Register a webhook for a bank."""
         try:
+            _validate_webhook_destination(request.url)
             webhook_id = uuid.uuid4()
             row = await app.state.memory.create_webhook(
                 bank_id,
@@ -5898,31 +9201,35 @@ def _register_routes(app: FastAPI):
                 if hasattr(row["updated_at"], "isoformat")
                 else str(row["updated_at"]),
             )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in POST /v1/default/banks/{bank_id}/webhooks: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/webhooks")
 
     @app.get(
         "/v1/default/banks/{bank_id}/webhooks",
         response_model=WebhookListResponse,
         summary="List webhooks",
-        description="List all webhooks registered for a bank.",
+        description="List the webhooks registered for a bank, oldest first. "
+        "Paged: `total` reports every webhook on the bank.",
         operation_id="list_webhooks",
         tags=["Webhooks"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_webhooks(
         bank_id: str,
+        limit: int = Query(default=100, ge=0, le=1000, description="Maximum number of webhooks to return"),
+        offset: int = Query(default=0, ge=0, description="Offset for pagination"),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """List webhooks for a bank."""
         try:
-            rows = await app.state.memory.list_webhooks(
+            data = await app.state.memory.list_webhooks(
                 bank_id,
+                limit=limit,
+                offset=offset,
                 request_context=request_context,
             )
 
@@ -5951,15 +9258,18 @@ def _register_routes(app: FastAPI):
                     else str(row["updated_at"]),
                 )
 
-            return WebhookListResponse(items=[_parse_webhook_row(row) for row in rows])
+            return WebhookListResponse(
+                items=[_parse_webhook_row(row) for row in data["items"]],
+                total=data["total"],
+                limit=data["limit"],
+                offset=data["offset"],
+            )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in GET /v1/default/banks/{bank_id}/webhooks: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/webhooks")
 
     @app.delete(
         "/v1/default/banks/{bank_id}/webhooks/{webhook_id}",
@@ -5979,20 +9289,18 @@ def _register_routes(app: FastAPI):
         try:
             deleted = await app.state.memory.delete_webhook(
                 bank_id,
-                uuid.UUID(webhook_id),
+                _parse_webhook_id(webhook_id),
                 request_context=request_context,
             )
             if not deleted:
                 raise HTTPException(status_code=404, detail="Webhook not found")
             return DeleteResponse(success=True)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in DELETE /v1/default/banks/{bank_id}/webhooks/{webhook_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"DELETE /v1/default/banks/{bank_id}/webhooks/{webhook_id}")
 
     @app.patch(
         "/v1/default/banks/{bank_id}/webhooks/{webhook_id}",
@@ -6012,10 +9320,12 @@ def _register_routes(app: FastAPI):
         """Update a webhook's fields (PATCH semantics — only sent fields are updated)."""
         try:
             set_clauses: list[str] = []
-            params: list = [uuid.UUID(webhook_id), bank_id]
+            parsed_webhook_id = _parse_webhook_id(webhook_id)
+            params: list = [parsed_webhook_id, bank_id]
 
             fields = request.model_fields_set
             if "url" in fields:
+                _validate_webhook_destination(request.url)
                 params.append(request.url)
                 set_clauses.append(f"url = ${len(params)}")
             if "secret" in fields:
@@ -6036,7 +9346,7 @@ def _register_routes(app: FastAPI):
 
             row = await app.state.memory.update_webhook(
                 bank_id,
-                uuid.UUID(webhook_id),
+                parsed_webhook_id,
                 set_clauses=set_clauses,
                 params=params,
                 request_context=request_context,
@@ -6068,14 +9378,12 @@ def _register_routes(app: FastAPI):
                 if hasattr(row["updated_at"], "isoformat")
                 else str(row["updated_at"]),
             )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in PATCH /v1/default/banks/{bank_id}/webhooks/{webhook_id}: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"PATCH /v1/default/banks/{bank_id}/webhooks/{webhook_id}")
 
     @app.get(
         "/v1/default/banks/{bank_id}/webhooks/{webhook_id}/deliveries",
@@ -6097,7 +9405,7 @@ def _register_routes(app: FastAPI):
             try:
                 rows = await app.state.memory.list_webhook_deliveries(
                     bank_id,
-                    uuid.UUID(webhook_id),
+                    _parse_webhook_id(webhook_id),
                     limit=limit,
                     cursor=cursor,
                     request_context=request_context,
@@ -6108,18 +9416,20 @@ def _register_routes(app: FastAPI):
             has_more = len(rows) > limit
             page = rows[:limit]
             next_cursor = page[-1]["created_at"] if has_more and page else None
+            expose_body = get_config().webhook_expose_response_body
             return WebhookDeliveryListResponse(
-                items=[WebhookDeliveryResponse.from_async_operation_row(dict(row)) for row in page],
+                items=[
+                    WebhookDeliveryResponse.from_async_operation_row(dict(row), expose_response_body=expose_body)
+                    for row in page
+                ],
                 next_cursor=next_cursor,
             )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in GET /v1/default/banks/{bank_id}/webhooks/{webhook_id}/deliveries: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/webhooks/{webhook_id}/deliveries")
 
     @app.post(
         "/v1/default/banks/{bank_id}/memories",
@@ -6151,19 +9461,83 @@ def _register_routes(app: FastAPI):
         bank_id: str,
         request: RetainRequest,
         request_context: RequestContext = Depends(get_request_context),
-        _precheck: None = Depends(precheck_for("retain")),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.RETAIN)),
+        _admit: None = Depends(admit_for(PrecheckOperation.RETAIN)),
     ):
         """Retain memories with optional async processing."""
         metrics = get_metrics_collector()
 
         try:
+            # Flatten any multimodal item to canonical placeholder text, and commit
+            # its images to content-addressed storage, BEFORE anything is submitted.
+            # Downstream — sync or async, the operations payload, every retry — then
+            # carries text only; raw screenshot bytes never enter the pipeline.
+            config = get_config()
+            # A document may re-reference its own attachments. Editing an article's
+            # wording in the control plane re-sends `original_text` as a plain
+            # string, placeholders and all; without this that edit would scrub them
+            # and silently delete every screenshot in the article. Only paid for
+            # when the caller actually wrote something placeholder-shaped.
+            allowed_by_document: dict[str, set[str]] = {}
+            names_by_document: dict[str, dict[str, str]] = {}
+            revisited = {
+                item.document_id
+                for item in request.items
+                if item.document_id and isinstance(item.content, str) and contains_placeholder_like(item.content)
+            }
+            if revisited:
+                existing = await app.state.memory.attachments_for_documents(bank_id, sorted(revisited), request_context)
+                allowed_by_document = {
+                    document_id: {record.short_id for record in records} for document_id, records in existing.items()
+                }
+                # The names those attachments already have. The edit re-sends only placeholders,
+                # so without these a store-owned document -- whose record's names are replaced on
+                # every write -- would lose them. A SQL bank merges the same names back itself.
+                names_by_document = {
+                    document_id: {record.short_id: record.filename for record in records if record.filename}
+                    for document_id, records in existing.items()
+                }
+
+            canonical_contents = [
+                canonicalize_item_content(
+                    item.content,
+                    item_index=index,
+                    config=config,
+                    allowed_attachment_ids=allowed_by_document.get(item.document_id or ""),
+                )
+                for index, item in enumerate(request.items)
+            ]
+            retained_attachments = [
+                attachment for canonical in canonical_contents for attachment in canonical.attachments
+            ]
+            if retained_attachments:
+                await app.state.memory.store_retain_attachments(bank_id, retained_attachments, request_context)
+
             # Group items by strategy
             strategy_groups: dict[str | None, list[dict]] = {}
-            for item in request.items:
+            for item, canonical in zip(request.items, canonical_contents, strict=True):
                 effective = item.strategy
                 if effective not in strategy_groups:
                     strategy_groups[effective] = []
-                content_dict: dict = {"content": item.content}
+                content_dict: dict = {"content": canonical.text}
+                # The names this item gave its attachments, recorded against the
+                # document rather than the blob — the same bytes can be attached
+                # under a different name elsewhere, and the blob row is written
+                # once, for whichever document got there first.
+                item_filenames = {
+                    short_attachment_id(attachment.attachment_hash): attachment.filename
+                    for attachment in canonical.attachments
+                    if attachment.filename
+                }
+                kept_names = names_by_document.get(item.document_id or "")
+                if kept_names:
+                    referenced = set(iter_placeholder_ids(canonical.text))
+                    item_filenames = {
+                        **{short_id: name for short_id, name in kept_names.items() if short_id in referenced},
+                        **item_filenames,
+                    }
+                if item_filenames:
+                    content_dict["attachment_filenames"] = item_filenames
                 if item.timestamp == "unset":
                     content_dict["event_date"] = None
                 elif item.timestamp:
@@ -6176,15 +9550,27 @@ def _register_routes(app: FastAPI):
                     content_dict["document_id"] = item.document_id
                 if item.entities:
                     content_dict["entities"] = [{"text": e.text, "type": e.type or "CONCEPT"} for e in item.entities]
+                    content_dict["resolve_entities"] = item.resolve_entities
                 if item.tags:
                     content_dict["tags"] = item.tags
                 if item.observation_scopes is not None:
                     content_dict["observation_scopes"] = item.observation_scopes
                 if item.update_mode is not None:
                     content_dict["update_mode"] = item.update_mode
+                # Carried on the item, not just used as the grouping key: reprocess
+                # rebuilds its retain call from retain_params, so a strategy that
+                # never reaches the content dict never reaches retain_params either
+                # — and the reprocess silently re-extracts under the bank default.
+                if item.strategy:
+                    content_dict["strategy"] = item.strategy
                 strategy_groups[effective].append(content_dict)
 
             if request.async_:
+                if request.operation_id is not None and len(strategy_groups) != 1:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="operation_id requires all retain items to resolve to a single strategy",
+                    )
                 # Async processing: one submit per strategy group
                 all_operation_ids = []
                 total_items_count = 0
@@ -6195,6 +9581,7 @@ def _register_routes(app: FastAPI):
                         document_tags=request.document_tags,
                         strategy=group_strategy,
                         request_context=request_context,
+                        operation_id=request.operation_id,
                     )
                     all_operation_ids.append(result["operation_id"])
                     total_items_count += result["items_count"]
@@ -6210,9 +9597,6 @@ def _register_routes(app: FastAPI):
                 )
             else:
                 # Check if batch API is enabled - if so, require async mode
-                from hindsight_api.config import get_config
-
-                config = get_config()
                 if config.retain_batch_enabled:
                     raise HTTPException(
                         status_code=400,
@@ -6236,9 +9620,8 @@ def _register_routes(app: FastAPI):
                             strategy=group_strategy,
                             request_context=request_context,
                             return_usage=True,
-                            outbox_callback=app.state.memory._build_retain_outbox_callback(
+                            outbox_callback_factory=app.state.memory._build_retain_outbox_callback_factory(
                                 bank_id=bank_id,
-                                contents=contents,
                                 operation_id=None,
                                 schema=_current_schema.get(),
                             ),
@@ -6262,15 +9645,47 @@ def _register_routes(app: FastAPI):
                 )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except RetainOperationConflictError as e:
+            # Caller reused an async retain operation_id that already belongs to
+            # a different operation.
+            raise HTTPException(status_code=409, detail=str(e))
+        except VisionNotSupportedError as e:
+            # The request is well-formed; the server's retain LLM cannot read the
+            # images it carries. 422 rather than 400 for that distinction.
+            raise HTTPException(status_code=422, detail=str(e))
         except (AuthenticationError, HTTPException):
             raise
+        except ValueError as e:
+            # Invalid request parameters (e.g. duplicate document_ids, or
+            # update_mode='append' when document text storage is disabled) are
+            # client errors, not server faults.
+            raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
+            from dataclasses import asdict
+
+            from hindsight_api.engine.retain.orchestrator import MemoryDefenseAllBlockedError
+
+            if isinstance(e, MemoryDefenseAllBlockedError):
+                raise HTTPException(
+                    status_code=422,
+                    detail={"violations": [asdict(v) for v in e.violations]},
+                )
             import traceback
 
             # Create a summary of the input for debugging
             input_summary = []
             for i, item in enumerate(request.items):
-                content_preview = item.content[:100] + "..." if len(item.content) > 100 else item.content
+                # Summarize the block form structurally: the raw content may be a
+                # list whose image blocks hold megabytes of base64, and this string
+                # goes into a log line and an error body.
+                if isinstance(item.content, str):
+                    raw_preview = item.content
+                else:
+                    raw_preview = " ".join(
+                        block.text if isinstance(block, TextContentBlock) else f"<{block.source.media_type}>"
+                        for block in item.content
+                    )
+                content_preview = raw_preview[:100] + "..." if len(raw_preview) > 100 else raw_preview
                 input_summary.append(
                     f"  [{i}] content={content_preview!r}, context={item.context}, timestamp={item.timestamp}"
                 )
@@ -6291,7 +9706,7 @@ def _register_routes(app: FastAPI):
         description="Upload files (PDF, DOCX, etc.), convert them to markdown, and retain as memories.\n\n"
         "This endpoint handles file upload, conversion, and memory creation in a single operation.\n\n"
         "**Features:**\n"
-        "- Supports PDF, DOCX, PPTX, XLSX, images (with OCR), audio (with transcription)\n"
+        "- Supports PDF, DOCX, PPTX, XLSX, images (parser-dependent OCR), audio (with transcription)\n"
         "- Automatic file-to-markdown conversion using pluggable parsers\n"
         "- Files stored in object storage (PostgreSQL by default, S3 for production)\n"
         "- Each file becomes a separate document with optional metadata/tags\n"
@@ -6321,7 +9736,7 @@ def _register_routes(app: FastAPI):
         files: list[UploadFile] = File(..., description="Files to upload and convert"),
         request: str = Form(..., description="JSON string with FileRetainRequest model"),
         request_context: RequestContext = Depends(get_request_context),
-        _precheck: None = Depends(precheck_for("files_retain")),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.FILES_RETAIN)),
     ):
         """Upload and convert files to memories."""
         from hindsight_api.config import get_config
@@ -6383,7 +9798,6 @@ def _register_routes(app: FastAPI):
                 _validate_parsers(_resolve_parser(request_data.parser), "request-level parser")
 
             # Prepare file items and calculate total batch size
-            import io
 
             file_items = []
             total_batch_size = 0
@@ -6452,87 +9866,53 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/files/retain: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/files/retain")
 
     @app.delete(
         "/v1/default/banks/{bank_id}/memories",
         response_model=DeleteResponse,
         summary="Clear memory bank memories",
-        description="Delete memory units for a memory bank. Optionally filter by type (world, experience, opinion) to delete only specific types. This is a destructive operation that cannot be undone. The bank profile (disposition and background) will be preserved.",
+        description="Delete memory units for a memory bank. Optionally filter by type (world, experience, observation) to delete only specific types. This is a destructive operation that cannot be undone. The bank profile (disposition and background) will be preserved.",
         operation_id="clear_bank_memories",
         tags=["Memory"],
     )
     @audited("clear_memories", request_param=None)
     async def api_clear_bank_memories(
         bank_id: str,
-        type: str | None = Query(None, description="Optional fact type filter (world, experience, opinion)"),
+        type: str | None = Query(None, description="Optional fact type filter (world, experience, observation)"),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Clear memories for a memory bank, optionally filtered by type."""
         try:
-            await app.state.memory.delete_bank(
+            result = await app.state.memory.delete_bank(
                 bank_id, fact_type=type, delete_bank_profile=False, request_context=request_context
             )
 
-            return DeleteResponse(success=True)
+            # Counted inside the delete's transaction — a client's before/after list diff races
+            # concurrent retains (#4307). Memory units only: unlike api_delete_bank, the bank's
+            # entities and documents survive a clear.
+            deleted = result.get("memory_units_deleted", 0)
+            scope = f" of type '{type}'" if type else ""
+            return DeleteResponse(
+                success=True,
+                message=f"Cleared {deleted} memory unit(s){scope} from bank '{bank_id}'",
+                deleted_count=deleted,
+            )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/memories: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/memories")
 
     # ---- Audit Logs ----
+    # Response models live in engine/audit.py so the MemoryEngine read methods
+    # (list_audit_logs / audit_log_stats) can build and return them directly.
 
-    class AuditLogEntry(BaseModel):
-        """A single audit log entry."""
-
-        id: str
-        action: str
-        transport: str
-        bank_id: str | None
-        started_at: str | None
-        ended_at: str | None
-        duration_ms: int | None = Field(
-            default=None,
-            description="Server-computed duration in milliseconds (started_at → ended_at). Null if not yet completed.",
-        )
-        request: dict[str, Any] | None
-        response: dict[str, Any] | None
-        metadata: dict[str, Any]
-
-    class AuditLogListResponse(BaseModel):
-        """Response model for list audit logs endpoint."""
-
-        bank_id: str
-        total: int
-        limit: int
-        offset: int
-        items: list[AuditLogEntry]
-
-    class AuditLogStatsBucket(BaseModel):
-        """A single time bucket in audit log stats."""
-
-        time: str
-        actions: dict[str, int]
-        total: int
-
-    class AuditLogStatsResponse(BaseModel):
-        """Response model for audit log stats endpoint."""
-
-        bank_id: str
-        period: str
-        trunc: str
-        start: str
-        buckets: list[AuditLogStatsBucket]
+    # ---- LLM Request Traces ----
+    # Response models + queries live in the engine (engine/llm_trace.py and
+    # MemoryEngine.list_llm_requests / llm_request_stats). The handlers below
+    # only parse params, delegate to the engine, and map a missing bank to 404.
 
     @app.get(
         "/v1/default/banks/{bank_id}/audit-logs",
@@ -6541,6 +9921,7 @@ def _register_routes(app: FastAPI):
         operation_id="list_audit_logs",
         tags=["Audit"],
         response_model=AuditLogListResponse,
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_audit_logs(
         bank_id: str,
@@ -6554,129 +9935,25 @@ def _register_routes(app: FastAPI):
     ):
         """List audit log entries for a bank."""
         try:
-            from hindsight_api.engine.memory_engine import fq_table
-
-            pool = await app.state.memory._get_backend()
-
-            # Read endpoint: verify bank exists without auto-creating it.
-            if (
-                await app.state.memory.get_bank_profile(
-                    bank_id, request_context=request_context, create_if_missing=False
-                )
-                is None
-            ):
+            result = await app.state.memory.list_audit_logs(
+                bank_id,
+                request_context=request_context,
+                action=action,
+                transport=transport,
+                start_date=datetime.fromisoformat(start_date.replace("Z", "+00:00")) if start_date else None,
+                end_date=datetime.fromisoformat(end_date.replace("Z", "+00:00")) if end_date else None,
+                limit=limit,
+                offset=offset,
+            )
+            if result is None:
                 raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
-
-            from hindsight_api.engine.db_utils import acquire_with_retry
-
-            async with acquire_with_retry(pool) as conn:
-                where_clauses = ["bank_id = $1"]
-                params: list[Any] = [bank_id]
-                idx = 2
-
-                if action:
-                    where_clauses.append(f"action = ${idx}")
-                    params.append(action)
-                    idx += 1
-
-                if transport:
-                    where_clauses.append(f"transport = ${idx}")
-                    params.append(transport)
-                    idx += 1
-
-                if start_date:
-                    parsed_start = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
-                    where_clauses.append(f"started_at >= ${idx}")
-                    params.append(parsed_start)
-                    idx += 1
-
-                if end_date:
-                    parsed_end = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-                    where_clauses.append(f"started_at < ${idx}")
-                    params.append(parsed_end)
-                    idx += 1
-
-                where_sql = " AND ".join(where_clauses)
-                table = fq_table("audit_log")
-
-                # Get total count
-                count_row = await conn.fetchrow(
-                    f"SELECT COUNT(*) as total FROM {table} WHERE {where_sql}",
-                    *params,
-                )
-                total = count_row["total"] if count_row else 0
-
-                # Get paginated results
-                params.append(limit)
-                params.append(offset)
-                rows = await conn.fetch(
-                    f"""
-                    SELECT id, action, transport, bank_id, started_at, ended_at,
-                           request, response, metadata
-                    FROM {table}
-                    WHERE {where_sql}
-                    ORDER BY started_at DESC
-                    LIMIT ${idx} OFFSET ${idx + 1}
-                    """,
-                    *params,
-                )
-
-                items = []
-                for row in rows:
-                    duration_ms = None
-                    started = row["started_at"]
-                    ended = row["ended_at"]
-                    if started and ended and hasattr(started, "total_seconds"):
-                        duration_ms = int((ended - started).total_seconds() * 1000)
-                    elif started and ended:
-                        try:
-                            duration_ms = int((ended - started).total_seconds() * 1000)
-                        except (TypeError, AttributeError):
-                            pass
-
-                    def _safe_iso(val):
-                        if val is None:
-                            return None
-                        return val.isoformat() if hasattr(val, "isoformat") else str(val)
-
-                    def _safe_json(val):
-                        if val is None:
-                            return None
-                        if isinstance(val, dict):
-                            return val
-                        return json.loads(val) if isinstance(val, str) else val
-
-                    items.append(
-                        {
-                            "id": str(row["id"]),
-                            "action": row["action"],
-                            "transport": row["transport"],
-                            "bank_id": row["bank_id"],
-                            "started_at": _safe_iso(started),
-                            "ended_at": _safe_iso(ended),
-                            "duration_ms": duration_ms,
-                            "request": _safe_json(row["request"]),
-                            "response": _safe_json(row["response"]),
-                            "metadata": _safe_json(row["metadata"]) or {},
-                        }
-                    )
-
-                return {
-                    "bank_id": bank_id,
-                    "total": total,
-                    "limit": limit,
-                    "offset": offset,
-                    "items": items,
-                }
+            return result
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
-
-            logger.error(f"Error listing audit logs: {traceback.format_exc()}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/audit-logs")
 
     @app.get(
         "/v1/default/banks/{bank_id}/audit-logs/stats",
@@ -6685,6 +9962,7 @@ def _register_routes(app: FastAPI):
         operation_id="audit_log_stats",
         tags=["Audit"],
         response_model=AuditLogStatsResponse,
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_audit_log_stats(
         bank_id: str,
@@ -6694,78 +9972,109 @@ def _register_routes(app: FastAPI):
     ):
         """Get audit log counts grouped by time bucket."""
         try:
-            from hindsight_api.engine.db_utils import acquire_with_retry
-            from hindsight_api.engine.memory_engine import fq_table
-
-            pool = await app.state.memory._get_backend()
-            # Read endpoint: verify bank exists without auto-creating it.
-            if (
-                await app.state.memory.get_bank_profile(
-                    bank_id, request_context=request_context, create_if_missing=False
-                )
-                is None
-            ):
+            result = await app.state.memory.audit_log_stats(
+                bank_id,
+                request_context=request_context,
+                action=action,
+                period=period,
+            )
+            if result is None:
                 raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
-
-            # Determine time range (always per-day buckets)
-            from datetime import timedelta as _td
-
-            now = datetime.now(timezone.utc)
-            trunc = "day"
-            if period == "1d":
-                start = now - _td(days=1)
-            elif period == "30d":
-                start = now - _td(days=30)
-            else:  # 7d default
-                start = now - _td(days=7)
-
-            table = fq_table("audit_log")
-
-            async with acquire_with_retry(pool) as conn:
-                where_clauses = ["bank_id = $1", "started_at >= $2"]
-                params: list[Any] = [bank_id, start]
-                idx = 3
-
-                if action:
-                    where_clauses.append(f"action = ${idx}")
-                    params.append(action)
-                    idx += 1
-
-                where_sql = " AND ".join(where_clauses)
-
-                rows = await conn.fetch(
-                    f"""
-                    SELECT date_trunc('{trunc}', started_at) AS bucket,
-                           action,
-                           COUNT(*) AS count
-                    FROM {table}
-                    WHERE {where_sql}
-                    GROUP BY bucket, action
-                    ORDER BY bucket ASC
-                    """,
-                    *params,
-                )
-
-                buckets: dict[str, dict[str, int]] = {}
-                for row in rows:
-                    bucket_key = row["bucket"].isoformat()
-                    if bucket_key not in buckets:
-                        buckets[bucket_key] = {}
-                    buckets[bucket_key][row["action"]] = row["count"]
-
-                return {
-                    "bank_id": bank_id,
-                    "period": period,
-                    "trunc": trunc,
-                    "start": start.isoformat(),
-                    "buckets": [{"time": k, "actions": v, "total": sum(v.values())} for k, v in buckets.items()],
-                }
+            return result
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            import traceback
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/audit-logs/stats")
 
-            logger.error(f"Error getting audit log stats: {traceback.format_exc()}")
-            raise HTTPException(status_code=500, detail=str(e))
+    @app.get(
+        "/v1/default/banks/{bank_id}/llm-requests",
+        summary="List LLM request traces",
+        description="List traced LLM requests for a bank, ordered by most recent first. "
+        "Requires LLM request tracing to be enabled (HINDSIGHT_API_LLM_TRACE_ENABLED).",
+        operation_id="list_llm_requests",
+        tags=["LLM Traces"],
+        response_model=LLMRequestListResponse,
+        responses=_BANK_NOT_FOUND_RESPONSES,
+    )
+    async def api_list_llm_requests(
+        bank_id: str,
+        status: str | None = Query(None, description="Filter by status (success, error)"),
+        operation: str | None = Query(None, description="Filter by operation (retain, reflect, consolidation)"),
+        scope: str | None = Query(None, description="Filter by call scope"),
+        provider: str | None = Query(None, description="Filter by LLM provider"),
+        trace_id: str | None = Query(None, description="Filter to one operation run (all LLM calls sharing a trace)"),
+        document_id: str | None = Query(None, description="Filter to LLM calls that processed a given document"),
+        memory_id: str | None = Query(
+            None, description="Filter to the operation run(s) that produced or consumed a given memory_unit"
+        ),
+        group: bool = Query(
+            False, description="Paginate by operation run (trace) instead of by call; returns whole runs"
+        ),
+        start_date: str | None = Query(None, description="Filter from this ISO datetime (inclusive)"),
+        end_date: str | None = Query(None, description="Filter until this ISO datetime (exclusive)"),
+        limit: int = Query(50, ge=1, le=500, description="Max items to return"),
+        offset: int = Query(0, ge=0, description="Offset for pagination"),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """List traced LLM requests for a bank."""
+        try:
+            result = await app.state.memory.list_llm_requests(
+                bank_id,
+                request_context=request_context,
+                status=status,
+                operation=operation,
+                scope=scope,
+                provider=provider,
+                trace_id=trace_id,
+                document_id=document_id,
+                memory_id=memory_id,
+                group=group,
+                start_date=datetime.fromisoformat(start_date.replace("Z", "+00:00")) if start_date else None,
+                end_date=datetime.fromisoformat(end_date.replace("Z", "+00:00")) if end_date else None,
+                limit=limit,
+                offset=offset,
+            )
+            if result is None:
+                raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
+            return result
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/llm-requests")
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/llm-requests/stats",
+        summary="LLM request statistics",
+        description="Get LLM request counts grouped by time bucket and status for charting.",
+        operation_id="llm_request_stats",
+        tags=["LLM Traces"],
+        response_model=LLMRequestStatsResponse,
+        responses=_BANK_NOT_FOUND_RESPONSES,
+    )
+    async def api_llm_request_stats(
+        bank_id: str,
+        operation: str | None = Query(None, description="Filter by operation"),
+        period: str = Query("7d", description="Time period: 1d, 7d, or 30d"),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Get LLM request counts grouped by time bucket and status."""
+        try:
+            result = await app.state.memory.llm_request_stats(
+                bank_id,
+                request_context=request_context,
+                operation=operation,
+                period=period,
+            )
+            if result is None:
+                raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
+            return result
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/llm-requests/stats")

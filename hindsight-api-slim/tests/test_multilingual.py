@@ -9,9 +9,14 @@ import pytest
 import logging
 from datetime import datetime, timezone
 from hindsight_api.engine.memory_engine import Budget
-from hindsight_api import RequestContext
+from hindsight_api import LLMConfig, RequestContext
+from hindsight_api.config import _get_raw_config
+from hindsight_api.engine.retain.fact_extraction import extract_facts_from_text
+from tests.llm_judge import assert_meets_criteria
 
 logger = logging.getLogger(__name__)
+
+pytestmark = pytest.mark.hs_llm_core
 
 
 @pytest.mark.asyncio
@@ -19,7 +24,7 @@ logger = logging.getLogger(__name__)
     strict=False,
     reason="Gemini sometimes consistently translates Chinese content to English despite instructions",
 )
-async def test_retain_chinese_content(memory, request_context):
+async def test_retain_chinese_content(memory_real_llm, request_context):
     """
     Test that retain correctly extracts facts from Chinese content
     and keeps the output in Chinese.
@@ -53,7 +58,7 @@ async def test_retain_chinese_content(memory, request_context):
             """
 
             # Retain the Chinese content
-            unit_ids = await memory.retain_async(
+            unit_ids = await memory_real_llm.retain_async(
                 bank_id=bank_id,
                 content=chinese_content,
                 context="团队概述",  # Chinese context
@@ -65,7 +70,7 @@ async def test_retain_chinese_content(memory, request_context):
             assert len(unit_ids) > 0, "Should have extracted and stored facts from Chinese content"
 
             # Recall the facts with a Chinese query
-            result = await memory.recall_async(
+            result = await memory_real_llm.recall_async(
                 bank_id=bank_id,
                 query="告诉我关于张伟的信息",  # "Tell me about Zhang Wei"
                 budget=Budget.MID,
@@ -83,10 +88,7 @@ async def test_retain_chinese_content(memory, request_context):
             for fact in result.results:
                 logger.info(f"Fact: {fact.text[:100]}...")
                 # Check for common Chinese characters or the name
-                if any(
-                    char in fact.text
-                    for char in ["张", "伟", "腾讯", "软件", "工程师", "分布式", "系统", "代码"]
-                ):
+                if any(char in fact.text for char in ["张", "伟", "腾讯", "软件", "工程师", "分布式", "系统", "代码"]):
                     chinese_facts_found += 1
 
             logger.info(f"Found {chinese_facts_found} facts with Chinese content")
@@ -106,13 +108,13 @@ async def test_retain_chinese_content(memory, request_context):
                 raise e
         finally:
             try:
-                await memory.delete_bank(bank_id, request_context=request_context)
+                await memory_real_llm.delete_bank(bank_id, request_context=request_context)
             except Exception:
                 pass
 
 
 @pytest.mark.asyncio
-async def test_reflect_chinese_content(memory, request_context):
+async def test_reflect_chinese_content(memory_real_llm, request_context):
     """
     Test that reflect correctly generates responses in Chinese
     when given Chinese facts and a Chinese query.
@@ -130,7 +132,7 @@ async def test_reflect_chinese_content(memory, request_context):
 
     try:
         # Store some Chinese facts to give context for opinion formation
-        await memory.retain_async(
+        await memory_real_llm.retain_async(
             bank_id=bank_id,
             content="张伟是一位优秀的软件工程师，完成了五个重大项目。他总是按时交付，代码整洁有良好的文档。",
             context="绩效评估",  # "Performance review"
@@ -138,7 +140,7 @@ async def test_reflect_chinese_content(memory, request_context):
             request_context=request_context,
         )
 
-        await memory.retain_async(
+        await memory_real_llm.retain_async(
             bank_id=bank_id,
             content="李明最近加入团队。他错过了第一个截止日期，代码有很多bug。",
             context="绩效评估",
@@ -151,7 +153,7 @@ async def test_reflect_chinese_content(memory, request_context):
             try:
                 # Reflect with a Chinese query
                 query = "谁是更可靠的工程师？"  # "Who is a more reliable engineer?"
-                result = await memory.reflect_async(
+                result = await memory_real_llm.reflect_async(
                     bank_id=bank_id,
                     query=query,
                     budget=Budget.MID,
@@ -183,7 +185,7 @@ async def test_reflect_chinese_content(memory, request_context):
                 expected_names = set()
                 for fact in result.based_on.get("world", []):
                     # Extract Chinese entity names from the fact
-                    for entity in (fact.entities or []):
+                    for entity in fact.entities or []:
                         # Check if entity contains Chinese characters
                         if any("\u4e00" <= char <= "\u9fff" for char in entity):
                             expected_names.add(entity)
@@ -209,11 +211,11 @@ async def test_reflect_chinese_content(memory, request_context):
                     raise e
 
     finally:
-        await memory.delete_bank(bank_id, request_context=request_context)
+        await memory_real_llm.delete_bank(bank_id, request_context=request_context)
 
 
 @pytest.mark.asyncio
-async def test_retain_japanese_content(memory, request_context):
+async def test_retain_japanese_content(memory_real_llm, request_context):
     """
     Test that retain correctly handles Japanese content.
 
@@ -238,7 +240,7 @@ async def test_retain_japanese_content(memory, request_context):
             先週、新しいAPIを完成させました。
             """
 
-            unit_ids = await memory.retain_async(
+            unit_ids = await memory_real_llm.retain_async(
                 bank_id=bank_id,
                 content=japanese_content,
                 context="チームプロフィール",  # "Team profile"
@@ -250,7 +252,7 @@ async def test_retain_japanese_content(memory, request_context):
             assert len(unit_ids) > 0, "Should have extracted facts from Japanese content"
 
             # Recall with Japanese query
-            result = await memory.recall_async(
+            result = await memory_real_llm.recall_async(
                 bank_id=bank_id,
                 query="田中さんについて教えてください",  # "Tell me about Tanaka-san"
                 budget=Budget.MID,
@@ -275,8 +277,7 @@ async def test_retain_japanese_content(memory, request_context):
                     japanese_facts_found += 1
 
             assert japanese_facts_found > 0, (
-                f"Expected facts to contain Japanese characters. "
-                f"Facts: {[f.text for f in result.results]}"
+                f"Expected facts to contain Japanese characters. Facts: {[f.text for f in result.results]}"
             )
 
             logger.info("Japanese retain test passed - facts preserved in Japanese")
@@ -291,13 +292,13 @@ async def test_retain_japanese_content(memory, request_context):
         finally:
             # Cleanup the bank
             try:
-                await memory.delete_bank(bank_id, request_context=request_context)
+                await memory_real_llm.delete_bank(bank_id, request_context=request_context)
             except Exception:
                 pass
 
 
 @pytest.mark.asyncio
-async def test_english_content_stays_english(memory, request_context):
+async def test_english_content_stays_english(memory_real_llm, request_context):
     """
     Test that English content is NOT incorrectly translated to Japanese or Chinese.
 
@@ -319,7 +320,7 @@ async def test_english_content_stays_english(memory, request_context):
         He prefers working in Python and uses PyTorch for model training.
         """
 
-        unit_ids = await memory.retain_async(
+        unit_ids = await memory_real_llm.retain_async(
             bank_id=bank_id,
             content=english_content,
             context="Team profile",
@@ -331,7 +332,7 @@ async def test_english_content_stays_english(memory, request_context):
         assert len(unit_ids) > 0, "Should have extracted facts from English content"
 
         # Recall with English query
-        result = await memory.recall_async(
+        result = await memory_real_llm.recall_async(
             bank_id=bank_id,
             query="Tell me about John Smith",
             budget=Budget.MID,
@@ -348,8 +349,7 @@ async def test_english_content_stays_english(memory, request_context):
 
             # Count Japanese characters (hiragana, katakana)
             japanese_chars = sum(
-                1 for char in fact.text
-                if ("\u3040" <= char <= "\u309f") or ("\u30a0" <= char <= "\u30ff")
+                1 for char in fact.text if ("\u3040" <= char <= "\u309f") or ("\u30a0" <= char <= "\u30ff")
             )
 
             # Count Chinese/CJK characters (excluding those also used in Japanese)
@@ -370,11 +370,11 @@ async def test_english_content_stays_english(memory, request_context):
         logger.info("English content test passed - facts stayed in English")
 
     finally:
-        await memory.delete_bank(bank_id, request_context=request_context)
+        await memory_real_llm.delete_bank(bank_id, request_context=request_context)
 
 
 @pytest.mark.asyncio
-async def test_italian_content_stays_italian(memory, request_context):
+async def test_italian_content_stays_italian(memory_real_llm, request_context):
     """
     Test that Italian content is NOT incorrectly translated to Japanese or Chinese.
 
@@ -394,7 +394,7 @@ async def test_italian_content_stays_italian(memory, request_context):
         Preferisce usare ingredienti freschi e locali per i suoi piatti.
         """
 
-        unit_ids = await memory.retain_async(
+        unit_ids = await memory_real_llm.retain_async(
             bank_id=bank_id,
             content=italian_content,
             context="Profilo dello chef",
@@ -406,7 +406,7 @@ async def test_italian_content_stays_italian(memory, request_context):
         assert len(unit_ids) > 0, "Should have extracted facts from Italian content"
 
         # Recall with Italian query
-        result = await memory.recall_async(
+        result = await memory_real_llm.recall_async(
             bank_id=bank_id,
             query="Dimmi di Marco Rossi",  # "Tell me about Marco Rossi"
             budget=Budget.MID,
@@ -424,8 +424,7 @@ async def test_italian_content_stays_italian(memory, request_context):
             # Count CJK characters
             cjk_chars = sum(1 for char in fact.text if "\u4e00" <= char <= "\u9fff")
             japanese_chars = sum(
-                1 for char in fact.text
-                if ("\u3040" <= char <= "\u309f") or ("\u30a0" <= char <= "\u30ff")
+                1 for char in fact.text if ("\u3040" <= char <= "\u309f") or ("\u30a0" <= char <= "\u30ff")
             )
 
             total_chars = len(fact.text)
@@ -452,11 +451,11 @@ async def test_italian_content_stays_italian(memory, request_context):
         logger.info("Italian content test passed - facts not translated to CJK")
 
     finally:
-        await memory.delete_bank(bank_id, request_context=request_context)
+        await memory_real_llm.delete_bank(bank_id, request_context=request_context)
 
 
 @pytest.mark.asyncio
-async def test_mixed_language_entities(memory, request_context):
+async def test_mixed_language_entities(memory_real_llm, request_context):
     """
     Test that entity extraction works correctly with mixed language content.
 
@@ -473,7 +472,7 @@ async def test_mixed_language_entities(memory, request_context):
         她负责管理YouTube在中国市场的推广策略。
         """
 
-        unit_ids = await memory.retain_async(
+        unit_ids = await memory_real_llm.retain_async(
             bank_id=bank_id,
             content=mixed_content,
             context="员工资料",
@@ -484,7 +483,7 @@ async def test_mixed_language_entities(memory, request_context):
         assert len(unit_ids) > 0, "Should extract facts from mixed language content"
 
         # Recall and check entities
-        result = await memory.recall_async(
+        result = await memory_real_llm.recall_async(
             bank_id=bank_id,
             query="王芳在哪里工作？",  # "Where does Wang Fang work?"
             budget=Budget.MID,
@@ -501,15 +500,49 @@ async def test_mixed_language_entities(memory, request_context):
 
         # Should contain Chinese name and/or English company names
         has_chinese_name = "王芳" in all_text
-        has_english_company = any(
-            company in all_text for company in ["Google", "Microsoft", "Amazon", "YouTube"]
-        )
+        has_english_company = any(company in all_text for company in ["Google", "Microsoft", "Amazon", "YouTube"])
 
-        assert has_chinese_name or has_english_company, (
-            f"Expected mixed language entities. Facts: {all_text}"
-        )
+        assert has_chinese_name or has_english_company, f"Expected mixed language entities. Facts: {all_text}"
 
         logger.info("Mixed language entity test passed")
 
     finally:
-        await memory.delete_bank(bank_id, request_context=request_context)
+        await memory_real_llm.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_english_coding_transcript_stays_english():
+    """An English coding-agent transcript is extracted as English facts (#4283).
+
+    The shape that regressed: a transcript dense with numbers, tool names and paths.
+    Under the old "detect the language, then STRICTLY never switch" rule gpt-5.6-luna
+    wrote French or Russian facts from it in ~18% of runs. The rate itself is tracked by
+    hindsight-system-evals ``test_03_retain_language``; this pins the behaviour on the
+    CI model. Judged, because the language call is the model's and a word list would
+    misread English tool names inside prose.
+    """
+    transcript = (
+        "user: run the full validation on the selected work and tell me what passed\n"
+        "assistant: Fresh validation complete. Server: 230 passed, 52 skipped. Portal production build "
+        "succeeded and 55 portal tests passed (I reran with the newer installed Node runtime because the "
+        "initial build picked up Node 17 from the shell). 17 shared native security checks passed and the "
+        "Admin iOS simulator build succeeded. Fixed five whitespace-only issues.\n"
+    )
+    facts, _, _ = await extract_facts_from_text(
+        text=transcript,
+        event_date=datetime(2026, 9, 9, tzinfo=timezone.utc),
+        llm_config=LLMConfig.from_env(),
+        config=_get_raw_config(),
+        context="coding agent session",
+        agent_name="assistant",
+    )
+    assert facts, "Should extract at least one fact"
+    await assert_meets_criteria(
+        response="\n".join(f"- {f.fact}" for f in facts),
+        criteria=(
+            "Every fact's main sentence (the text before the first ' | ') is written in English. "
+            "Ignore the ' | When: …' / ' | Involving: …' fields, proper nouns, identifiers and numbers."
+        ),
+        context="The input was an English conversation between a user and a coding assistant.",
+        msg=f"English transcript must yield English facts: {[f.fact for f in facts]}",
+    )

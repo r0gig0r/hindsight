@@ -360,6 +360,26 @@ async def test_middleware_handles_both_endpoints(mock_memory):
     assert "create_bank" not in single_bank_tools
 
 
+def test_registered_tool_sets_match_the_allowlists(mock_memory):
+    """Every allowlisted tool name must resolve to a really-registered tool.
+
+    Three hand-maintained lists have to agree: ``_ALL_TOOLS``, the default set in
+    ``register_mcp_tools()``, and the single-bank allowlist in
+    ``create_mcp_server()``. A name added to one but not the others is silent —
+    the tool simply never appears on the endpoint and nothing fails — so assert
+    over the whole sets rather than spot-checking tool names.
+    """
+    from hindsight_api.api.mcp import create_mcp_server
+    from hindsight_api.mcp_tools import _ALL_TOOLS
+
+    multi = set(_tools(create_mcp_server(mock_memory, multi_bank=True)))
+    single = set(_tools(create_mcp_server(mock_memory, multi_bank=False)))
+
+    assert multi == set(_ALL_TOOLS)
+    # Single-bank mode drops exactly the tools that operate across banks.
+    assert multi - single == {"list_banks", "create_bank", "get_bank_stats"}
+
+
 def test_global_mcp_enabled_tools_filter_restricts_registered_tools(mock_memory):
     """Test that global mcp_enabled_tools env setting restricts which tools are registered."""
     from unittest.mock import MagicMock, patch
@@ -423,6 +443,28 @@ def test_global_mcp_enabled_tools_intersects_with_single_bank_mode(mock_memory):
     assert "list_banks" not in tools  # single-bank mode excludes it regardless
 
 
+def test_mcp_instructions_append_to_retain_and_recall_descriptions(mock_memory):
+    """HINDSIGHT_API_MCP_INSTRUCTIONS customizes retain/recall tool descriptions."""
+    from unittest.mock import MagicMock, patch
+
+    from hindsight_api.api.mcp import create_mcp_server
+
+    custom_instructions = "Also store every action you take."
+    mock_cfg = MagicMock()
+    mock_cfg.mcp_enabled_tools = ["retain", "recall", "reflect"]
+    mock_cfg.mcp_instructions = custom_instructions
+
+    with patch("hindsight_api.api.mcp._get_raw_config", return_value=mock_cfg):
+        mcp_server = create_mcp_server(mock_memory, multi_bank=True)
+
+    tools = _tools(mcp_server)
+    expected_suffix = f"Additional instructions: {custom_instructions}"
+
+    assert expected_suffix in tools["retain"].description
+    assert expected_suffix in tools["recall"].description
+    assert expected_suffix not in tools["reflect"].description
+
+
 @pytest.mark.asyncio
 async def test_routing_logic_from_url_path():
     """Test that routing correctly selects server based on URL structure.
@@ -430,14 +472,6 @@ async def test_routing_logic_from_url_path():
     Simulates the path parsing logic from MCPMiddleware.__call__ after the
     prefix has been stripped. Any first path segment is treated as a bank_id.
     """
-    from hindsight_api.api.mcp import MCPMiddleware
-
-    # Mock memory
-    mock_memory = MagicMock()
-
-    # Create middleware
-    middleware = MCPMiddleware(None, mock_memory)
-
     # Simulate different URL patterns and verify routing
     # Path is what remains after stripping the /mcp prefix
     test_cases = [

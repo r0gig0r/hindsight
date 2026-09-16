@@ -32,6 +32,12 @@ import type {
   CreateDirectiveData,
   CreateDirectiveErrors,
   CreateDirectiveResponses,
+  CreateKnowledgeFolderData,
+  CreateKnowledgeFolderErrors,
+  CreateKnowledgeFolderResponses,
+  CreateKnowledgePageData,
+  CreateKnowledgePageErrors,
+  CreateKnowledgePageResponses,
   CreateMentalModelData,
   CreateMentalModelErrors,
   CreateMentalModelResponses,
@@ -50,21 +56,48 @@ import type {
   DeleteDocumentData,
   DeleteDocumentErrors,
   DeleteDocumentResponses,
+  DeleteKnowledgeNodeData,
+  DeleteKnowledgeNodeErrors,
+  DeleteKnowledgeNodeResponses,
   DeleteMentalModelData,
   DeleteMentalModelErrors,
   DeleteMentalModelResponses,
+  DeleteOperationData,
+  DeleteOperationErrors,
+  DeleteOperationResponses,
   DeleteWebhookData,
   DeleteWebhookErrors,
   DeleteWebhookResponses,
+  DownloadFileData,
+  DownloadFileErrors,
+  DownloadFileResponses,
+  DryRunExtractMemoriesData,
+  DryRunExtractMemoriesErrors,
+  DryRunExtractMemoriesResponses,
+  DryRunRefreshMentalModelData,
+  DryRunRefreshMentalModelErrors,
+  DryRunRefreshMentalModelResponses,
   ExportBankTemplateData,
   ExportBankTemplateErrors,
   ExportBankTemplateResponses,
+  ExportDocumentsData,
+  ExportDocumentsErrors,
+  ExportDocumentsResponses,
+  ExportDocumentsSyncRemovedData,
+  ExportDocumentsSyncRemovedErrors,
+  ExportDocumentsSyncRemovedResponses,
+  ExportKnowledgeBaseData,
+  ExportKnowledgeBaseErrors,
+  ExportKnowledgeBaseResponses,
   FileRetainData,
   FileRetainErrors,
   FileRetainResponses,
   GetAgentStatsData,
   GetAgentStatsErrors,
   GetAgentStatsResponses,
+  GetBankAttachmentData,
+  GetBankAttachmentErrors,
+  GetBankAttachmentResponses,
   GetBankConfigData,
   GetBankConfigErrors,
   GetBankConfigResponses,
@@ -91,6 +124,14 @@ import type {
   GetGraphData,
   GetGraphErrors,
   GetGraphResponses,
+  GetKnowledgeBaseTreeData,
+  GetKnowledgeBaseTreeErrors,
+  GetKnowledgeBaseTreeResponses,
+  GetKnowledgePageData,
+  GetKnowledgePageErrors,
+  GetKnowledgePageResponses,
+  GetLivenessData,
+  GetLivenessResponses,
   GetMemoriesTimeseriesData,
   GetMemoriesTimeseriesErrors,
   GetMemoriesTimeseriesResponses,
@@ -109,6 +150,8 @@ import type {
   GetOperationStatusData,
   GetOperationStatusErrors,
   GetOperationStatusResponses,
+  GetReadinessData,
+  GetReadinessResponses,
   GetVersionData,
   GetVersionResponses,
   HealthEndpointHealthGetData,
@@ -116,6 +159,9 @@ import type {
   ImportBankTemplateData,
   ImportBankTemplateErrors,
   ImportBankTemplateResponses,
+  ImportDocumentsData,
+  ImportDocumentsErrors,
+  ImportDocumentsResponses,
   ListAuditLogsData,
   ListAuditLogsErrors,
   ListAuditLogsResponses,
@@ -134,12 +180,18 @@ import type {
   ListEntitiesData,
   ListEntitiesErrors,
   ListEntitiesResponses,
+  ListLlmRequestsData,
+  ListLlmRequestsErrors,
+  ListLlmRequestsResponses,
   ListMemoriesData,
   ListMemoriesErrors,
   ListMemoriesResponses,
   ListMentalModelsData,
   ListMentalModelsErrors,
   ListMentalModelsResponses,
+  ListObservationScopesData,
+  ListObservationScopesErrors,
+  ListObservationScopesResponses,
   ListOperationsData,
   ListOperationsErrors,
   ListOperationsResponses,
@@ -152,8 +204,14 @@ import type {
   ListWebhooksData,
   ListWebhooksErrors,
   ListWebhooksResponses,
+  LlmRequestStatsData,
+  LlmRequestStatsErrors,
+  LlmRequestStatsResponses,
   MetricsEndpointMetricsGetData,
   MetricsEndpointMetricsGetResponses,
+  PreviewPromptData,
+  PreviewPromptErrors,
+  PreviewPromptResponses,
   RecallMemoriesData,
   RecallMemoriesErrors,
   RecallMemoriesResponses,
@@ -181,6 +239,12 @@ import type {
   RetryOperationData,
   RetryOperationErrors,
   RetryOperationResponses,
+  SearchKnowledgeBaseData,
+  SearchKnowledgeBaseErrors,
+  SearchKnowledgeBaseResponses,
+  TestBankLlmData,
+  TestBankLlmErrors,
+  TestBankLlmResponses,
   TriggerConsolidationData,
   TriggerConsolidationErrors,
   TriggerConsolidationResponses,
@@ -199,6 +263,12 @@ import type {
   UpdateDocumentData,
   UpdateDocumentErrors,
   UpdateDocumentResponses,
+  UpdateKnowledgeNodeData,
+  UpdateKnowledgeNodeErrors,
+  UpdateKnowledgeNodeResponses,
+  UpdateMemoryData,
+  UpdateMemoryErrors,
+  UpdateMemoryResponses,
   UpdateMentalModelData,
   UpdateMentalModelErrors,
   UpdateMentalModelResponses,
@@ -210,7 +280,8 @@ import type {
 export type Options<
   TData extends TDataShape = TDataShape,
   ThrowOnError extends boolean = boolean,
-> = Options2<TData, ThrowOnError> & {
+  TResponse = unknown,
+> = Options2<TData, ThrowOnError, TResponse> & {
   /**
    * You can provide a client instance returned by `createClient()` instead of
    * individual options. This might be also useful if you want to implement a
@@ -227,13 +298,39 @@ export type Options<
 /**
  * Health check endpoint
  *
- * Checks the health of the API and database connection
+ * Readiness check: verifies the API can reach the database. Alias of /health/ready. Use /health/live for liveness probes — this one fails whenever the database is unreachable, which must gate traffic, not restart the process.
  */
 export const healthEndpointHealthGet = <ThrowOnError extends boolean = false>(
   options?: Options<HealthEndpointHealthGetData, ThrowOnError>
 ) =>
   (options?.client ?? client).get<HealthEndpointHealthGetResponses, unknown, ThrowOnError>({
     url: "/health",
+    ...options,
+  });
+
+/**
+ * Readiness probe
+ *
+ * Returns 200 when the API can serve traffic (database reachable), 503 otherwise. Identical to /health, which stays supported as its alias.
+ */
+export const getReadiness = <ThrowOnError extends boolean = false>(
+  options?: Options<GetReadinessData, ThrowOnError>
+) =>
+  (options?.client ?? client).get<GetReadinessResponses, unknown, ThrowOnError>({
+    url: "/health/ready",
+    ...options,
+  });
+
+/**
+ * Liveness probe
+ *
+ * Returns 200 whenever the process can serve a request. Performs no database access, so a slow or unreachable database never restarts the pod. Point livenessProbe here and readinessProbe at /health.
+ */
+export const getLiveness = <ThrowOnError extends boolean = false>(
+  options?: Options<GetLivenessData, ThrowOnError>
+) =>
+  (options?.client ?? client).get<GetLivenessResponses, unknown, ThrowOnError>({
+    url: "/health/live",
     ...options,
   });
 
@@ -266,7 +363,7 @@ export const metricsEndpointMetricsGet = <ThrowOnError extends boolean = false>(
 /**
  * Get memory graph data
  *
- * Retrieve graph data for visualization, optionally filtered by type (world/experience/opinion).
+ * Retrieve graph data for visualization, optionally filtered by type (world/experience/observation).
  */
 export const getGraph = <ThrowOnError extends boolean = false>(
   options: Options<GetGraphData, ThrowOnError>
@@ -279,7 +376,7 @@ export const getGraph = <ThrowOnError extends boolean = false>(
 /**
  * List memory units
  *
- * List memory units with pagination and optional full-text search. Supports filtering by type. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC).
+ * List memory units with pagination and optional full-text search. Supports filtering by type, source document, and linked entity ID. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC).
  */
 export const listMemories = <ThrowOnError extends boolean = false>(
   options: Options<ListMemoriesData, ThrowOnError>
@@ -287,6 +384,44 @@ export const listMemories = <ThrowOnError extends boolean = false>(
   (options.client ?? client).get<ListMemoriesResponses, ListMemoriesErrors, ThrowOnError>({
     url: "/v1/default/banks/{bank_id}/memories/list",
     ...options,
+  });
+
+/**
+ * Dry-run fact extraction (preview, no persistence)
+ *
+ * Preview what the retain step would extract from text WITHOUT changing the bank — no entity resolution, links, embeddings, or persistence. Returns the candidate facts and the LLM token usage. Every prompt-affecting setting (retain mission, extraction mode, chunk size, …) is overridable in the body to A/B a candidate config against the bank's current one. This is a read-only tool: nothing is stored.
+ */
+export const dryRunExtractMemories = <ThrowOnError extends boolean = false>(
+  options: Options<DryRunExtractMemoriesData, ThrowOnError>
+) =>
+  (options.client ?? client).post<
+    DryRunExtractMemoriesResponses,
+    DryRunExtractMemoriesErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/memories/dry-run-extract",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Preview an operation's prompts (no LLM call)
+ *
+ * Render the exact system and user messages retain, consolidation or reflect would send for this bank, without calling an LLM, reading memories, or changing anything. Everything that shapes the prompt comes from the bank; the runtime data an operation would be given is a fixed placeholder. Both messages are returned: retain and consolidation keep their system prompt bank-agnostic (one provider-side cache serves every bank) and carry the mission in the user message instead.
+ */
+export const previewPrompt = <ThrowOnError extends boolean = false>(
+  options: Options<PreviewPromptData, ThrowOnError>
+) =>
+  (options.client ?? client).post<PreviewPromptResponses, PreviewPromptErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/prompts/preview",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
   });
 
 /**
@@ -300,6 +435,23 @@ export const getMemory = <ThrowOnError extends boolean = false>(
   (options.client ?? client).get<GetMemoryResponses, GetMemoryErrors, ThrowOnError>({
     url: "/v1/default/banks/{bank_id}/memories/{memory_id}",
     ...options,
+  });
+
+/**
+ * Curate memory unit
+ *
+ * Edit a memory's text and/or change its curation state (invalidate / revert). Invalidated memories are excluded from recall, consolidation, and graph maintenance but kept for audit (reversible). Only world/experience facts can be curated; observations are derived.
+ */
+export const updateMemory = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateMemoryData, ThrowOnError>
+) =>
+  (options.client ?? client).patch<UpdateMemoryResponses, UpdateMemoryErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/memories/{memory_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
   });
 
 /**
@@ -321,9 +473,12 @@ export const getObservationHistory = <ThrowOnError extends boolean = false>(
  *
  * Recall memory using semantic similarity and spreading activation.
  *
- * The type parameter is optional and must be one of:
+ * The `types` parameter is optional and may contain any of:
  * - `world`: General knowledge about people, places, events, and things that happen
  * - `experience`: Memories about experience, conversations, actions taken, and tasks performed
+ * - `observation`: Consolidated knowledge synthesized from facts
+ *
+ * If `types` is omitted, all fact types are recalled.
  */
 export const recallMemories = <ThrowOnError extends boolean = false>(
   options: Options<RecallMemoriesData, ThrowOnError>
@@ -340,12 +495,12 @@ export const recallMemories = <ThrowOnError extends boolean = false>(
 /**
  * Reflect and generate answer
  *
- * Reflect and formulate an answer using bank identity, world facts, and opinions.
+ * Reflect and formulate an answer using bank identity, world facts, observations, and mental models.
  *
  * This endpoint:
  * 1. Retrieves experience (conversations and events)
  * 2. Retrieves world facts relevant to the query
- * 3. Retrieves existing opinions (bank's perspectives)
+ * 3. Retrieves observations and mental models (bank's synthesized perspectives)
  * 4. Uses LLM to formulate a contextual answer
  * 5. Returns plain text answer and the facts used
  */
@@ -362,9 +517,9 @@ export const reflect = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * List all memory banks
+ * List memory banks
  *
- * Get a list of all agents with their profiles
+ * List banks with their profiles and summary stats, most recently written first (`last_write_at` descending), with pagination and optional search.
  */
 export const listBanks = <ThrowOnError extends boolean = false>(
   options?: Options<ListBanksData, ThrowOnError>
@@ -384,6 +539,19 @@ export const getAgentStats = <ThrowOnError extends boolean = false>(
 ) =>
   (options.client ?? client).get<GetAgentStatsResponses, GetAgentStatsErrors, ThrowOnError>({
     url: "/v1/default/banks/{bank_id}/stats",
+    ...options,
+  });
+
+/**
+ * Test the bank's LLM connectivity
+ *
+ * Probe the LLMs this bank would use for retain / consolidation / reflect with one minimal call each (configs shared across operations are probed once), so you can discover 'not configured / unreachable' instead of a silent stall. Deliberate action (makes a real provider call); not for polling. Returns status only — never the provider, model, endpoint, API key, or raw error. Disable with HINDSIGHT_API_ENABLE_BANK_LLM_HEALTH=false.
+ */
+export const testBankLlm = <ThrowOnError extends boolean = false>(
+  options: Options<TestBankLlmData, ThrowOnError>
+) =>
+  (options.client ?? client).post<TestBankLlmResponses, TestBankLlmErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/health/llm",
     ...options,
   });
 
@@ -567,6 +735,27 @@ export const refreshMentalModel = <ThrowOnError extends boolean = false>(
   >({ url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh", ...options });
 
 /**
+ * Dry-run mental model refresh (preview, no persistence)
+ *
+ * Preview what a refresh would do to this mental model WITHOUT changing it — no content, structured document, watermark, or last_refreshed_at is written. Returns the mode the refresh ran in and why (delta silently falls back to full when there is no baseline or the source query changed), the resolved tag scope and time window it read, how many facts retrieval returned versus how many the reflect agent actually used, the delta operations it emitted, and a unified diff from the stored content to the content it would write.
+ *
+ * This is the production refresh pipeline with two writes skipped — the content and the watermark — and nothing about it is configurable, so what it reports is what the next refresh will do. Because nothing is persisted, a delta dry run reads exactly the window the next real refresh would, and repeating it reads that same window again.
+ *
+ * It costs the same LLM tokens as a refresh and is validated the same way.
+ */
+export const dryRunRefreshMentalModel = <ThrowOnError extends boolean = false>(
+  options: Options<DryRunRefreshMentalModelData, ThrowOnError>
+) =>
+  (options.client ?? client).post<
+    DryRunRefreshMentalModelResponses,
+    DryRunRefreshMentalModelErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/dry-run-refresh",
+    ...options,
+  });
+
+/**
  * Clear mental model content
  *
  * Clear a mental model's content so the next refresh performs a full re-synthesis. This is useful for delta-mode models that have accumulated drift over many incremental refreshes. After clearing, call the /refresh endpoint to trigger a clean full rebuild.
@@ -580,9 +769,141 @@ export const clearMentalModel = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Get the knowledge-base tree
+ *
+ * Return the knowledge base as a nested tree of folders and pages.
+ */
+export const getKnowledgeBaseTree = <ThrowOnError extends boolean = false>(
+  options: Options<GetKnowledgeBaseTreeData, ThrowOnError>
+) =>
+  (options.client ?? client).get<
+    GetKnowledgeBaseTreeResponses,
+    GetKnowledgeBaseTreeErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/knowledge-base/tree", ...options });
+
+/**
+ * Create a knowledge-base folder
+ *
+ * Create a folder, optionally nested under a parent folder.
+ */
+export const createKnowledgeFolder = <ThrowOnError extends boolean = false>(
+  options: Options<CreateKnowledgeFolderData, ThrowOnError>
+) =>
+  (options.client ?? client).post<
+    CreateKnowledgeFolderResponses,
+    CreateKnowledgeFolderErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/knowledge-base/folders",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Create a knowledge-base page
+ *
+ * Create a page (a mental model + tree node). Content is generated asynchronously; use the returned operation_id to track completion.
+ */
+export const createKnowledgePage = <ThrowOnError extends boolean = false>(
+  options: Options<CreateKnowledgePageData, ThrowOnError>
+) =>
+  (options.client ?? client).post<
+    CreateKnowledgePageResponses,
+    CreateKnowledgePageErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/knowledge-base/pages",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Export the knowledge base as a markdown bundle
+ *
+ * Return a portable markdown bundle: a nested index.md, one <id>.md per page, and history logs.
+ */
+export const exportKnowledgeBase = <ThrowOnError extends boolean = false>(
+  options: Options<ExportKnowledgeBaseData, ThrowOnError>
+) =>
+  (options.client ?? client).get<
+    ExportKnowledgeBaseResponses,
+    ExportKnowledgeBaseErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/knowledge-base/export", ...options });
+
+/**
+ * Hybrid search over knowledge pages (BM25 + vector)
+ *
+ * Doc-level hybrid search across a bank's knowledge pages: a full-text (BM25) match and a vector-similarity match, Reciprocal-Rank-Fusion fused. No reranker — tuned for latency.
+ */
+export const searchKnowledgeBase = <ThrowOnError extends boolean = false>(
+  options: Options<SearchKnowledgeBaseData, ThrowOnError>
+) =>
+  (options.client ?? client).get<
+    SearchKnowledgeBaseResponses,
+    SearchKnowledgeBaseErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/knowledge-base/search", ...options });
+
+/**
+ * Get a knowledge-base page
+ *
+ * Return a single page as a markdown document (frontmatter + markdown body).
+ */
+export const getKnowledgePage = <ThrowOnError extends boolean = false>(
+  options: Options<GetKnowledgePageData, ThrowOnError>
+) =>
+  (options.client ?? client).get<GetKnowledgePageResponses, GetKnowledgePageErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/knowledge-base/pages/{page_id}",
+    ...options,
+  });
+
+/**
+ * Delete a knowledge-base node
+ *
+ * Delete a folder or page and its whole subtree (pages' mental models are removed too).
+ */
+export const deleteKnowledgeNode = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteKnowledgeNodeData, ThrowOnError>
+) =>
+  (options.client ?? client).delete<
+    DeleteKnowledgeNodeResponses,
+    DeleteKnowledgeNodeErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/knowledge-base/nodes/{node_id}", ...options });
+
+/**
+ * Rename/move a knowledge-base node or update a page's options
+ *
+ * Rename a node (set `name`), move it under another folder (set `parent_id`, null for the root), and/or update a page's options (`source_query`, `tags`, `max_tokens`, `trigger`). Changing `source_query` schedules an async refresh so the page rebuilds against the new question. `trigger` is applied as a patch: the fields you send are updated and the rest keep the page's current values.
+ */
+export const updateKnowledgeNode = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateKnowledgeNodeData, ThrowOnError>
+) =>
+  (options.client ?? client).patch<
+    UpdateKnowledgeNodeResponses,
+    UpdateKnowledgeNodeErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/knowledge-base/nodes/{node_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * List directives
  *
- * List hard rules that are injected into prompts.
+ * List directive definitions. Unlike reflect, an omitted tag filter returns all directives.
  */
 export const listDirectives = <ThrowOnError extends boolean = false>(
   options: Options<ListDirectivesData, ThrowOnError>
@@ -595,7 +916,7 @@ export const listDirectives = <ThrowOnError extends boolean = false>(
 /**
  * Create directive
  *
- * Create a hard rule that will be injected into prompts.
+ * Create a global or tag-scoped hard rule for reflect prompts.
  */
 export const createDirective = <ThrowOnError extends boolean = false>(
   options: Options<CreateDirectiveData, ThrowOnError>
@@ -655,7 +976,7 @@ export const updateDirective = <ThrowOnError extends boolean = false>(
 /**
  * List documents
  *
- * List documents with pagination and optional search. Documents are the source content from which memory units are extracted.
+ * List documents with pagination and optional search, most recently written first (`updated_at` descending). Documents are the source content from which memory units are extracted.
  */
 export const listDocuments = <ThrowOnError extends boolean = false>(
   options: Options<ListDocumentsData, ThrowOnError>
@@ -731,7 +1052,9 @@ export const getDocument = <ThrowOnError extends boolean = false>(
  *
  * Update mutable fields on a document without re-processing its content.
  *
- * **Tags** (`tags`): Propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset.
+ * **Tags** (`tags`): The array REPLACES the document's tags, it is not merged into them — send the complete set you want the document to end up with, and any tag you leave out is dropped. An empty array (`[]`) therefore clears every tag; only omitting the field entirely is rejected (422).
+ *
+ * The new tags are propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset. Tags are compared as a set, so re-sending the tags a document already has (in any order) changes nothing and queues no re-consolidation.
  *
  * At least one field must be provided.
  */
@@ -787,9 +1110,9 @@ export const listOperations = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Cancel a pending async operation
+ * Cancel a pending or in-flight async operation
  *
- * Cancel a pending async operation by removing it from the queue
+ * Cancel a queued or running async operation. A 'pending' operation is never started. A 'processing' one is cancelled cooperatively: the row is marked 'cancelled' immediately and the worker running it stops at its next checkpoint, so work already in flight may finish the batch it is on. This also clears operations stranded in 'processing' by a crashed worker. Returns 409 for operations that already reached a terminal state.
  */
 export const cancelOperation = <ThrowOnError extends boolean = false>(
   options: Options<CancelOperationData, ThrowOnError>
@@ -802,7 +1125,7 @@ export const cancelOperation = <ThrowOnError extends boolean = false>(
 /**
  * Get operation status
  *
- * Get the status of a specific async operation. Returns 'pending', 'completed', or 'failed'. Completed operations are removed from storage, so 'completed' means the operation finished successfully.
+ * Get the status of a specific async operation. Returns 'pending', 'processing', 'completed', 'failed', or 'cancelled'. Completed operations remain queryable with their payload for the configured retention window and are pruned afterward.
  */
 export const getOperationStatus = <ThrowOnError extends boolean = false>(
   options: Options<GetOperationStatusData, ThrowOnError>
@@ -827,9 +1150,22 @@ export const retryOperation = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Get memory bank profile
+ * Delete a terminal async operation
  *
- * Get disposition traits and mission for a memory bank. Returns 404 if the bank does not exist.
+ * Permanently remove a failed, cancelled, or completed async operation record
+ */
+export const deleteOperation = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteOperationData, ThrowOnError>
+) =>
+  (options.client ?? client).delete<DeleteOperationResponses, DeleteOperationErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/operations/{operation_id}/delete",
+    ...options,
+  });
+
+/**
+ * Get memory bank profile (removed — use GET .../config)
+ *
+ * **Removed.** The bank profile endpoints have been removed. Disposition traits and the reflect mission are bank configuration: read them from GET /v1/default/banks/{bank_id}/config as `disposition_skepticism`, `disposition_literalism`, `disposition_empathy` and `reflect_mission`, and write them with PATCH /v1/default/banks/{bank_id}/config. The `name` field this endpoint also returned was a display-only label; read it from GET /v1/default/banks.
  *
  * @deprecated
  */
@@ -842,9 +1178,9 @@ export const getBankProfile = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Update memory bank disposition
+ * Update memory bank disposition (removed — use PATCH .../config)
  *
- * Update bank's disposition traits (skepticism, literalism, empathy)
+ * **Removed.** The bank profile endpoints have been removed. Disposition traits and the reflect mission are bank configuration: read them from GET /v1/default/banks/{bank_id}/config as `disposition_skepticism`, `disposition_literalism`, `disposition_empathy` and `reflect_mission`, and write them with PATCH /v1/default/banks/{bank_id}/config. The `name` field this endpoint also returned was a display-only label; read it from GET /v1/default/banks.
  *
  * @deprecated
  */
@@ -865,9 +1201,9 @@ export const updateBankDisposition = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Add/merge memory bank background (deprecated)
+ * Add/merge memory bank background (removed — use PATCH .../config)
  *
- * Deprecated: Use PUT /mission instead. This endpoint now updates the mission field.
+ * **Removed.** The bank background was folded into the reflect mission. Write it with PATCH /v1/default/banks/{bank_id}/config as `reflect_mission`. That call replaces the value rather than merging into it, so read the current mission from GET .../config first if you relied on this endpoint's append behaviour.
  *
  * @deprecated
  */
@@ -950,7 +1286,14 @@ export const importBankTemplate = <ThrowOnError extends boolean = false>(
     ImportBankTemplateResponses,
     ImportBankTemplateErrors,
     ThrowOnError
-  >({ url: "/v1/default/banks/{bank_id}/import", ...options });
+  >({
+    url: "/v1/default/banks/{bank_id}/import",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
 
 /**
  * Export bank template
@@ -965,6 +1308,80 @@ export const exportBankTemplate = <ThrowOnError extends boolean = false>(
     ExportBankTemplateErrors,
     ThrowOnError
   >({ url: "/v1/default/banks/{bank_id}/export", ...options });
+
+/**
+ * Export documents (removed — use POST .../document-transfer/export)
+ *
+ * **Removed.** The synchronous whole-bank export loaded the entire bank into memory and held a database connection for the full request, which could exhaust memory and take down the shared API on large banks. Use the asynchronous POST /v1/default/banks/{bank_id}/document-transfer/export instead: it returns an operation_id, runs the export in the background, and exposes a download URL on completion.
+ *
+ * @deprecated
+ */
+export const exportDocumentsSyncRemoved = <ThrowOnError extends boolean = false>(
+  options: Options<ExportDocumentsSyncRemovedData, ThrowOnError>
+) =>
+  (options.client ?? client).get<
+    ExportDocumentsSyncRemovedResponses,
+    ExportDocumentsSyncRemovedErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/document-transfer", ...options });
+
+/**
+ * Import documents (async)
+ *
+ * Submit a transfer archive (produced by the export endpoint) for import into a bank. Runs as a background operation: facts are re-embedded with the target bank's embedding model and entities are re-resolved — no LLM extraction. Returns an operation_id; poll GET /v1/default/banks/{bank_id}/operations/{operation_id} for status and the imported/skipped counts in result_metadata. Use on_conflict to control existing document ids: skip (default), replace, or new-id.
+ */
+export const importDocuments = <ThrowOnError extends boolean = false>(
+  options: Options<ImportDocumentsData, ThrowOnError>
+) =>
+  (options.client ?? client).post<ImportDocumentsResponses, ImportDocumentsErrors, ThrowOnError>({
+    ...formDataBodySerializer,
+    url: "/v1/default/banks/{bank_id}/document-transfer",
+    ...options,
+    headers: {
+      "Content-Type": null,
+      ...options.headers,
+    },
+  });
+
+/**
+ * Export documents (async)
+ *
+ * Submit an async export of a bank's documents (extracted facts, entity names, causal links, chunks) as a transfer ZIP archive. Embeddings and database ids are not included — importing re-embeds with the target bank's model and re-resolves entities. Runs as a background operation to avoid pinning the API on large banks. Returns an operation_id; poll GET /v1/default/banks/{bank_id}/operations/{operation_id}. On completion the operation's result_metadata carries download_url (fetch the ZIP from GET /v1/default/files/download/{key}), storage_key, byte_size, and filename. Pass document_id query params to export specific documents, or omit to export the whole bank; include_observations=true carries consolidated observations and include_knowledge_base=true carries Mental Models plus Knowledge Pages (all whole-bank export only).
+ */
+export const exportDocuments = <ThrowOnError extends boolean = false>(
+  options: Options<ExportDocumentsData, ThrowOnError>
+) =>
+  (options.client ?? client).post<ExportDocumentsResponses, ExportDocumentsErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/document-transfer/export",
+    ...options,
+  });
+
+/**
+ * Fetch an attachment retained inline with a document
+ *
+ * Serve the bytes of an attachment retained as inline content. The id is the one inside a placeholder token, and is returned on `attachments[].url` by recall and by the document/chunk/memory reads — so an agent can show or reason over the original behind an attachment-derived fact.
+ *
+ * Bytes are served with the Content-Type the caller declared at retain. Access is authorized against the bank; a missing attachment and an invisible bank both return 404, so the endpoint cannot be used to probe what a bank holds.
+ */
+export const getBankAttachment = <ThrowOnError extends boolean = false>(
+  options: Options<GetBankAttachmentData, ThrowOnError>
+) =>
+  (options.client ?? client).get<GetBankAttachmentResponses, GetBankAttachmentErrors, ThrowOnError>(
+    { url: "/v1/default/banks/{bank_id}/attachments/{attachment_id}", ...options }
+  );
+
+/**
+ * Download a stored file (async export archive)
+ *
+ * Stream a file previously written to file storage — currently the transfer ZIP produced by an async document export. The key comes from the export operation's result_metadata (storage_key / download_url). Access is authorized against the bank the key belongs to.
+ */
+export const downloadFile = <ThrowOnError extends boolean = false>(
+  options: Options<DownloadFileData, ThrowOnError>
+) =>
+  (options.client ?? client).get<DownloadFileResponses, DownloadFileErrors, ThrowOnError>({
+    url: "/v1/default/files/download/{key}",
+    ...options,
+  });
 
 /**
  * Get bank template JSON Schema
@@ -992,6 +1409,20 @@ export const clearObservations = <ThrowOnError extends boolean = false>(
     ClearObservationsErrors,
     ThrowOnError
   >({ url: "/v1/default/banks/{bank_id}/observations", ...options });
+
+/**
+ * List observation scopes
+ *
+ * Enumerate the distinct scopes across a bank's observations. Each observation lives under a scope: the exact set of tags it was consolidated with. Returns every distinct scope (tag order normalized) with the number of observations in it; the empty tag list is the global/untagged scope. Use a returned scope with the graph endpoint (tags=<scope> & tags_match=exact) to filter observations to exactly that scope. Paged: `total` reports every distinct scope in the bank.
+ */
+export const listObservationScopes = <ThrowOnError extends boolean = false>(
+  options: Options<ListObservationScopesData, ThrowOnError>
+) =>
+  (options.client ?? client).get<
+    ListObservationScopesResponses,
+    ListObservationScopesErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/observations/scopes", ...options });
 
 /**
  * Recover failed consolidation
@@ -1037,7 +1468,7 @@ export const resetBankConfig = <ThrowOnError extends boolean = false>(
 /**
  * Get bank configuration
  *
- * Get fully resolved configuration for a bank including all hierarchical overrides (global → tenant → bank). The 'config' field contains all resolved config values. The 'overrides' field shows only bank-specific overrides.
+ * Get fully resolved configuration for a bank including all hierarchical overrides (global → tenant → bank). The 'config' field contains all resolved config values. The 'overrides' field shows only bank-specific overrides. Always available: HINDSIGHT_API_ENABLE_BANK_CONFIG_API gates only the write operations on this resource.
  */
 export const getBankConfig = <ThrowOnError extends boolean = false>(
   options: Options<GetBankConfigData, ThrowOnError>
@@ -1050,7 +1481,7 @@ export const getBankConfig = <ThrowOnError extends boolean = false>(
 /**
  * Update bank configuration
  *
- * Update configuration overrides for a bank. Only hierarchical fields can be overridden (LLM settings, retention parameters, etc.). Keys can be provided in Python field format (llm_provider) or environment variable format (HINDSIGHT_API_LLM_PROVIDER).
+ * Update configuration overrides for a bank. Only hierarchical behavioral settings can be overridden (retention parameters, recall settings, etc.). Keys can be provided in Python field format (retain_extraction_mode) or environment variable format (HINDSIGHT_API_RETAIN_EXTRACTION_MODE).
  */
 export const updateBankConfig = <ThrowOnError extends boolean = false>(
   options: Options<UpdateBankConfigData, ThrowOnError>
@@ -1078,12 +1509,19 @@ export const triggerConsolidation = <ThrowOnError extends boolean = false>(
     TriggerConsolidationResponses,
     TriggerConsolidationErrors,
     ThrowOnError
-  >({ url: "/v1/default/banks/{bank_id}/consolidate", ...options });
+  >({
+    url: "/v1/default/banks/{bank_id}/consolidate",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
 
 /**
  * List webhooks
  *
- * List all webhooks registered for a bank.
+ * List the webhooks registered for a bank, oldest first. Paged: `total` reports every webhook on the bank.
  */
 export const listWebhooks = <ThrowOnError extends boolean = false>(
   options: Options<ListWebhooksData, ThrowOnError>
@@ -1157,7 +1595,7 @@ export const listWebhookDeliveries = <ThrowOnError extends boolean = false>(
 /**
  * Clear memory bank memories
  *
- * Delete memory units for a memory bank. Optionally filter by type (world, experience, opinion) to delete only specific types. This is a destructive operation that cannot be undone. The bank profile (disposition and background) will be preserved.
+ * Delete memory units for a memory bank. Optionally filter by type (world, experience, observation) to delete only specific types. This is a destructive operation that cannot be undone. The bank profile (disposition and background) will be preserved.
  */
 export const clearBankMemories = <ThrowOnError extends boolean = false>(
   options: Options<ClearBankMemoriesData, ThrowOnError>
@@ -1216,7 +1654,7 @@ export const retainMemories = <ThrowOnError extends boolean = false>(
  * This endpoint handles file upload, conversion, and memory creation in a single operation.
  *
  * **Features:**
- * - Supports PDF, DOCX, PPTX, XLSX, images (with OCR), audio (with transcription)
+ * - Supports PDF, DOCX, PPTX, XLSX, images (parser-dependent OCR), audio (with transcription)
  * - Automatic file-to-markdown conversion using pluggable parsers
  * - Files stored in object storage (PostgreSQL by default, S3 for production)
  * - Each file becomes a separate document with optional metadata/tags
@@ -1277,5 +1715,31 @@ export const auditLogStats = <ThrowOnError extends boolean = false>(
 ) =>
   (options.client ?? client).get<AuditLogStatsResponses, AuditLogStatsErrors, ThrowOnError>({
     url: "/v1/default/banks/{bank_id}/audit-logs/stats",
+    ...options,
+  });
+
+/**
+ * List LLM request traces
+ *
+ * List traced LLM requests for a bank, ordered by most recent first. Requires LLM request tracing to be enabled (HINDSIGHT_API_LLM_TRACE_ENABLED).
+ */
+export const listLlmRequests = <ThrowOnError extends boolean = false>(
+  options: Options<ListLlmRequestsData, ThrowOnError>
+) =>
+  (options.client ?? client).get<ListLlmRequestsResponses, ListLlmRequestsErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/llm-requests",
+    ...options,
+  });
+
+/**
+ * LLM request statistics
+ *
+ * Get LLM request counts grouped by time bucket and status for charting.
+ */
+export const llmRequestStats = <ThrowOnError extends boolean = false>(
+  options: Options<LlmRequestStatsData, ThrowOnError>
+) =>
+  (options.client ?? client).get<LlmRequestStatsResponses, LlmRequestStatsErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/llm-requests/stats",
     ...options,
   });

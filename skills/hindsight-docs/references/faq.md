@@ -1,6 +1,8 @@
 
 
-<PageHero title="FAQ" subtitle="Common questions and answers about Hindsight." />
+# FAQ
+
+Common questions and answers about Hindsight.
 
 **Contents**
 - [What is Hindsight and how does it differ from RAG?](#what-is-hindsight-and-how-does-it-differ-from-rag)
@@ -13,10 +15,12 @@
 - [Retain, recall, and reflect — what's the difference?](#whats-the-difference-between-retain-recall-and-reflect)
 - [When should I use recall vs reflect?](#when-should-i-use-recall-vs-reflect)
 - [When should I use mental models?](#when-should-i-use-mental-models)
+- [Mental model vs. knowledge page](#whats-the-difference-between-a-mental-model-and-a-knowledge-page)
 - [Latency expectations](#whats-the-typical-latency-for-recall-operations)
 - [Tags, metadata, and entity labels](#does-hindsight-support-metadata-filtering)
 - [Controlling which memory types are recalled](#how-do-i-control-which-types-of-memories-are-recalled)
 - [Recommended format for conversations](#what-is-the-recommended-format-for-retaining-conversations)
+- [How is Hindsight's graph different from a traditional knowledge graph?](#how-is-hindsights-graph-different-from-a-traditional-knowledge-graph)
 
 ---
 
@@ -66,6 +70,7 @@ Browse all supported integrations in the Integrations Hub.
 ### Which LLM providers are supported?
 
 - OpenAI
+- OpenAI Responses
 - Anthropic
 - Google Gemini
 - Vertex AI
@@ -78,11 +83,18 @@ Browse all supported integrations in the Integrations Hub.
 - DeepSeek
 - z.ai
 - opencode-go
+- Atlas Cloud
+- Meta Model API
 - Volcano Engine
 - OpenRouter
+- Requesty
 - OpenAI Codex
 - Claude Code
+- GitHub Copilot
 - AWS Bedrock
+- Fireworks AI
+- Nous Portal
+- SuperGrok (OAuth)
 - OpenAI Compatible
 - LiteLLM (100+)
 
@@ -211,13 +223,32 @@ See [Recall](developer/api/recall.md) and [Reflect](developer/reflect.md) for fu
 
 ### When should I use mental models?
 
-**Mental models** are consolidated knowledge patterns synthesized from individual facts over time. Use them when you need:
+**Mental models** are standing answers to questions you define — synthesized from the bank's knowledge and rewritten in the background as it changes. Use them when you need:
 
 - Higher-level understanding beyond raw facts (e.g., "User prefers functional programming patterns")
 - Long-term behavioral patterns (e.g., "Customer is price-sensitive but values quality")
+- An answer available instantly, with no reasoning on the request path
 - Context for AI agent reasoning during **reflect** operations
 
-Mental models are automatically built during retain and used by reflect to provide richer, more contextual responses. See [Mental Models](developer/api/mental-models.md).
+You create a mental model with the question that defines it; Hindsight builds the content and keeps it current. Reflect checks mental models first, so a fresh one can answer without descending into observations and raw facts. See [Mental Models](developer/api/mental-models.md).
+
+---
+
+### What's the difference between a mental model and a knowledge page?
+
+A **knowledge page is a mental model** — the same engine, the same refresh behaviour — with two additions: a place in a folder tree, and a set of defaults tuned for documents rather than answers (built from observations only, refreshed incrementally after each consolidation, never influenced by other pages, and a larger content budget).
+
+| | Mental model | Knowledge page |
+|---|---|---|
+| Shape | A standing answer to a question | A markdown document with frontmatter |
+| Organization | Flat list, scoped by tags | Nested folders and pages |
+| Sources | All fact types by default | Observations only by default |
+| Refresh | Off by default | Delta refresh after each consolidation |
+| Typical consumer | Your application or an agent, by lookup | A person or agent browsing and reading |
+
+Use a plain mental model when something in your system looks up the answer. Use a knowledge page when the result is meant to be browsed and read directly, like a wiki. Anything you can configure on a mental model can be configured on a page.
+
+See [Mental Models](developer/api/mental-models.md) and the Knowledge Pages section of the developer docs.
 
 ---
 
@@ -340,6 +371,62 @@ Re-retaining with the same `id` replaces the old document and its facts, so you 
 
 ---
 
+### How is Hindsight's graph different from a traditional knowledge graph?
+
+Hindsight uses an **event-centric graph** that organizes data around moments (conversations, observations, memories) rather than static, isolated facts. Memories are the anchor: entities attach to the memories they appear in, and memories themselves can also be linked directly to each other (more on that below). The closest analogy is a map versus a scrapbook.
+
+**A traditional graph (like Neo4j) is a map.** It shows how places connect directly to each other via roads, mapping rigid structural facts about the world:
+
+```
+[Toronto] ──IS_IN──> [Canada]
+```
+
+**A Hindsight graph is a scrapbook.** Each page is a single memory. On that page, you slap stickers of all the people, concepts, and labels present in that specific moment. The stickers don't touch each other — they just live on the same page together:
+
+```
+Scrapbook page: "Math Class"
+  [Alice]   [Acme]   [pedagogy:scaffolding]
+```
+
+#### How do the two handle change over time?
+
+This is where traditional graphs run into major limitations when used for AI memory.
+
+**Traditional graphs struggle with change.** If Alice leaves Acme Corp to work at Stark Industries, you have to manually delete or rewrite the old `[WORKS_AT]` arrow. If you don't, the graph contradicts reality by stating she works at both places simultaneously. Traditional graphs are built for the absolute present; they lose history when data changes.
+
+**Hindsight handles change effortlessly because history is preserved.** If Alice changes jobs, you don't rewrite the past. You simply create a new scrapbook page — `Memory: Tuesday's Call` with a sticker for `[Stark Industries]`. The old page from last year still accurately links her to `[Acme Corp]`. The graph naturally tracks how the world evolves without complex database maintenance.
+
+#### Where do the stickers come from? How do I control them?
+
+The creation of stickers happens through a mix of AI automation and developer control:
+
+- **Open-world automation (default):** Hindsight's LLM pipeline automatically detects and extracts standard entities — people, places, dates — from raw text and turns them into stickers.
+- **Developer control via `entity_labels`:** You can define a custom schema using [entity labels](developer/retain.md#entity-labels). This forces the LLM to categorize memories using a strict, predefined vocabulary. Instead of letting the AI invent random descriptors, you choose the exact names and parameters for the stickers — for example, forcing a `pedagogy` key to only choose from `scaffolding`, `direct_instruction`, or `socratic_questioning`. To lock the bank to *only* your configured labels and turn off the open-world automation above, also set `entities_allow_free_form: false` on the bank config — the LLM then skips free-form named entities entirely and emits only entries that match your schema.
+
+#### Can I build direct entity-to-entity pipelines?
+
+No. In Hindsight, entities (people, places, concepts, or classification labels) do not have direct arrows connecting them to one another. Instead, they interact by anchoring to the same parent memory unit — the same scrapbook page.
+
+#### How does Hindsight find connections if entities aren't directly linked?
+
+Recall starts with semantic search — finding the memories most relevant to your query as seed pages — and then expands from those seeds through three parallel signals:
+
+- **Shared entities.** If Memory A and Memory B both anchor to the same entity node — like `[pedagogy:scaffolding]` — Hindsight traverses `Memory A → [pedagogy:scaffolding] → Memory B`. This is the scrapbook-pages-with-the-same-stickers case.
+- **Semantic links between memories.** When a new memory is retained, Hindsight precomputes links to its nearest neighbors in embedding space, so semantically related pages connect directly without needing a shared sticker.
+- **Causal links between memories.** Hindsight also extracts explicit causal relationships (`causes`, `caused_by`, `enables`, `prevents`) between memories, so cause-and-effect chains are first-class edges rather than something the model has to infer.
+
+The semantic layer picks the starting points; the graph fills in the connections through whichever of those three signals is strongest for each candidate.
+
+#### Does this graph structure help reduce hallucinations in my agent?
+
+Yes — by giving the consuming LLM better-grounded context to reason from. Three properties of the scrapbook model contribute directly:
+
+- **History is preserved, not collapsed.** The model sees time-bounded facts (Alice worked at Acme last year, Stark Industries now) rather than a contradictory present-tense edge that forces it to reconcile or guess.
+- **Connections come from recorded links, not inference.** When recall surfaces two related memories, it's because they share an entity, a precomputed semantic neighbor, or an explicit causal edge — the link appears in the retrieved context, so the model doesn't have to invent one.
+- **Convergent evidence accumulates.** Multiple memories anchoring to the same entity reinforce each other instead of competing, giving the model corroborated claims rather than singular unsupported ones.
+
+---
+
 ## Still have questions?
 
-Join our [Slack community](https://join.slack.com/t/hindsight-space/shared_invite/zt-3nhbm4w29-LeSJ5Ixi6j8PdiYOCPlOgg) or report issues on [GitHub](https://github.com/vectorize-io/hindsight/issues).
+Join our [Slack community](https://vectorize.io/slack) or report issues on [GitHub](https://github.com/vectorize-io/hindsight/issues).

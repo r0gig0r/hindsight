@@ -63,6 +63,20 @@ No single search method handles all these well. Hindsight solves this with **TEM
 
 **Why it matters:** Ensures you never miss results that mention specific names or terms, even if they're semantically distant from your query.
 
+**Backends:** Hindsight ships five pluggable BM25 backends, selected via
+`HINDSIGHT_API_TEXT_SEARCH_EXTENSION`:
+
+| Backend | What it uses | Citus-compatible? |
+|---|---|---|
+| `native` | PostgreSQL `tsvector` + `ts_rank_cd` (TF-IDF, not true BM25) | Yes |
+| `vchord` | `vchord_bm25` extension | No |
+| `pg_textsearch` | Timescale `pg_textsearch` extension | No |
+| `pgroonga` | PGroonga (Groonga) full-text extension, `TokenBigram` polyglot tokenizer | No |
+| `pg_search` | ParadeDB `pg_search` extension, configurable tokenizer (e.g. `jieba`, `chinese_compatible`, `ngram`) via `HINDSIGHT_API_TEXT_SEARCH_EXTENSION_PG_SEARCH_TOKENIZER` | Yes |
+
+If you need true BM25 ranking on a horizontally scaled Postgres (Citus) cluster,
+`pg_search` is the only option. See the [`pg_search` docker-compose example](https://github.com/vectorize-io/hindsight/tree/main/docker/docker-compose/pg_search).
+
 ---
 
 ### Graph Traversal
@@ -90,9 +104,9 @@ No single search method handles all these well. Hindsight solves this with **TEM
 - Relative time: "What did Bob work on last year?"
 - Before/after: "What happened before Alice joined Google?"
 
-**How it works:** Combines semantic understanding with time filtering to find events within specific periods.
+**How it works:** When the query contains a time reference, Hindsight parses it into a date window, then retrieves the memories whose time overlaps that window. Within the window it selects candidates by **semantic relevance to the query** — not by recency — so the most relevant in-window memory is never dropped just because other memories happen to be more recent. It then **spreads the selection across the window's range**: the window is divided into time-buckets and the strongest match from each populated bucket is taken first, so a "what happened in 2023?" query surfaces memories from across the whole year rather than clustering on whichever stretch is densest. Time is also used as a *scoring* signal — memories closer to the center of the window get a small boost (see [Temporal proximity signal](#temporal-proximity-signal)).
 
-**Why it matters:** Enables precise historical queries without losing old information.
+**Why it matters:** Enables precise historical queries that stay relevant *and* representative of the whole period. It also stays fast and meaningful on memory banks whose timestamps are densely clustered (for example when a large batch is ingested with one date): because selection is relevance-first, a time window that happens to match most of the bank still returns the best matches rather than an arbitrary slice.
 
 ---
 
@@ -231,7 +245,7 @@ Where:
 - **rank_i(d)** = position of document *d* in strategy *i* (1-indexed)
 - The sum runs over all strategies where *d* appears
 
-**All four strategies are weighted equally.** There are no per-strategy weight multipliers — importance comes from rank position, not the source.
+**Within RRF, all four strategies are weighted equally** — fusion uses rank position, not the source, so no strategy gets an implicit multiplier. You can, however, deliberately bias a source with [`HINDSIGHT_API_RECALL_STRATEGY_BOOSTS`](./configuration): that boost is applied at a separate stage — before the reranking pre-filter cap and again after reranking — not inside the RRF fusion above.
 
 **Why RRF over raw score merging?** Each retrieval strategy produces scores on a different scale (cosine similarity, BM25 tf-idf, graph activation). These scores aren't comparable — a BM25 score of 12.5 and a cosine similarity of 0.85 don't mean the same thing. RRF sidesteps this by using only rank positions, making it robust across any scoring system without requiring calibration.
 
@@ -253,11 +267,11 @@ The first memory ranks higher because it has **consensus** across strategies.
 
 RRF gives a good initial ranking, but it's based on positions, not on deep query-document understanding. The cross-encoder evaluates each candidate against the query as a pair, producing a relevance score.
 
-**Pre-filtering:** Before reranking, candidates are trimmed to the top **300** (by RRF score) to limit computational cost. This is configurable via `HINDSIGHT_API_RERANKER_MAX_CANDIDATES`.
+**Pre-filtering:** Before reranking, candidates are trimmed to the top **300** (by RRF score) to limit computational cost. This is configurable via `HINDSIGHT_API_RERANKER_MAX_CANDIDATES`. If [`HINDSIGHT_API_RECALL_STRATEGY_BOOSTS`](./configuration) is set, the boost is applied before this cut, so candidates from a favoured source are more likely to survive it. The boost promotes the favoured arm in *rank* space (its rank is divided by the level's divisor before the RRF contribution is computed) rather than scaling its score, so it reaches deeper into that arm without evicting the top-ranked hits of the others — including on banks whose merged pool is many times the cap. When `trace: true` is requested, the `rerank_prefilter` phase reports how many candidates were kept and dropped, the cap in force, the active boosts, and the per-arm composition of the survivors.
 
 **Why rerank after RRF?** RRF is position-based — it knows a memory ranked well across strategies, but it never actually reads the query and the memory together. The cross-encoder does: it takes the query and each candidate as a pair and produces a relevance score based on their full interaction. This catches nuances that position-based fusion misses, like a memory that ranked #1 in keyword search because it matched a common term but is actually irrelevant to the query's intent.
 
-**Score normalization:** Cross-encoders output raw logits (which can be negative). These are normalized to [0, 1] using the sigmoid function:
+**Score normalization:** Cross-encoders output raw logits (which can be negative). Scores that already fall within [0, 1] — as returned by calibrated external API rerankers (e.g. Cohere, SiliconFlow, ZeroEntropy, Alibaba, Jina) — are passed through unchanged to preserve their absolute confidence. Raw logits outside [0, 1] are normalized to [0, 1] using the sigmoid function:
 
 ```
 CE_normalized = 1 / (1 + e^(-raw_logit))
@@ -303,7 +317,7 @@ Linear decay over 365 days from the memory's occurrence date:
 recency = clamp(1.0 - days_ago / 365, 0.1, 1.0)
 ```
 
-A memory from today has recency 1.0 (+10% boost). A memory from 6 months ago has recency ~0.5 (neutral). A memory older than a year has recency 0.1 (-8% penalty). Memories without dates get 0.5 (neutral — no boost or penalty).
+A memory from the query timestamp has recency 1.0 (+10% boost). A memory from 6 months before the query timestamp has recency ~0.5 (neutral). A memory more than a year before the query timestamp has recency 0.1 (-8% penalty). If no `query_timestamp` is provided, the server's current time is used. Memories without dates get 0.5 (neutral — no boost or penalty).
 
 #### Temporal proximity signal
 
@@ -342,7 +356,7 @@ The boosts are intentionally conservative — they nudge the ranking without ove
 
 ### Stage 4: Token Truncation
 
-After scoring, results are sorted by `final_score` and selected top-down until the `max_tokens` budget is exhausted. Only the memory text counts toward the budget — metadata is free.
+After scoring, results are sorted by `final_score` and selected top-down until the `max_tokens` budget is exhausted. Only the memory text counts toward the budget — metadata is free. A result too long for what is left of the budget is skipped and the packing continues with the next one, so a single long fact does not cost you the shorter ones ranked behind it. If nothing fits at all, the top-ranked result is still returned whole, so a query that matched something is never answered with an empty list.
 
 ---
 
@@ -360,7 +374,7 @@ This recall budget flows through the pipeline as follows:
 
 | Pipeline stage | How the recall budget is used |
 |----------------|-------------------------------|
-| **Semantic search** | Over-fetches max(recall_budget × 5, 100) from HNSW, trims to recall_budget |
+| **Semantic search** | `LIMIT recall_budget` in SQL, with the ANN candidate list sized to match for the query (on pgvector, `hnsw.ef_search`, capped at that setting's maximum of 1000) |
 | **BM25 search** | `LIMIT recall_budget` in SQL |
 | **Graph traversal** | Explores up to recall_budget nodes |
 | **Temporal spreading** | Activates up to recall_budget nodes via links |

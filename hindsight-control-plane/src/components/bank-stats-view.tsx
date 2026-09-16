@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { useTranslations } from "next-intl";
 import { useBank } from "@/lib/bank-context";
 import { useFeatures } from "@/lib/features-context";
 import { client, MentalModel } from "@/lib/api";
@@ -18,6 +19,7 @@ import {
   RefreshCw,
   ExternalLink,
 } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import {
   Dialog,
   DialogContent,
@@ -46,7 +48,7 @@ import {
 } from "recharts";
 import type { TooltipContentProps } from "recharts";
 
-interface BankStats {
+export interface BankStats {
   bank_id: string;
   total_nodes: number;
   total_links: number;
@@ -65,20 +67,39 @@ interface BankStats {
   failed_operations: number;
   operations_by_status?: Record<string, number>;
   last_consolidated_at: string | null;
+  /** Last time a memory was stored, edited or consolidated. Null on an empty bank. */
+  last_memory_write_at: string | null;
   pending_consolidation: number;
   failed_consolidation: number;
   total_observations: number;
 }
 
+/** What the mental-models card reads: the per-model staleness answer, nothing else.
+ * It also took the two refresh timestamps back when it derived staleness itself. */
+type MentalModelSummary = Pick<MentalModel, "is_stale">;
+
 type Period = "1h" | "12h" | "1d" | "7d" | "30d" | "90d";
 const PERIODS: Period[] = ["1h", "12h", "1d", "7d", "30d", "90d"];
 
 type TimeField = "created_at" | "mentioned_at" | "occurred_start";
-const TIME_FIELD_LABELS: Record<TimeField, { short: string; long: string }> = {
-  created_at: { short: "Ingested", long: "When records were ingested" },
-  mentioned_at: { short: "Mentioned", long: "When facts were mentioned (event time)" },
-  occurred_start: { short: "Occurred", long: "When the underlying event started" },
-};
+type TimeFieldLabel = { short: string; long: string };
+type TimeFieldTranslator = (
+  key:
+    | "timeFieldIngestedShort"
+    | "timeFieldIngestedLong"
+    | "timeFieldMentionedShort"
+    | "timeFieldMentionedLong"
+    | "timeFieldOccurredShort"
+    | "timeFieldOccurredLong"
+) => string;
+
+function getTimeFieldLabels(t: TimeFieldTranslator): Record<TimeField, TimeFieldLabel> {
+  return {
+    created_at: { short: t("timeFieldIngestedShort"), long: t("timeFieldIngestedLong") },
+    mentioned_at: { short: t("timeFieldMentionedShort"), long: t("timeFieldMentionedLong") },
+    occurred_start: { short: t("timeFieldOccurredShort"), long: t("timeFieldOccurredLong") },
+  };
+}
 const TIME_FIELDS: TimeField[] = ["created_at", "mentioned_at", "occurred_start"];
 
 interface TimeseriesBucket {
@@ -174,39 +195,6 @@ function ChartTooltip({ active, payload, label, valueLabel }: ChartTooltipProps)
   );
 }
 
-function HeroCard({
-  icon: Icon,
-  label,
-  value,
-  pulse,
-}: {
-  icon: typeof Database;
-  label: string;
-  value: number;
-  pulse?: boolean;
-}) {
-  return (
-    <Card>
-      <CardContent className="p-4">
-        <div className="flex items-center gap-3">
-          <div className="p-2 rounded-md bg-muted">
-            <Icon
-              className={`w-4 h-4 ${pulse ? "animate-pulse text-amber-500" : "text-muted-foreground"}`}
-            />
-          </div>
-          <div className="flex-1 min-w-0">
-            <p className="text-xs text-muted-foreground font-medium">{label}</p>
-            <CompactNumber
-              value={value}
-              className="text-2xl font-semibold text-foreground leading-tight tabular-nums block"
-            />
-          </div>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
 function SectionHeading({ children }: { children: React.ReactNode }) {
   return (
     <h3 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-[0.08em] mb-3">
@@ -215,16 +203,26 @@ function SectionHeading({ children }: { children: React.ReactNode }) {
   );
 }
 
-function formatRelativeTime(ts: string | null): string {
-  if (!ts) return "Never";
+type RelativeTimeTranslator = (
+  key:
+    | "relativeTimeNever"
+    | "relativeTimeJustNow"
+    | "relativeTimeMinutes"
+    | "relativeTimeHours"
+    | "relativeTimeDays",
+  values?: Record<string, number>
+) => string;
+
+function formatRelativeTime(ts: string | null, t?: RelativeTimeTranslator): string {
+  if (!ts) return t ? t("relativeTimeNever") : "Never";
   const diff = Date.now() - new Date(ts).getTime();
   const mins = Math.floor(diff / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
+  if (mins < 1) return t ? t("relativeTimeJustNow") : "just now";
+  if (mins < 60) return t ? t("relativeTimeMinutes", { mins }) : `${mins}m ago`;
   const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
+  if (hours < 24) return t ? t("relativeTimeHours", { hours }) : `${hours}h ago`;
   const days = Math.floor(hours / 24);
-  return `${days}d ago`;
+  return t ? t("relativeTimeDays", { days }) : `${days}d ago`;
 }
 
 // Bucket timestamps arrive from the memories-timeseries endpoint, which is
@@ -406,9 +404,17 @@ interface OpsStatusEntry {
 }
 
 function OperationsCard({ byStatus }: { byStatus: Record<string, number> }) {
+  const t = useTranslations("bankStats");
+  const statusLabel: Record<string, string> = {
+    completed: t("opsCompleted"),
+    processing: t("opsProcessing"),
+    pending: t("opsPending"),
+    failed: t("opsFailed"),
+    cancelled: t("opsCancelled"),
+  };
   const entries: OpsStatusEntry[] = OPS_STATUS_ORDER.map((s) => ({
     status: s,
-    label: OPS_STATUS_LABELS[s],
+    label: statusLabel[s] ?? OPS_STATUS_LABELS[s],
     value: byStatus[s] || 0,
     color: OPS_STATUS_COLORS[s],
   }));
@@ -425,16 +431,16 @@ function OperationsCard({ byStatus }: { byStatus: Record<string, number> }) {
       <CardHeader className="pb-2 flex flex-row items-center justify-between space-y-0">
         <CardTitle className="text-sm font-semibold flex items-center gap-2">
           <Activity className="w-3.5 h-3.5 text-muted-foreground" />
-          Operations
+          {t("operations")}
         </CardTitle>
         <span className="text-xs text-muted-foreground tabular-nums">
-          <CompactNumber value={total} /> total
+          <CompactNumber value={total} /> {t("totalSuffix")}
         </span>
       </CardHeader>
       <CardContent>
         {total === 0 ? (
           <div className="h-[100px] flex items-center justify-center text-sm text-muted-foreground">
-            No operations yet
+            {t("noOperationsYet")}
           </div>
         ) : (
           <div className="space-y-3">
@@ -489,13 +495,14 @@ function ConsolidationCard({
   total: number;
   lastConsolidatedAt: string | null;
 }) {
+  const t = useTranslations("bankStats");
   const [failedOpen, setFailedOpen] = useState(false);
   const hasFailed = failed > 0;
 
   return (
     <Card>
       <CardHeader className="pb-2">
-        <CardTitle className="text-sm font-semibold">Consolidation</CardTitle>
+        <CardTitle className="text-sm font-semibold">{t("consolidation")}</CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
         <ProgressRow done={done} total={total} doneColor={CHART_COLORS.success} />
@@ -504,7 +511,7 @@ function ConsolidationCard({
             <div className="flex items-center gap-1.5">
               <CheckCircle2 className="w-3 h-3 text-emerald-500" />
               <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-medium">
-                Done
+                {t("done")}
               </span>
             </div>
             <CompactNumber
@@ -516,7 +523,7 @@ function ConsolidationCard({
             <div className="flex items-center gap-1.5">
               <AlertCircle className="w-3 h-3 text-amber-500" />
               <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-medium">
-                Pending
+                {t("pending")}
               </span>
             </div>
             <CompactNumber
@@ -533,7 +540,7 @@ function ConsolidationCard({
                 ? "cursor-pointer hover:bg-red-500/10 focus:outline-none focus:ring-2 focus:ring-red-500/40"
                 : "cursor-default"
             }`}
-            title={hasFailed ? "View failed memories" : undefined}
+            title={hasFailed ? t("viewFailedMemoriesLabel") : undefined}
           >
             <div className="flex items-center gap-1.5">
               <XCircle
@@ -546,7 +553,7 @@ function ConsolidationCard({
                   hasFailed ? "text-red-600 dark:text-red-400" : "text-muted-foreground"
                 }`}
               >
-                Failed
+                {t("failed")}
               </span>
             </div>
             <span
@@ -562,11 +569,11 @@ function ConsolidationCard({
             <div className="flex items-center gap-1.5">
               <Clock className="w-3 h-3 text-muted-foreground" />
               <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-medium">
-                Last
+                {t("last")}
               </span>
             </div>
             <span className="text-base font-semibold text-foreground block leading-tight">
-              {formatRelativeTime(lastConsolidatedAt)}
+              {formatRelativeTime(lastConsolidatedAt, t as RelativeTimeTranslator)}
             </span>
           </div>
         </div>
@@ -591,6 +598,8 @@ function FailedConsolidationsDialog({
   open: boolean;
   onOpenChange: (value: boolean) => void;
 }) {
+  const t = useTranslations("bankStats");
+  const tFailed = useTranslations("failedConsolidations");
   const { currentBank } = useBank();
   const [items, setItems] = useState<FailedMemoryItem[]>([]);
   const [total, setTotal] = useState(0);
@@ -629,9 +638,7 @@ function FailedConsolidationsDialog({
       if (res.retried_count > 0) {
         await client.triggerConsolidation(currentBank);
       }
-      toast.success(
-        `Queued ${res.retried_count} memor${res.retried_count === 1 ? "y" : "ies"} for re-consolidation`
-      );
+      toast.success(tFailed("recoverSuccess", { count: res.retried_count }));
       setRefreshTick((t) => t + 1);
     } catch {
       // toast shown by interceptor
@@ -646,43 +653,40 @@ function FailedConsolidationsDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <XCircle className="w-4 h-4 text-red-600 dark:text-red-400" />
-            Failed consolidations
+            {tFailed("title")}
           </DialogTitle>
-          <DialogDescription>
-            Source memories whose consolidation permanently failed. Recovery resets them so they are
-            retried on the next consolidation run.
-          </DialogDescription>
+          <DialogDescription>{tFailed("description")}</DialogDescription>
         </DialogHeader>
         <div className="flex items-center justify-between gap-2 py-2">
           <span className="text-sm text-muted-foreground">
-            {loading ? "Loading…" : `${total} failed`}
+            {loading ? tFailed("loading") : tFailed("totalFailed", { total })}
           </span>
           <Button size="sm" onClick={handleRecover} disabled={recovering || loading || total === 0}>
             <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${recovering ? "animate-spin" : ""}`} />
-            Recover all
+            {tFailed("recoverAll")}
           </Button>
         </div>
         <div className="flex-1 min-h-0 overflow-auto border border-border rounded-md">
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead className="w-[140px]">Failed at</TableHead>
-                <TableHead className="w-[100px]">Type</TableHead>
-                <TableHead>Text</TableHead>
+                <TableHead className="w-[140px]">{tFailed("colFailedAt")}</TableHead>
+                <TableHead className="w-[100px]">{tFailed("colType")}</TableHead>
+                <TableHead>{tFailed("colText")}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {items.length === 0 && !loading && (
                 <TableRow>
                   <TableCell colSpan={3} className="text-center text-muted-foreground py-8">
-                    No failed consolidations.
+                    {tFailed("noFailedConsolidations")}
                   </TableCell>
                 </TableRow>
               )}
               {items.map((row) => (
                 <TableRow key={row.id}>
                   <TableCell className="text-xs text-muted-foreground whitespace-nowrap">
-                    {formatRelativeTime(row.consolidation_failed_at)}
+                    {formatRelativeTime(row.consolidation_failed_at, t as RelativeTimeTranslator)}
                   </TableCell>
                   <TableCell className="text-xs capitalize">{row.fact_type}</TableCell>
                   <TableCell className="text-sm">
@@ -703,53 +707,53 @@ function FailedConsolidationsDialog({
   );
 }
 
-function MentalModelsCard({
-  models,
-  lastConsolidatedAt,
-}: {
-  models: MentalModel[];
-  lastConsolidatedAt: string | null;
-}) {
+function MentalModelsCard({ models }: { models: MentalModelSummary[] }) {
+  const t = useTranslations("bankStats");
+  // The counts use the shared staleness vocabulary so the tile, the tree and the
+  // model dialog all say the same word for the same boolean.
+  const ts = useTranslations("staleness");
   const total = models.length;
-  const consolidatedTime = lastConsolidatedAt ? new Date(lastConsolidatedAt).getTime() : 0;
-  const upToDate = models.filter((m) => {
-    if (!consolidatedTime) return true;
-    if (!m.last_refreshed_at) return false;
-    return new Date(m.last_refreshed_at).getTime() >= consolidatedTime;
-  }).length;
-  const stale = total - upToDate;
+  // `is_stale` is the API's per-model answer, evaluated against that model's own
+  // tags and fact types — the same check that decides whether a scheduled refresh
+  // does any work. This card used to derive it here by comparing each model's
+  // last_memory_seen_at against the bank-wide last write, which flagged every model
+  // that had not read the newest memory in the bank even when that memory was
+  // nowhere near its scope, and stayed that way for as long as the model's own
+  // scope was quiet.
+  const stale = models.filter((m) => m.is_stale).length;
+  const inSync = total - stale;
 
   return (
     <Card>
       <CardHeader className="pb-2">
         <CardTitle className="text-sm font-semibold flex items-center gap-2">
           <Brain className="w-3.5 h-3.5 text-muted-foreground" />
-          Mental Models
+          {t("mentalModels")}
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
         {total === 0 ? (
-          <div className="text-sm text-muted-foreground py-4">No mental models</div>
+          <div className="text-sm text-muted-foreground py-4">{t("noMentalModels")}</div>
         ) : (
           <>
-            <ProgressRow done={upToDate} total={total} doneColor={CHART_COLORS.success} />
+            <ProgressRow done={inSync} total={total} doneColor={CHART_COLORS.success} />
             <div className="grid grid-cols-3 gap-3 pt-1">
               <div className="space-y-0.5">
                 <div className="flex items-center gap-1.5">
                   <CheckCircle2 className="w-3 h-3 text-emerald-500" />
                   <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-medium">
-                    Up to date
+                    {ts("inSync")}
                   </span>
                 </div>
                 <span className="text-base font-semibold tabular-nums text-foreground block">
-                  {upToDate}
+                  {inSync}
                 </span>
               </div>
               <div className="space-y-0.5">
                 <div className="flex items-center gap-1.5">
                   <AlertCircle className="w-3 h-3 text-amber-500" />
                   <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-medium">
-                    Stale
+                    {ts("stale")}
                   </span>
                 </div>
                 <span className="text-base font-semibold tabular-nums text-foreground block">
@@ -760,7 +764,7 @@ function MentalModelsCard({
                 <div className="flex items-center gap-1.5">
                   <Brain className="w-3 h-3 text-muted-foreground" />
                   <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-medium">
-                    Total
+                    {t("total")}
                   </span>
                 </div>
                 <span className="text-base font-semibold tabular-nums text-foreground block">
@@ -781,13 +785,100 @@ const AXIS_TICK_STYLE = {
   fontWeight: 500,
 };
 
-export function BankStatsView() {
-  const { currentBank } = useBank();
-  const { features } = useFeatures();
-  const observationsEnabled = features?.observations ?? false;
-  const [stats, setStats] = useState<BankStats | null>(null);
-  const [mentalModels, setMentalModels] = useState<MentalModel[]>([]);
-  const [loading, setLoading] = useState(false);
+/**
+ * The "Memory store" summary card (top stat strip + composition + link types).
+ * Exported so the bank Home dashboard can reuse the exact same card.
+ */
+export function MemoryStoreCard({
+  stats,
+  observationsEnabled,
+}: {
+  stats: BankStats;
+  observationsEnabled: boolean;
+}) {
+  const t = useTranslations("bankStats");
+  return (
+    <Card>
+      <CardContent className="p-0">
+        {/* Stat strip */}
+        <div className="grid grid-cols-1 md:grid-cols-3 md:divide-x divide-y md:divide-y-0 divide-border/60">
+          <InlineStat icon={Database} label={t("memories")} value={stats.total_nodes} />
+          <InlineStat icon={FolderOpen} label={t("documents")} value={stats.total_documents} />
+          <InlineStat icon={Link2} label={t("links")} value={stats.total_links} />
+        </div>
+
+        {/* Composition + Link types side by side */}
+        <div className="grid grid-cols-1 md:grid-cols-2 md:divide-x divide-y md:divide-y-0 divide-border/60 border-t border-border/60">
+          <div className="p-5">
+            <Distribution
+              title={t("memoryComposition")}
+              items={[
+                {
+                  name: t("world"),
+                  value: stats.nodes_by_fact_type?.world || 0,
+                  color: CHART_COLORS.world,
+                },
+                {
+                  name: t("experience"),
+                  value: stats.nodes_by_fact_type?.experience || 0,
+                  color: CHART_COLORS.experience,
+                },
+                ...(observationsEnabled
+                  ? [
+                      {
+                        name: t("observations"),
+                        value: stats.total_observations || 0,
+                        color: CHART_COLORS.observation,
+                      },
+                    ]
+                  : []),
+              ]}
+              emptyLabel={t("noMemoriesYet")}
+            />
+          </div>
+          <div className="p-5">
+            <Distribution
+              title={t("linkTypes")}
+              items={[
+                {
+                  name: t("temporal"),
+                  value: stats.links_by_link_type?.temporal || 0,
+                  color: CHART_COLORS.temporal,
+                },
+                {
+                  name: t("semantic"),
+                  value: stats.links_by_link_type?.semantic || 0,
+                  color: CHART_COLORS.semantic,
+                },
+                {
+                  name: t("entity"),
+                  value: stats.links_by_link_type?.entity || 0,
+                  color: CHART_COLORS.entity,
+                },
+              ]}
+              emptyLabel={t("noLinksYet")}
+            />
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * The "Memories by <ingested/mentioned/occurred> time" activity chart — a
+ * self-contained widget (owns its own period/time-field/series state + polling
+ * fetch). Exported so the bank Home dashboard can reuse it.
+ */
+export function MemoriesActivityChart({
+  bankId,
+  observationsEnabled,
+}: {
+  bankId: string;
+  observationsEnabled: boolean;
+}) {
+  const t = useTranslations("bankStats");
+  const timeFieldLabels = getTimeFieldLabels(t as TimeFieldTranslator);
   const [period, setPeriod] = useState<Period>("7d");
   const [timeField, setTimeField] = useState<TimeField>("created_at");
   const [timeseries, setTimeseries] = useState<{ trunc: string; buckets: TimeseriesBucket[] }>({
@@ -800,6 +891,187 @@ export function BankStatsView() {
     observation: true,
   });
 
+  useEffect(() => {
+    if (!bankId) return;
+    const load = async () => {
+      try {
+        const data = await client.getMemoriesTimeseries(bankId, period, timeField);
+        setTimeseries({ trunc: data.trunc, buckets: data.buckets || [] });
+      } catch (error) {
+        console.error("Error loading memories timeseries:", error);
+      }
+    };
+    load();
+    const interval = setInterval(load, 5000);
+    return () => clearInterval(interval);
+  }, [bankId, period, timeField]);
+
+  const factSeries: FactKey[] = observationsEnabled
+    ? ["world", "experience", "observation"]
+    : ["world", "experience"];
+  const chartData = timeseries.buckets.map((b) => ({
+    ...b,
+    label: formatBucketLabel(b.time, timeseries.trunc),
+    tooltipLabel: formatBucketTooltip(b.time, timeseries.trunc),
+  }));
+  const ingestedTotal = chartData.reduce(
+    (sum, b) => sum + factSeries.reduce((s, k) => s + (enabledSeries[k] ? b[k] || 0 : 0), 0),
+    0
+  );
+  const toggleSeries = (k: FactKey) => setEnabledSeries((prev) => ({ ...prev, [k]: !prev[k] }));
+  const factLabel: Record<FactKey, string> = {
+    world: t("world"),
+    experience: t("experience"),
+    observation: t("observations"),
+  };
+
+  return (
+    <Card>
+      <CardHeader className="pb-2 space-y-2">
+        <div className="flex flex-row items-center justify-between">
+          <CardTitle className="text-sm font-semibold">
+            {t("memoriesByTimeChartTitle", {
+              field: timeFieldLabels[timeField].short.toLowerCase(),
+            })}
+          </CardTitle>
+          <div className="flex items-center gap-0.5 rounded-md bg-muted/60 p-0.5">
+            {PERIODS.map((p) => (
+              <button
+                key={p}
+                onClick={() => setPeriod(p)}
+                className={`px-2 py-0.5 text-[11px] font-medium rounded transition-colors tabular-nums ${
+                  period === p
+                    ? "bg-background text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {p}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="flex items-center gap-0.5 rounded-md bg-muted/60 p-0.5 w-fit">
+          {TIME_FIELDS.map((tf) => (
+            <button
+              key={tf}
+              onClick={() => setTimeField(tf)}
+              title={timeFieldLabels[tf].long}
+              className={`px-2 py-0.5 text-[11px] font-medium rounded transition-colors ${
+                timeField === tf
+                  ? "bg-background text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {timeFieldLabels[tf].short}
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-1.5">
+            {factSeries.map((k) => {
+              const meta = FACT_META[k];
+              const on = enabledSeries[k];
+              return (
+                <button
+                  key={k}
+                  onClick={() => toggleSeries(k)}
+                  className={`flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[11px] font-medium transition-all ${
+                    on
+                      ? "bg-muted text-foreground"
+                      : "bg-transparent text-muted-foreground/60 hover:text-muted-foreground"
+                  }`}
+                >
+                  <span
+                    className="w-2 h-2 rounded-[2px] transition-opacity"
+                    style={{ backgroundColor: meta.color, opacity: on ? 1 : 0.3 }}
+                  />
+                  {factLabel[k]}
+                </button>
+              );
+            })}
+          </div>
+          <span className="text-xs text-muted-foreground tabular-nums">
+            <CompactNumber value={ingestedTotal} /> {t("totalSuffix")}
+          </span>
+        </div>
+      </CardHeader>
+      <CardContent>
+        {chartData.length === 0 || ingestedTotal === 0 ? (
+          <div className="h-[180px] flex items-center justify-center text-sm text-muted-foreground">
+            {t("noMemoriesIngestedInPeriod")}
+          </div>
+        ) : (
+          <div className="h-[180px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: -10 }}>
+                <defs>
+                  {factSeries.map((k) => (
+                    <linearGradient key={k} id={`grad-${k}`} x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor={FACT_META[k].color} stopOpacity={0.35} />
+                      <stop offset="100%" stopColor={FACT_META[k].color} stopOpacity={0} />
+                    </linearGradient>
+                  ))}
+                </defs>
+                <CartesianGrid
+                  vertical={false}
+                  stroke={CHART_COLORS.border}
+                  strokeOpacity={0.5}
+                  strokeDasharray="2 4"
+                />
+                <XAxis
+                  dataKey="label"
+                  tick={AXIS_TICK_STYLE}
+                  axisLine={false}
+                  tickLine={false}
+                  dy={4}
+                  minTickGap={20}
+                />
+                <YAxis
+                  tick={AXIS_TICK_STYLE}
+                  axisLine={false}
+                  tickLine={false}
+                  width={40}
+                  allowDecimals={false}
+                  tickFormatter={(v: number) => formatCompact(v)}
+                />
+                <Tooltip
+                  content={<ChartTooltip />}
+                  labelFormatter={(_v, payload) => payload?.[0]?.payload?.tooltipLabel || ""}
+                  cursor={{ stroke: CHART_COLORS.mutedFg, strokeWidth: 1, strokeDasharray: "3 3" }}
+                />
+                {factSeries.map((k) =>
+                  enabledSeries[k] ? (
+                    <Area
+                      key={k}
+                      type="monotone"
+                      dataKey={k}
+                      name={factLabel[k]}
+                      stackId="a"
+                      stroke={FACT_META[k].color}
+                      strokeWidth={2}
+                      fill={`url(#grad-${k})`}
+                      isAnimationActive={false}
+                    />
+                  ) : null
+                )}
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+export function BankStatsView() {
+  const t = useTranslations("bankStats");
+  const { currentBank } = useBank();
+  const { features } = useFeatures();
+  const observationsEnabled = features?.observations ?? false;
+  const [stats, setStats] = useState<BankStats | null>(null);
+  const [mentalModels, setMentalModels] = useState<MentalModelSummary[]>([]);
+  const [loading, setLoading] = useState(false);
+
   const loadData = async () => {
     if (!currentBank) return;
 
@@ -807,24 +1079,17 @@ export function BankStatsView() {
     try {
       const [statsData, mentalModelsData] = await Promise.all([
         client.getBankStats(currentBank),
-        client.listMentalModels(currentBank),
+        // The card counts every model's freshness, so it needs the whole set, not
+        // the first page. It reloads every few seconds — metadata keeps the stored
+        // reflect payloads off the wire.
+        client.listAllMentalModels(currentBank, { detail: "metadata" }),
       ]);
       setStats(statsData as BankStats);
-      setMentalModels(mentalModelsData.items || []);
+      setMentalModels(mentalModelsData);
     } catch (error) {
       console.error("Error loading bank stats:", error);
     } finally {
       setLoading(false);
-    }
-  };
-
-  const loadTimeseries = async () => {
-    if (!currentBank) return;
-    try {
-      const data = await client.getMemoriesTimeseries(currentBank, period, timeField);
-      setTimeseries({ trunc: data.trunc, buckets: data.buckets || [] });
-    } catch (error) {
-      console.error("Error loading memories timeseries:", error);
     }
   };
 
@@ -836,116 +1101,35 @@ export function BankStatsView() {
     }
   }, [currentBank]);
 
-  useEffect(() => {
-    if (currentBank) {
-      loadTimeseries();
-      const interval = setInterval(loadTimeseries, 5000);
-      return () => clearInterval(interval);
-    }
-  }, [currentBank, period, timeField]);
-
   if (loading && !stats) {
     return (
       <div className="flex items-center justify-center py-12">
-        <Clock className="w-12 h-12 mx-auto mb-3 text-muted-foreground animate-pulse" />
+        <Spinner size="lg" variant="jump" className="mx-auto mb-3" />
       </div>
     );
   }
 
   if (!stats) return null;
 
-  const factSeries: FactKey[] = observationsEnabled
-    ? ["world", "experience", "observation"]
-    : ["world", "experience"];
-
-  const chartData = timeseries.buckets.map((b) => ({
-    ...b,
-    label: formatBucketLabel(b.time, timeseries.trunc),
-    tooltipLabel: formatBucketTooltip(b.time, timeseries.trunc),
-  }));
-  const ingestedTotal = chartData.reduce(
-    (sum, b) => sum + factSeries.reduce((s, k) => s + (enabledSeries[k] ? b[k] || 0 : 0), 0),
-    0
+  // Done / pending / failed are shown side by side and must not overlap: the API's
+  // pending_consolidation already excludes permanently failed memories, so those are
+  // subtracted here too rather than being counted as done.
+  const consolidatedDone = Math.max(
+    0,
+    stats.total_nodes - stats.pending_consolidation - (stats.failed_consolidation ?? 0)
   );
-
-  const toggleSeries = (k: FactKey) => setEnabledSeries((prev) => ({ ...prev, [k]: !prev[k] }));
-
-  const consolidatedDone = Math.max(0, stats.total_nodes - stats.pending_consolidation);
 
   return (
     <div className="space-y-8">
       {/* MEMORY STORE — unified card: top stat strip + composition + link types */}
       <section>
-        <SectionHeading>Memory store</SectionHeading>
-        <Card>
-          <CardContent className="p-0">
-            {/* Stat strip */}
-            <div className="grid grid-cols-1 md:grid-cols-3 md:divide-x divide-y md:divide-y-0 divide-border/60">
-              <InlineStat icon={Database} label="Memories" value={stats.total_nodes} />
-              <InlineStat icon={FolderOpen} label="Documents" value={stats.total_documents} />
-              <InlineStat icon={Link2} label="Links" value={stats.total_links} />
-            </div>
-
-            {/* Composition + Link types side by side */}
-            <div className="grid grid-cols-1 md:grid-cols-2 md:divide-x divide-y md:divide-y-0 divide-border/60 border-t border-border/60">
-              <div className="p-5">
-                <Distribution
-                  title="Memory composition"
-                  items={[
-                    {
-                      name: "World",
-                      value: stats.nodes_by_fact_type?.world || 0,
-                      color: CHART_COLORS.world,
-                    },
-                    {
-                      name: "Experience",
-                      value: stats.nodes_by_fact_type?.experience || 0,
-                      color: CHART_COLORS.experience,
-                    },
-                    ...(observationsEnabled
-                      ? [
-                          {
-                            name: "Observations",
-                            value: stats.total_observations || 0,
-                            color: CHART_COLORS.observation,
-                          },
-                        ]
-                      : []),
-                  ]}
-                  emptyLabel="No memories yet"
-                />
-              </div>
-              <div className="p-5">
-                <Distribution
-                  title="Link types"
-                  items={[
-                    {
-                      name: "Temporal",
-                      value: stats.links_by_link_type?.temporal || 0,
-                      color: CHART_COLORS.temporal,
-                    },
-                    {
-                      name: "Semantic",
-                      value: stats.links_by_link_type?.semantic || 0,
-                      color: CHART_COLORS.semantic,
-                    },
-                    {
-                      name: "Entity",
-                      value: stats.links_by_link_type?.entity || 0,
-                      color: CHART_COLORS.entity,
-                    },
-                  ]}
-                  emptyLabel="No links yet"
-                />
-              </div>
-            </div>
-          </CardContent>
-        </Card>
+        <SectionHeading>{t("memoryStore")}</SectionHeading>
+        <MemoryStoreCard stats={stats} observationsEnabled={observationsEnabled} />
       </section>
 
       {/* CONSOLIDATION */}
       <section>
-        <SectionHeading>Consolidation</SectionHeading>
+        <SectionHeading>{t("consolidation")}</SectionHeading>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <ConsolidationCard
             done={consolidatedDone}
@@ -954,153 +1138,22 @@ export function BankStatsView() {
             total={stats.total_nodes}
             lastConsolidatedAt={stats.last_consolidated_at}
           />
-          <MentalModelsCard models={mentalModels} lastConsolidatedAt={stats.last_consolidated_at} />
+          <MentalModelsCard models={mentalModels} />
         </div>
       </section>
 
       {/* ACTIVITY */}
       <section>
-        <SectionHeading>Activity</SectionHeading>
+        <SectionHeading>{t("activity")}</SectionHeading>
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <Card className="lg:col-span-2">
-            <CardHeader className="pb-2 space-y-2">
-              <div className="flex flex-row items-center justify-between">
-                <CardTitle className="text-sm font-semibold">
-                  Memories by {TIME_FIELD_LABELS[timeField].short.toLowerCase()} time
-                </CardTitle>
-                <div className="flex items-center gap-0.5 rounded-md bg-muted/60 p-0.5">
-                  {PERIODS.map((p) => (
-                    <button
-                      key={p}
-                      onClick={() => setPeriod(p)}
-                      className={`px-2 py-0.5 text-[11px] font-medium rounded transition-colors tabular-nums ${
-                        period === p
-                          ? "bg-background text-foreground shadow-sm"
-                          : "text-muted-foreground hover:text-foreground"
-                      }`}
-                    >
-                      {p}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <div className="flex items-center gap-0.5 rounded-md bg-muted/60 p-0.5 w-fit">
-                {TIME_FIELDS.map((tf) => (
-                  <button
-                    key={tf}
-                    onClick={() => setTimeField(tf)}
-                    title={TIME_FIELD_LABELS[tf].long}
-                    className={`px-2 py-0.5 text-[11px] font-medium rounded transition-colors ${
-                      timeField === tf
-                        ? "bg-background text-foreground shadow-sm"
-                        : "text-muted-foreground hover:text-foreground"
-                    }`}
-                  >
-                    {TIME_FIELD_LABELS[tf].short}
-                  </button>
-                ))}
-              </div>
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-1.5">
-                  {factSeries.map((k) => {
-                    const meta = FACT_META[k];
-                    const on = enabledSeries[k];
-                    return (
-                      <button
-                        key={k}
-                        onClick={() => toggleSeries(k)}
-                        className={`flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[11px] font-medium transition-all ${
-                          on
-                            ? "bg-muted text-foreground"
-                            : "bg-transparent text-muted-foreground/60 hover:text-muted-foreground"
-                        }`}
-                      >
-                        <span
-                          className="w-2 h-2 rounded-[2px] transition-opacity"
-                          style={{
-                            backgroundColor: meta.color,
-                            opacity: on ? 1 : 0.3,
-                          }}
-                        />
-                        {meta.label}
-                      </button>
-                    );
-                  })}
-                </div>
-                <span className="text-xs text-muted-foreground tabular-nums">
-                  <CompactNumber value={ingestedTotal} /> total
-                </span>
-              </div>
-            </CardHeader>
-            <CardContent>
-              {chartData.length === 0 || ingestedTotal === 0 ? (
-                <div className="h-[180px] flex items-center justify-center text-sm text-muted-foreground">
-                  No memories ingested in this period
-                </div>
-              ) : (
-                <div className="h-[180px]">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: -10 }}>
-                      <defs>
-                        {factSeries.map((k) => (
-                          <linearGradient key={k} id={`grad-${k}`} x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="0%" stopColor={FACT_META[k].color} stopOpacity={0.35} />
-                            <stop offset="100%" stopColor={FACT_META[k].color} stopOpacity={0} />
-                          </linearGradient>
-                        ))}
-                      </defs>
-                      <CartesianGrid
-                        vertical={false}
-                        stroke={CHART_COLORS.border}
-                        strokeOpacity={0.5}
-                        strokeDasharray="2 4"
-                      />
-                      <XAxis
-                        dataKey="label"
-                        tick={AXIS_TICK_STYLE}
-                        axisLine={false}
-                        tickLine={false}
-                        dy={4}
-                        minTickGap={20}
-                      />
-                      <YAxis
-                        tick={AXIS_TICK_STYLE}
-                        axisLine={false}
-                        tickLine={false}
-                        width={40}
-                        allowDecimals={false}
-                        tickFormatter={(v: number) => formatCompact(v)}
-                      />
-                      <Tooltip
-                        content={<ChartTooltip />}
-                        labelFormatter={(_v, payload) => payload?.[0]?.payload?.tooltipLabel || ""}
-                        cursor={{
-                          stroke: CHART_COLORS.mutedFg,
-                          strokeWidth: 1,
-                          strokeDasharray: "3 3",
-                        }}
-                      />
-                      {factSeries.map((k) =>
-                        enabledSeries[k] ? (
-                          <Area
-                            key={k}
-                            type="monotone"
-                            dataKey={k}
-                            name={FACT_META[k].label}
-                            stackId="a"
-                            stroke={FACT_META[k].color}
-                            strokeWidth={2}
-                            fill={`url(#grad-${k})`}
-                            isAnimationActive={false}
-                          />
-                        ) : null
-                      )}
-                    </AreaChart>
-                  </ResponsiveContainer>
-                </div>
-              )}
-            </CardContent>
-          </Card>
+          <div className="lg:col-span-2">
+            {currentBank && (
+              <MemoriesActivityChart
+                bankId={currentBank}
+                observationsEnabled={observationsEnabled}
+              />
+            )}
+          </div>
 
           <OperationsCard byStatus={stats.operations_by_status || {}} />
         </div>

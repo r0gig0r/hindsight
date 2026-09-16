@@ -2,8 +2,9 @@
 OpenAI Codex LLM provider using ChatGPT Plus/Pro OAuth authentication.
 
 This provider enables using ChatGPT Plus/Pro subscriptions for API calls
-without separate OpenAI Platform API credits. It uses OAuth tokens from
-~/.codex/auth.json and communicates with the ChatGPT backend API.
+without separate OpenAI Platform API credits. It uses OAuth tokens from the
+Codex ``auth.json`` (``$CODEX_HOME/auth.json``, or ``~/.codex/auth.json`` when
+``CODEX_HOME`` is unset) and communicates with the ChatGPT backend API.
 
 Tokens are refreshed automatically: the provider decodes the access_token
 JWT's ``exp`` claim and proactively refreshes via
@@ -15,54 +16,175 @@ so that future server-side changes affect both clients identically.
 """
 
 import asyncio
-import base64
-import binascii
+import codecs
 import json
 import logging
-import os
-import tempfile
+import re
 import time
 import uuid
-from datetime import datetime, timezone
+from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-import httpx
+import aiohttp
 
-from hindsight_api.engine.llm_interface import LLMInterface, OutputTooLongError
+from hindsight_api.engine.aiohttp_session import LoopLocalSession, UpstreamHTTPError, raise_for_status
+from hindsight_api.engine.llm_interface import (
+    LLM_TOOL_CHOICE_AUTO,
+    LLMInterface,
+    LLMToolChoice,
+    LLMToolChoiceMode,
+    ProviderRateLimitResetError,
+)
+from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
+from hindsight_api.engine.llm_transport import build_aiohttp_timeout
+from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
+from hindsight_api.engine.structured_output import provider_json_schema, strict_json_schema
 from hindsight_api.metrics import get_metrics_collector
+from hindsight_api.worker.stage import set_stage
+
+from ..response_models import LLMCallResult
+from .codex_auth import (
+    _CODEX_CLIENT_ID,
+    _CODEX_REFRESH_TOKEN_URL,
+    _CODEX_TERMINAL_REFRESH_ERROR_CODES,
+    _CODEX_TOKEN_REFRESH_SKEW_SECONDS,
+    CodexAuthManager,
+    CodexRefreshExpiredError,
+    default_codex_auth_file,
+)
+
+# Re-export for backward compatibility (tests import from this module).
+__all__ = [
+    "CodexLLM",
+    "CodexRefreshExpiredError",
+    "CodexAuthManager",
+    "_CODEX_REFRESH_TOKEN_URL",
+    "_CODEX_CLIENT_ID",
+    "_CODEX_TOKEN_REFRESH_SKEW_SECONDS",
+    "_CODEX_TERMINAL_REFRESH_ERROR_CODES",
+]
 
 logger = logging.getLogger(__name__)
 
+# Newer Codex models are gated on the first-party client identity; the previous
+# browser-shaped User-Agent returned "Model not found" for Luna (#2643).
+# Use a neutral version because Hindsight must not claim a specific Codex release.
+_CODEX_ORIGINATOR = "codex_cli_rs"
+_CODEX_USER_AGENT = "codex_cli_rs/0.0.0 (Hindsight)"
 
-# OAuth refresh endpoint and client id, mirrored from the canonical
-# ``@openai/codex`` CLI (codex-rs/login/src/auth/manager.rs on
-# github.com/openai/codex). The endpoint is overridable via env var so that
-# future Codex changes or staging environments can be pointed at without a
-# code change — same env var name the upstream CLI uses.
-_CODEX_REFRESH_TOKEN_URL = os.environ.get("CODEX_REFRESH_TOKEN_URL_OVERRIDE", "https://auth.openai.com/oauth/token")
-_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+# Name of the single forced function tool used to carry structured output when
+# strict_schema is on. The Codex backend speaks the OpenAI Responses API, so a
+# forced function call gives us constrained decoding straight into the response
+# schema — no prompt-injected schema, no raw json.loads on free-form model text,
+# no invalid-\escape retry storm (issue #2504, same class as #1002 / #2339).
+_STRUCTURED_TOOL_NAME = "structured_response"
 
-# Proactively refresh this many seconds before the JWT ``exp`` claim. The
-# upstream Codex CLI uses no skew (it refreshes at ``exp <= now``); the
-# extra window reduces races where a request leaves the client with a token
-# that the server has already declared expired by the time it arrives.
-_CODEX_TOKEN_REFRESH_SKEW_SECONDS = 60
-
-# OAuth error codes that the refresh endpoint returns when the refresh_token
-# itself is no longer usable. These are terminal — retrying refresh will not
-# succeed; the user must re-run ``codex auth login``.
-_CODEX_TERMINAL_REFRESH_ERROR_CODES = frozenset(
-    {"refresh_token_expired", "refresh_token_reused", "refresh_token_invalidated"}
-)
+# Valid JSON string escape characters (the char that may follow a backslash).
+_VALID_JSON_ESCAPE_CHARS = set('"\\/bfnrtu')
 
 
-class CodexRefreshExpiredError(RuntimeError):
-    """Raised when the Codex refresh_token itself is no longer valid.
+def _repair_invalid_json_escapes(text: str) -> str:
+    """Best-effort repair of invalid ``\\escape`` sequences in a JSON string.
 
-    The user must re-run ``codex auth login`` to obtain new credentials.
-    Callers should surface a clear remediation message and stop retrying.
+    Escape-heavy content (code, serial/CLI commands, Windows paths, regexes)
+    makes weaker models emit backslashes that aren't valid JSON escapes (e.g.
+    ``\\d``, ``\\s``, ``C:\\Users``), so ``json.loads`` fails deterministically
+    and every retry re-fails the same way (issue #2504). This doubles any
+    backslash that isn't part of a valid escape so the payload parses. It is a
+    lenient fallback only — the strict_schema forced-tool path is the real fix.
+    """
+    result: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt in _VALID_JSON_ESCAPE_CHARS:
+                # Preserve the valid escape (both chars) verbatim.
+                result.append(ch)
+                result.append(nxt)
+                i += 2
+                continue
+            # Invalid escape: escape the lone backslash so JSON parses.
+            result.append("\\\\")
+            i += 1
+            continue
+        if ch == "\\" and i + 1 == n:
+            # Trailing lone backslash — escape it.
+            result.append("\\\\")
+            i += 1
+            continue
+        result.append(ch)
+        i += 1
+    return "".join(result)
+
+
+# Fallback per-request deadline when the caller resolved no timeout (direct
+# construction, tests). Configured deployments always pass one down from
+# ``llm_timeout`` / the per-operation override.
+_DEFAULT_CODEX_TIMEOUT = 120.0
+
+# Hard ceiling on one SSE response body, counted in decoded characters (so a
+# multi-byte body is cut off a little later than the name suggests, which is
+# fine for a backstop). The Codex backend can wedge
+# into runaway generation and emit megabytes of deltas for a request whose real
+# answer is a few hundred bytes (issue #3898); a structured-output call bounded
+# by ``max_completion_tokens`` never approaches this, so blowing past it means
+# the stream is not going to end on its own.
+_MAX_SSE_BODY_CHARS = 4 * 1024 * 1024
+
+
+# The characters ``str.splitlines`` breaks a line on.
+_LINE_BREAK_RE = re.compile("[\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+
+
+def _codex_quota_retry_at(error: UpstreamHTTPError) -> datetime | None:
+    """Return a future reset time from a Codex usage-limit response."""
+    if error.status_code != 429:
+        return None
+    try:
+        payload = json.loads(error.body)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict) or error.get("type") != "usage_limit_reached":
+        return None
+    resets_at = error.get("resets_at")
+    if isinstance(resets_at, bool) or not isinstance(resets_at, (int, float)):
+        return None
+    try:
+        retry_at = datetime.fromtimestamp(resets_at, UTC)
+    except (OSError, OverflowError, ValueError):
+        return None
+    return retry_at if retry_at > datetime.now(UTC) else None
+
+
+def _raise_codex_quota_defer(
+    error: UpstreamHTTPError, *, provider: str, model: str, scope: str, max_backoff: float
+) -> None:
+    """Turn a long Codex quota window into the engine's defer signal."""
+    retry_at = _codex_quota_retry_at(error)
+    if retry_at is None or (retry_at - datetime.now(UTC)).total_seconds() <= max_backoff:
+        return
+    raise ProviderRateLimitResetError(
+        retry_at=retry_at,
+        message=f"Codex quota exhausted ({provider}/{model}, scope={scope}); retry at {retry_at.isoformat()}",
+    )
+
+
+class CodexRunawayStreamError(aiohttp.ClientPayloadError):
+    """The backend streamed past the deadline or the body-size ceiling.
+
+    Deliberately an ``aiohttp.ClientPayloadError``: a runaway stream is a
+    transport-level failure, so ``call()`` retries it with backoff alongside every
+    other ``aiohttp.ClientError`` and ``remote_retry`` classifies it as transient.
     """
 
 
@@ -70,49 +192,68 @@ class CodexLLM(LLMInterface):
     """
     LLM provider using OpenAI Codex OAuth authentication.
 
-    Authenticates using ChatGPT Plus/Pro credentials stored in ~/.codex/auth.json
-    and makes API calls to chatgpt.com/backend-api/codex/responses.
+    Authenticates using ChatGPT Plus/Pro credentials stored in the Codex
+    ``auth.json`` (``codex_home`` if given, else ``CODEX_HOME``, else
+    ``~/.codex``) and makes API calls to chatgpt.com/backend-api/codex/responses.
     """
 
     def __init__(
         self,
         provider: str,
-        api_key: str,  # Will be ignored, reads from ~/.codex/auth.json
+        api_key: str,  # Will be ignored, reads from the Codex auth.json (CODEX_HOME or ~/.codex)
         base_url: str,
         model: str,
-        reasoning_effort: str = "low",
+        reasoning_effort: str | None = None,
+        extra_body: dict[str, Any] | None = None,
+        codex_home: str | None = None,
         **kwargs: Any,
     ):
-        """Initialize Codex LLM provider."""
+        """Initialize Codex LLM provider.
+
+        ``codex_home`` selects this instance's credentials directory (its
+        ``auth.json``), overriding the process-wide ``CODEX_HOME``. Two members
+        of a multi-LLM chain can therefore run as two independently authorized
+        ChatGPT profiles.
+        """
         super().__init__(provider, api_key, base_url, model, reasoning_effort, **kwargs)
 
-        # Path is fixed at ~/.codex/auth.json — matches the upstream CLI.
-        # Storing it on self lets the refresh path re-read after another
-        # process (e.g. a sidecar) rotates the file out from under us.
-        self._auth_file = Path.home() / ".codex" / "auth.json"
+        # Resolved once: every auth read/write on this instance uses this path,
+        # never the process-wide default.
+        self._codex_home = codex_home
 
-        # Single-flight refresh lock. Multiple concurrent requests racing
-        # toward an expired token should produce one network refresh, not N.
-        self._auth_lock = asyncio.Lock()
-
-        # Load Codex OAuth credentials
+        # Load Codex OAuth credentials (keep these methods for test patching).
         try:
-            self.access_token, self.account_id = self._load_codex_auth()
-            self.refresh_token = self._load_codex_refresh_token()
-            logger.info(f"Loaded Codex OAuth credentials for account: {self.account_id}")
+            access_token, account_id = self._load_codex_auth()
+            refresh_token = self._load_codex_refresh_token()
+            logger.info(f"Loaded Codex OAuth credentials for account: {account_id}")
         except Exception as e:
+            auth_file = default_codex_auth_file(self._codex_home)
             raise RuntimeError(
-                f"Failed to load Codex OAuth credentials from ~/.codex/auth.json: {e}\n\n"
+                f"Failed to load Codex OAuth credentials from {auth_file}: {e}\n\n"
                 "To set up Codex authentication:\n"
                 "1. Install Codex CLI: npm install -g @openai/codex\n"
                 "2. Login: codex auth login\n"
-                "3. Verify: ls ~/.codex/auth.json\n\n"
+                f"3. Verify: ls {auth_file}\n\n"
+                "(Set CODEX_HOME to use a credentials directory other than ~/.codex.)\n\n"
                 "Or use a different provider (openai, anthropic, gemini) with API keys."
             ) from e
 
-        # Use ChatGPT backend API endpoint
-        if not self.base_url:
+        self._auth_manager = CodexAuthManager(
+            access_token=access_token,
+            account_id=account_id,
+            refresh_token=refresh_token,
+            auth_file=default_codex_auth_file(self._codex_home),
+        )
+
+        # Use ChatGPT backend API endpoint. Codex auth is tied to
+        # chatgpt.com/backend-api, not the OpenAI-compatible base URL used by
+        # other providers. Deployments often set a global LLM_BASE_URL for an
+        # OpenAI-compatible proxy; ignore that inherited value unless the user
+        # explicitly provides a Codex backend URL.
+        if not self.base_url or self.base_url.rstrip("/").endswith("/v1"):
             self.base_url = "https://chatgpt.com/backend-api"
+        else:
+            self.base_url = self.base_url.rstrip("/")
 
         # Normalize model name (strip openai/ prefix if present)
         if self.model.startswith("openai/"):
@@ -124,16 +265,74 @@ class CodexLLM(LLMInterface):
 
         self.model = resolve_codex_model(self.model)
 
-        # Map reasoning effort to Codex reasoning summary format
-        # Codex supports: "auto", "concise", "detailed"
+        # Reasoning summary controls presentation separately from the backend's
+        # reasoning effort, which is sent unchanged in each request payload.
         self.reasoning_summary = self._map_reasoning_effort(reasoning_effort)
+        self._extra_body = dict(extra_body or {})
 
-        # HTTP client for SSE streaming
-        self._client = httpx.AsyncClient(timeout=120.0)
+        # Per-request deadline. ``self.timeout`` is resolved by the caller from
+        # ``llm_timeout`` / the per-operation override; the literal below is only
+        # the unconfigured fallback.
+        self._request_timeout = self.timeout or _DEFAULT_CODEX_TIMEOUT
+
+        # HTTP session for SSE streaming, one per event loop. Its timeouts are
+        # per-phase (per socket read), so they bound a *silent* backend only — a
+        # stream that keeps delivering bytes never trips them. The total deadline
+        # in ``_stream_request`` is what bounds a talkative one. The connect leg is
+        # capped independently so an unreachable backend fails in seconds instead
+        # of consuming the whole deadline (issue #3881).
+        self._session = LoopLocalSession(timeout=build_aiohttp_timeout(self._request_timeout))
+
+    # ------------------------------------------------------------------
+    # Properties — delegate to _auth_manager (preserves test-visible API)
+    # ------------------------------------------------------------------
+
+    @property
+    def access_token(self) -> str:
+        return self._auth_manager.access_token
+
+    @access_token.setter
+    def access_token(self, v: str) -> None:
+        self._auth_manager.access_token = v
+
+    @property
+    def account_id(self) -> str:
+        return self._auth_manager.account_id
+
+    def _build_request_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+            "OpenAI-Account-ID": self.account_id,
+            "User-Agent": _CODEX_USER_AGENT,
+            "Origin": "https://chatgpt.com",
+            "originator": _CODEX_ORIGINATOR,
+        }
+
+    @property
+    def refresh_token(self) -> str | None:
+        return self._auth_manager.refresh_token
+
+    @refresh_token.setter
+    def refresh_token(self, v: str | None) -> None:
+        self._auth_manager.refresh_token = v
+
+    @property
+    def _auth_file(self) -> Path:
+        return self._auth_manager._auth_file
+
+    @_auth_file.setter
+    def _auth_file(self, v: Path) -> None:
+        self._auth_manager._auth_file = v
+
+    # ------------------------------------------------------------------
+    # Forwarding methods (keep surface area for tests / subclasses)
+    # ------------------------------------------------------------------
 
     def _load_codex_auth(self) -> tuple[str, str]:
         """
-        Load OAuth credentials from ~/.codex/auth.json.
+        Load OAuth credentials from this instance's Codex ``auth.json``
+        (``codex_home``, else ``CODEX_HOME``, else ``~/.codex``).
 
         Returns:
             Tuple of (access_token, account_id).
@@ -142,7 +341,7 @@ class CodexLLM(LLMInterface):
             FileNotFoundError: If auth file doesn't exist.
             ValueError: If auth file is invalid.
         """
-        auth_file = Path.home() / ".codex" / "auth.json"
+        auth_file = default_codex_auth_file(self._codex_home)
 
         if not auth_file.exists():
             raise FileNotFoundError(
@@ -167,273 +366,51 @@ class CodexLLM(LLMInterface):
         return access_token, account_id
 
     def _load_codex_refresh_token(self) -> str | None:
-        """Load ``tokens.refresh_token`` from ``~/.codex/auth.json``.
+        """Read ``tokens.refresh_token`` from the configured auth file.
 
-        Returns None when the auth file is unreadable or omits the field —
-        the provider still functions as a one-shot loader in that case, it
-        just can't refresh when the access_token expires. This deliberately
-        does not raise so that ``__init__`` keeps the existing failure mode
-        of raising only on missing ``access_token``.
+        Kept as an instance method so existing tests that patch
+        ``CodexLLM._load_codex_refresh_token`` continue to work. Works both
+        pre- and post-``__init__`` because it does not depend on
+        ``_auth_manager`` being constructed yet.
         """
-        try:
-            with open(self._auth_file) as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
-            logger.warning(
-                f"Codex auth file unreadable when loading refresh_token: {type(e).__name__}. "
-                "Token refresh will not be available; the access_token in memory will be used until it expires."
-            )
-            return None
-        return data.get("tokens", {}).get("refresh_token")
+        auth_file = (
+            self._auth_manager._auth_file
+            if hasattr(self, "_auth_manager")
+            else default_codex_auth_file(self._codex_home)
+        )
+        return CodexAuthManager.load_refresh_token_from_file(auth_file)
 
     @staticmethod
     def _decode_jwt_exp_unixtime(token: str) -> int | None:
-        """Return the JWT ``exp`` claim as a unix timestamp, or None on parse failure.
-
-        ChatGPT/Codex access_tokens are JWTs whose payload includes ``exp``
-        (RFC 7519). We need the expiry to schedule proactive refresh — the
-        ``auth.json`` file does not persist a separate ``expires_at`` field
-        in the upstream CLI's shape, so decoding the JWT itself is the
-        canonical way to know when the token is stale.
-
-        We do not verify the signature — the server is the source of truth
-        on whether the token is actually accepted, and the only thing this
-        method affects is the *timing* of refresh, not whether to trust the
-        token contents.
-        """
-        try:
-            parts = token.split(".")
-            if len(parts) < 2:
-                return None
-            payload_b64 = parts[1]
-            # JWT uses base64url without padding. Re-pad before decoding.
-            padding = "=" * (-len(payload_b64) % 4)
-            payload_bytes = base64.urlsafe_b64decode(payload_b64 + padding)
-            payload = json.loads(payload_bytes.decode("utf-8"))
-            exp = payload.get("exp")
-            return int(exp) if exp is not None else None
-        except (ValueError, TypeError, json.JSONDecodeError, binascii.Error):
-            return None
+        """Delegate to ``CodexAuthManager._decode_jwt_exp_unixtime``."""
+        return CodexAuthManager._decode_jwt_exp_unixtime(token)
 
     def _token_is_stale(self, skew_seconds: int = _CODEX_TOKEN_REFRESH_SKEW_SECONDS) -> bool:
-        """True when the cached access_token is past expiry (with skew).
-
-        Returns False when expiry cannot be determined — we'd rather use a
-        possibly-expired token and recover via the reactive 401 path than
-        refresh aggressively on every request when ``exp`` parsing fails.
-        """
-        exp = self._decode_jwt_exp_unixtime(self.access_token)
-        if exp is None:
-            return False
-        return exp <= int(time.time()) + skew_seconds
+        """Delegate to ``_auth_manager._token_is_stale``."""
+        return self._auth_manager._token_is_stale(skew_seconds)
 
     def _persist_auth_atomic(self, updated_tokens: dict[str, Any]) -> None:
-        """Write the rotated tokens back to ``~/.codex/auth.json`` atomically.
-
-        Strategy: re-read the on-disk auth.json (so we don't clobber fields
-        another process may have added), patch ``tokens.*`` and
-        ``last_refresh``, write to a tempfile in the same directory with
-        mode 0600, then ``os.replace`` onto the target. ``os.replace`` is
-        atomic within the same filesystem on POSIX and Windows, so a
-        concurrent reader will see either the old file or the fully-written
-        new file — never a partial truncate, which is the upstream CLI's
-        worst-case race.
-
-        On non-Unix platforms the chmod is a best-effort no-op; the parent
-        directory permissions still bound access.
-        """
-        current: dict[str, Any]
-        try:
-            with open(self._auth_file) as f:
-                loaded = json.load(f)
-            # auth.json should always be a JSON object at the top level; if
-            # someone has hand-edited it into a non-object shape, fall back
-            # to the minimal default rather than crashing the refresh path.
-            current = loaded if isinstance(loaded, dict) else {"auth_mode": "chatgpt", "tokens": {}}
-        except (OSError, json.JSONDecodeError):
-            # If the file became unreadable between our last read and now,
-            # construct a minimal shape rather than refusing to persist.
-            current = {"auth_mode": "chatgpt", "tokens": {}}
-
-        existing_tokens = current.get("tokens")
-        tokens: dict[str, Any] = existing_tokens if isinstance(existing_tokens, dict) else {}
-        for key in ("access_token", "refresh_token", "id_token", "account_id"):
-            if key in updated_tokens and updated_tokens[key] is not None:
-                tokens[key] = updated_tokens[key]
-        current["tokens"] = tokens
-        current["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-        # Write to a sibling tempfile so the rename is same-filesystem.
-        parent = self._auth_file.parent
-        parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(prefix=".auth.", suffix=".json.tmp", dir=str(parent))
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(current, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            try:
-                os.chmod(tmp_path, 0o600)
-            except OSError:
-                pass  # best-effort on platforms that don't support chmod
-            os.replace(tmp_path, self._auth_file)
-        except Exception:
-            # Clean up the orphaned tempfile if rename fails.
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        """Delegate to ``_auth_manager._persist_auth_atomic``."""
+        return self._auth_manager._persist_auth_atomic(updated_tokens)
 
     async def _refresh_oauth_tokens(self, reason: str = "", *, force: bool = False) -> None:
-        """Refresh the OAuth access_token using the stored refresh_token.
+        """Single-flight OAuth token refresh, delegated to the auth manager.
 
-        Single-flight: serialized through ``self._auth_lock`` so concurrent
-        callers produce one network request. The first caller refreshes; the
-        rest wake up and observe that either (a) the in-memory token is no
-        longer stale (proactive case) or (b) the in-memory token has changed
-        since they entered (reactive case), and return without re-refreshing.
+        The manager serialises refreshes per auth file (``oauth_store_lock``),
+        so concurrent coroutines racing toward an expired token produce one
+        network refresh.
 
         Args:
             reason: Free-form string included in log lines for diagnostics.
             force: When True, refresh even if the JWT exp claim looks fresh.
-                Used by the reactive 401 path — the server rejected the
-                token, so we cannot trust the JWT's self-reported expiry.
+                Used by the reactive 401 path.
 
         Raises:
             CodexRefreshExpiredError: when the server returns a terminal
-                error code (refresh_token_expired/reused/invalidated) or any
-                401 on the refresh endpoint itself.
+                error code or any 401 on the refresh endpoint.
             RuntimeError: for other refresh failures (network, 5xx, etc.).
         """
-        # Capture the token we'd be refreshing BEFORE acquiring the lock so
-        # that we can detect mid-wait rotation by another coroutine.
-        token_before_lock = self.access_token
-        async with self._auth_lock:
-            if force:
-                # Reactive: skip only if another coroutine already rotated
-                # the token while we were waiting on the lock.
-                if self.access_token != token_before_lock:
-                    return
-            else:
-                # Proactive: skip if the token is no longer stale (the
-                # canonical "another coroutine refreshed first" check).
-                if not self._token_is_stale():
-                    return
-
-            if not self.refresh_token:
-                raise RuntimeError(
-                    "Codex access_token is expired but no refresh_token is available. "
-                    "Run 'codex auth login' to re-authenticate."
-                )
-
-            log_reason = f" ({reason})" if reason else ""
-            logger.info(f"Refreshing Codex OAuth access_token{log_reason}")
-
-            request_body = {
-                "client_id": _CODEX_CLIENT_ID,
-                "grant_type": "refresh_token",
-                "refresh_token": self.refresh_token,
-            }
-            try:
-                response = await self._client.post(
-                    _CODEX_REFRESH_TOKEN_URL,
-                    json=request_body,
-                    headers={"Content-Type": "application/json"},
-                    timeout=30.0,
-                )
-            except httpx.RequestError as e:
-                raise RuntimeError(f"Codex OAuth refresh network error: {type(e).__name__}") from e
-
-            if response.status_code == 401:
-                # Classify by ``error.code`` (or top-level ``error`` string) — same
-                # mapping as the upstream Rust CLI's request_chatgpt_token_refresh.
-                error_code = self._extract_oauth_error_code(response)
-                if error_code in _CODEX_TERMINAL_REFRESH_ERROR_CODES:
-                    raise CodexRefreshExpiredError(
-                        f"Codex refresh_token is permanently invalid (error.code={error_code}). "
-                        "Run 'codex auth login' to re-authenticate."
-                    )
-                # Unknown 401 — treat as terminal too, matching the upstream classification.
-                raise CodexRefreshExpiredError(
-                    f"Codex OAuth refresh returned 401 with unrecognized error code "
-                    f"({error_code or 'none'}). Run 'codex auth login' to re-authenticate."
-                )
-
-            if response.status_code >= 400:
-                # 5xx and other 4xx are transient/retryable from the caller's
-                # perspective; surface as RuntimeError without leaking the
-                # request body in logs.
-                raise RuntimeError(f"Codex OAuth refresh failed with HTTP {response.status_code}")
-
-            try:
-                body = response.json()
-            except json.JSONDecodeError as e:
-                raise RuntimeError(f"Codex OAuth refresh returned non-JSON body: {e}") from e
-
-            new_access = body.get("access_token")
-            if not new_access:
-                raise RuntimeError("Codex OAuth refresh returned no access_token")
-
-            # The refresh_token may rotate on each refresh — adopt the new
-            # one if the server sent it, otherwise keep the existing.
-            new_refresh = body.get("refresh_token") or self.refresh_token
-            new_id_token = body.get("id_token")
-
-            # Update in-memory state first so callers waiting on the lock
-            # see fresh credentials immediately, even if disk write fails.
-            self.access_token = new_access
-            self.refresh_token = new_refresh
-
-            persisted = {
-                "access_token": new_access,
-                "refresh_token": new_refresh,
-            }
-            if new_id_token:
-                persisted["id_token"] = new_id_token
-
-            try:
-                self._persist_auth_atomic(persisted)
-            except OSError as e:
-                # In-memory creds are valid; warn but don't fail the request
-                # path. Future process starts will fall back to the stale
-                # on-disk auth.json and immediately refresh.
-                logger.warning(
-                    f"Codex OAuth refresh succeeded but persisting auth.json failed: {type(e).__name__}. "
-                    "In-memory credentials are up to date; on-disk file is stale."
-                )
-
-            logger.info("Codex OAuth access_token refreshed successfully")
-
-    @staticmethod
-    def _extract_oauth_error_code(response: "httpx.Response") -> str | None:
-        """Pull the OAuth error code out of a 4xx response body, if present.
-
-        The refresh endpoint returns shapes like
-        ``{"error": "...", "error_code": "..."}`` or
-        ``{"error": {"code": "..."}}``. We don't fail the call if the body
-        is unparseable — the caller falls back to a generic "unknown" error.
-        """
-        try:
-            body = response.json()
-        except (json.JSONDecodeError, ValueError):
-            return None
-        if not isinstance(body, dict):
-            return None
-        # Shape 1: error is a nested object with "code"
-        err = body.get("error")
-        if isinstance(err, dict):
-            code = err.get("code")
-            if isinstance(code, str):
-                return code
-        # Shape 2: top-level error_code string
-        code = body.get("error_code")
-        if isinstance(code, str):
-            return code
-        # Shape 3: error is itself a string code
-        if isinstance(err, str):
-            return err
-        return None
+        await self._auth_manager.refresh_tokens(reason, force=force)
 
     async def _ensure_fresh_token(self) -> None:
         """Refresh the access_token proactively if it is near or past expiry.
@@ -441,21 +418,44 @@ class CodexLLM(LLMInterface):
         Called at the top of every API-bound method. Cheap when the token is
         fresh (just decodes the JWT exp claim and returns).
         """
-        if self._token_is_stale():
+        if self._auth_manager._token_is_stale():
             try:
                 await self._refresh_oauth_tokens(reason="proactive (token near expiry)")
             except CodexRefreshExpiredError:
-                # Surface to the caller as the same RuntimeError shape the
-                # request loop has historically raised, so existing error
-                # handling paths keep working.
                 raise
 
-    def _map_reasoning_effort(self, effort: str) -> str:
+    def _reasoning_payload(self, summary: str) -> dict[str, str]:
+        """Build the ``reasoning`` request object.
+
+        ``effort`` is present only when the operator configured one: an unset
+        HINDSIGHT_API_*_REASONING_EFFORT means the model runs at its own default
+        effort, and Hindsight does not pick one on the operator's behalf.
+        """
+        payload = {"summary": summary}
+        if self.reasoning_effort is not None:
+            payload["effort"] = self.reasoning_effort
+        return payload
+
+    def _supports_concise_reasoning_summary(self) -> bool:
+        """Whether this Codex model accepts concise/auto summaries."""
+        model = self.model.lower()
+        legacy_mini_models = ("5.1-codex-mini", "5.2-codex-mini")
+        return not any(marker in model for marker in legacy_mini_models)
+
+    def _reasoning_summary_for_request(self) -> str:
+        """Return the Codex summary value that this model can accept."""
+        if self.reasoning_summary == "auto":
+            return "auto"
+        return "detailed" if not self._supports_concise_reasoning_summary() else self.reasoning_summary
+
+    def _map_reasoning_effort(self, effort: str | None) -> str:
         """
         Map standard reasoning effort to Codex reasoning summary format.
 
         Args:
-            effort: Standard effort level ("low", "medium", "high", "xhigh").
+            effort: Standard effort level ("low", "medium", "high", "xhigh"), or None
+                when unconfigured — the summary then stays "auto", the same neutral
+                presentation an unrecognised level gets.
 
         Returns:
             Codex reasoning summary: "concise", "detailed", or "auto".
@@ -466,33 +466,11 @@ class CodexLLM(LLMInterface):
             "high": "detailed",
             "xhigh": "detailed",
         }
-        return mapping.get(effort.lower(), "auto")
+        return mapping.get(effort.lower(), "auto") if effort else "auto"
 
-    def _normalize_tool_choice(self, tool_choice: str | dict[str, Any]) -> str | dict[str, Any]:
-        """Normalize forced function tool choice for the Codex Responses API.
-
-        Older agent paths may still pass OpenAI chat-completions style named
-        tool choice payloads such as:
-
-            {"type": "function", "function": {"name": "recall"}}
-
-        Codex Responses expects the named function at the top level instead:
-
-            {"type": "function", "name": "recall"}
-        """
-        if not isinstance(tool_choice, dict):
-            return tool_choice
-        if str(tool_choice.get("type") or "").strip() != "function":
-            return tool_choice
-        function_payload = tool_choice.get("function")
-        if isinstance(function_payload, dict):
-            function_name = str(function_payload.get("name") or "").strip()
-            if function_name:
-                return {"type": "function", "name": function_name}
-        function_name = str(tool_choice.get("name") or "").strip()
-        if function_name:
-            return {"type": "function", "name": function_name}
-        return tool_choice
+    def supports_vision(self) -> bool:
+        """Codex runs OpenAI's own models, all of which are multimodal."""
+        return True
 
     async def verify_connection(self) -> None:
         """Verify Codex connection by making a simple test call."""
@@ -526,9 +504,20 @@ class CodexLLM(LLMInterface):
         max_backoff: float = 60.0,
         skip_validation: bool = False,
         strict_schema: bool = False,
-        return_usage: bool = False,
-    ) -> Any:
-        """Make API call to Codex backend with SSE streaming."""
+        attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
+    ) -> LLMCallResult:
+        """Make API call to Codex backend with SSE streaming.
+
+        Args:
+            strict_schema: Route structured output through a single forced
+                function tool (constrained decoding) instead of prompt-injecting
+                the schema and parsing free-form text. The Codex backend speaks
+                the OpenAI Responses API, so the forced function call emits the
+                response schema directly as tool arguments — eliminating the
+                invalid-``\\escape`` retry storm (issue #2504). When False, falls
+                back to schema-in-prompt + JSON parse, now hardened with a lenient
+                invalid-escape repair before giving up.
+        """
         start_time = time.time()
 
         # Proactively refresh the OAuth access_token if it's near expiry.
@@ -553,16 +542,24 @@ class CodexLLM(LLMInterface):
             else:
                 user_messages.append(msg)
 
-        # Add JSON schema instruction if response_format is provided
+        # Structured output: prefer a single forced function tool (constrained
+        # decoding) over text-injecting the schema and parsing the reply. The
+        # forced tool guarantees schema-shaped JSON in the tool arguments,
+        # eliminating the invalid-\escape retry storm (issue #2504). When
+        # strict_schema is off we keep the schema-in-prompt + json.loads
+        # fallback (now hardened with a lenient escape repair) for callers that
+        # can't force tools.
+        schema = None
+        use_forced_tool = False
         if response_format is not None and hasattr(response_format, "model_json_schema"):
-            schema = response_format.model_json_schema()
-            schema_msg = f"\n\nYou must respond with valid JSON matching this schema:\n{json.dumps(schema, indent=2, ensure_ascii=False)}"
-            system_instruction += schema_msg
+            schema = strict_json_schema(response_format) if strict_schema else provider_json_schema(response_format)
+            if strict_schema:
+                use_forced_tool = True
+            else:
+                schema_msg = f"\n\nYou must respond with valid JSON matching this schema:\n{json.dumps(schema, indent=2, ensure_ascii=False)}"
+                system_instruction += schema_msg
 
-        # Older codex models (5.1, 5.2) only support "detailed" reasoning summary;
-        # only gpt-5.3-codex (non-mini) supports concise/auto
-        _supports_concise = "5.3-codex" in self.model and "mini" not in self.model
-        reasoning_summary = self.reasoning_summary if _supports_concise else "detailed"
+        reasoning_summary = self._reasoning_summary_for_request()
 
         # Build Codex request payload
         payload = {
@@ -579,23 +576,31 @@ class CodexLLM(LLMInterface):
             "tools": [],
             "tool_choice": "auto",
             "parallel_tool_calls": True,
-            "reasoning": {"summary": reasoning_summary},
+            "reasoning": self._reasoning_payload(reasoning_summary),
             "store": False,  # Codex uses stateless mode
             "stream": True,  # SSE streaming
             "include": ["reasoning.encrypted_content"],
             "prompt_cache_key": str(uuid.uuid4()),
         }
+        payload.update(self._extra_body)
 
-        headers = {
-            "Authorization": f"Bearer {self.access_token}",
-            "Content-Type": "application/json",
-            "OpenAI-Account-ID": self.account_id,
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-            "Origin": "https://chatgpt.com",
-        }
+        if use_forced_tool and schema is not None:
+            # Single function tool whose parameters ARE the response schema;
+            # force it via tool_choice so the backend does constrained decoding.
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "name": _STRUCTURED_TOOL_NAME,
+                    "description": "Return the structured response.",
+                    "parameters": schema,
+                }
+            ]
+            payload["tool_choice"] = {"type": "function", "name": _STRUCTURED_TOOL_NAME}
+            payload["parallel_tool_calls"] = False
+
+        headers = self._build_request_headers()
 
         url = f"{self.base_url}/codex/responses"
-        last_exception = None
 
         # Manual attempt tracking instead of ``for attempt in range(...)`` so
         # that the reactive-refresh path can retry once without consuming a
@@ -604,14 +609,52 @@ class CodexLLM(LLMInterface):
         attempt = 0
         while True:
             try:
-                response = await self._client.post(url, json=payload, headers=headers, timeout=120.0)
-                response.raise_for_status()
+                async with attempt_context() if attempt_context is not None else nullcontext():
+                    set_stage(f"llm.codex.{scope}.attempt={attempt + 1}/{max_retries + 1}")
+                    async with self._stream_request(url, payload, headers) as response:
+                        # Forced-tool path: read structured output from the function-call
+                        # arguments (already a JSON string in a dedicated channel) rather
+                        # than from free-form assistant text.
+                        if use_forced_tool:
+                            text_content, tool_calls = await self._parse_sse_tool_stream(response)
+                            content = text_content or ""
+                        else:
+                            tool_calls = []
+                            content = await self._parse_sse_stream(response)
 
-                # Parse SSE stream
-                content = await self._parse_sse_stream(response)
+                # Codex SSE carries no usage block; stash the same char/4 estimate
+                # the success path traces so a later parse/validate failure records
+                # consistent (estimated) token counts rather than zero (#2387).
+                stash_response_usage(
+                    LLMResponseUsage(
+                        input_tokens=sum(len(m.get("content", "")) for m in messages) // 4,
+                        output_tokens=len(content) // 4,
+                    )
+                )
 
                 # Handle structured output
-                if response_format is not None:
+                if use_forced_tool:
+                    tool_input = None
+                    for tc in tool_calls:
+                        if tc.name == _STRUCTURED_TOOL_NAME:
+                            tool_input = tc.arguments if isinstance(tc.arguments, dict) else None
+                            break
+                    if tool_input is None:
+                        # Model ignored the forced tool (rare — e.g. a gateway that
+                        # drops tool_choice). Retry so we don't hard-fail.
+                        logger.warning(
+                            f"Codex forced structured tool missing from response "
+                            f"(attempt {attempt + 1}/{max_retries + 1})"
+                        )
+                        if attempt < max_retries:
+                            backoff = min(initial_backoff * (2**attempt), max_backoff)
+                            await asyncio.sleep(backoff)
+                            attempt += 1
+                            continue
+                        raise RuntimeError("Codex did not return the forced structured_response tool call")
+                    content = json.dumps(tool_input)
+                    result = tool_input if skip_validation else response_format.model_validate(tool_input)
+                elif response_format is not None:
                     # Models may wrap JSON in markdown
                     clean_content = content
                     if "```json" in content:
@@ -622,14 +665,20 @@ class CodexLLM(LLMInterface):
                     try:
                         json_data = json.loads(clean_content)
                     except json.JSONDecodeError as e:
-                        logger.warning(f"Codex JSON parse error (attempt {attempt + 1}/{max_retries + 1}): {e}")
-                        if attempt < max_retries:
-                            backoff = min(initial_backoff * (2**attempt), max_backoff)
-                            await asyncio.sleep(backoff)
-                            last_exception = e
-                            attempt += 1
-                            continue
-                        raise
+                        # Escape-heavy content deterministically re-fails every
+                        # retry (issue #2504). Try a lenient invalid-escape repair
+                        # before burning a retry / re-raising.
+                        try:
+                            json_data = json.loads(_repair_invalid_json_escapes(clean_content))
+                            logger.info("Codex JSON parsed after repairing invalid escape sequences")
+                        except json.JSONDecodeError:
+                            logger.warning(f"Codex JSON parse error (attempt {attempt + 1}/{max_retries + 1}): {e}")
+                            if attempt < max_retries:
+                                backoff = min(initial_backoff * (2**attempt), max_backoff)
+                                await asyncio.sleep(backoff)
+                                attempt += 1
+                                continue
+                            raise
 
                     if skip_validation:
                         result = json_data
@@ -653,7 +702,7 @@ class CodexLLM(LLMInterface):
 
                 # Record trace span
                 try:
-                    from hindsight_api.tracing import get_span_recorder
+                    from hindsight_api.tracing import _serialize_for_span, get_span_recorder
 
                     # Estimate tokens for tracing
                     estimated_input = sum(len(m.get("content", "")) for m in messages) // 4
@@ -664,32 +713,29 @@ class CodexLLM(LLMInterface):
                         model=self.model,
                         scope=scope,
                         messages=messages,
-                        response_content=result if isinstance(result, str) else result.model_dump_json(),
+                        response_content=_serialize_for_span(result),
                         input_tokens=estimated_input,
                         output_tokens=estimated_output,
                         duration=duration,
                         finish_reason=None,
                         error=None,
                     )
-                except Exception:
-                    pass  # logging failure must never affect the operation
+                except Exception as span_error:
+                    # Tracing must remain best-effort, but expose instrumentation
+                    # bugs that would otherwise silently erase spans (#3025).
+                    logger.debug("Codex span recording failed: %s", span_error, exc_info=True)
 
-                if return_usage:
-                    # Codex doesn't provide token counts, estimate based on content
-                    estimated_input = sum(len(m.get("content", "")) for m in messages) // 4
-                    estimated_output = len(content) // 4
-                    token_usage = TokenUsage(
-                        input_tokens=estimated_input,
-                        output_tokens=estimated_output,
-                        total_tokens=estimated_input + estimated_output,
-                    )
-                    return result, token_usage
+                estimated_input = sum(len(m.get("content", "")) for m in messages) // 4
+                estimated_output = len(content) // 4
+                token_usage = TokenUsage(
+                    input_tokens=estimated_input,
+                    output_tokens=estimated_output,
+                    total_tokens=estimated_input + estimated_output,
+                )
+                return LLMCallResult(content=result, usage=token_usage)
 
-                return result
-
-            except httpx.HTTPStatusError as e:
-                last_exception = e
-                status_code = e.response.status_code
+            except UpstreamHTTPError as e:
+                status_code = e.status_code
 
                 # Auth error: try one OAuth refresh + retry before giving up.
                 # The proactive refresh at the top of this method catches most
@@ -723,14 +769,25 @@ class CodexLLM(LLMInterface):
                                 f"Codex token refresh attempt failed: {type(refresh_err).__name__}: {refresh_err}"
                             )
                             # Fall through to the original raise below.
-                    logger.error(f"Codex auth error (HTTP {status_code}): {e.response.text[:200]}")
+                    logger.error(f"Codex auth error (HTTP {status_code}): {e.body[:200]}")
                     raise RuntimeError(
                         "Codex authentication failed. Your OAuth token may have expired.\n"
                         "Run 'codex auth login' to re-authenticate."
                     ) from e
 
+                _raise_codex_quota_defer(
+                    e,
+                    provider=self.provider,
+                    model=self.model,
+                    scope=scope,
+                    max_backoff=max_backoff,
+                )
+
+                # Diagnostic dump (opt-in) of the exact request behind any 4xx.
+                dump_request_on_4xx(scope=scope, provider=self.provider, model=self.model, err=e, request=payload)
+
                 # Log the actual error message from the API
-                error_detail = e.response.text[:500] if hasattr(e.response, "text") else str(e)
+                error_detail = e.body[:500]
 
                 if attempt < max_retries:
                     backoff = min(initial_backoff * (2**attempt), max_backoff)
@@ -746,8 +803,7 @@ class CodexLLM(LLMInterface):
                     )
                     raise
 
-            except httpx.RequestError as e:
-                last_exception = e
+            except aiohttp.ClientError as e:
                 if attempt < max_retries:
                     backoff = min(initial_backoff * (2**attempt), max_backoff)
                     logger.warning(f"Codex connection error (attempt {attempt + 1}/{max_retries + 1}): {e}")
@@ -762,11 +818,83 @@ class CodexLLM(LLMInterface):
                 logger.error(f"Unexpected Codex error: {type(e).__name__}: {e}")
                 raise
 
-        if last_exception:
-            raise last_exception
-        raise RuntimeError("Codex call failed after all retries")
+    @asynccontextmanager
+    async def _stream_request(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+    ) -> AsyncIterator[aiohttp.ClientResponse]:
+        """POST and hand back the still-streaming response under a total deadline.
 
-    async def _parse_sse_stream(self, response: httpx.Response) -> str:
+        Two things this gives that a buffered POST did not (issue #3898):
+
+        * ``asyncio.timeout`` bounds the request *and* the caller's parse of the
+          body. The session's own timeout is per socket read, so a backend that
+          keeps sending bytes resets it forever; only a wall-clock deadline ends that.
+        * The body is consumed incrementally, so ``_iter_sse_lines`` can abandon a
+          runaway response instead of buffering megabytes of it before any parsing runs.
+
+        A 4xx/5xx is raised as :class:`UpstreamHTTPError` with its body already read,
+        so callers classify on ``status_code`` and log ``body``.
+        """
+        deadline = asyncio.timeout(self._request_timeout)
+        try:
+            async with deadline:
+                async with self._session.get().post(url, json=payload, headers=headers) as response:
+                    await raise_for_status(response)
+                    yield response
+        except TimeoutError as e:
+            # Only the wall-clock deadline is a runaway; a per-phase timeout from the
+            # session (a silent backend) propagates as the transport error it is.
+            if not deadline.expired():
+                raise
+            raise CodexRunawayStreamError(
+                f"Codex response exceeded the {self._request_timeout:g}s deadline "
+                f"(HINDSIGHT_API_LLM_TIMEOUT or its per-operation override)"
+            ) from e
+
+    async def _iter_sse_lines(self, response: aiohttp.ClientResponse) -> AsyncIterator[str]:
+        """Yield SSE lines, abandoning the response if the body runs away.
+
+        The deadline in ``_stream_request`` already bounds wall time; this bounds
+        volume, so a backend generating at speed is cut off in seconds rather than
+        held onto until the deadline expires. Volume is counted as the body
+        arrives, so a runaway that never emits a line break is caught too.
+
+        Lines split the way ``str.splitlines`` does (what httpx's ``aiter_lines``
+        did), including a ``\\r\\n`` that straddles two chunks. aiohttp's own line
+        reader is not used: it raises on a line longer than its buffer limit.
+        """
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        pending: list[str] = []
+        seen_chars = 0
+        async for chunk in response.content.iter_any():
+            text = decoder.decode(chunk)
+            seen_chars += len(text)
+            if seen_chars > _MAX_SSE_BODY_CHARS:
+                raise CodexRunawayStreamError(
+                    f"Codex response exceeded {_MAX_SSE_BODY_CHARS} characters without completing; "
+                    "abandoning the stream"
+                )
+            if not _LINE_BREAK_RE.search(text):
+                # Still inside one line: defer the join so a long line costs linear time.
+                pending.append(text)
+                continue
+            lines = ("".join(pending) + text).splitlines(keepends=True)
+            pending = []
+            # The last piece is incomplete unless it ends on a break — and a lone
+            # "\r" may be the first half of a "\r\n" the next chunk completes.
+            last = lines[-1]
+            if not _LINE_BREAK_RE.match(last[-1]) or last.endswith("\r"):
+                pending.append(lines.pop())
+            for line in lines:
+                yield line.splitlines()[0]
+        rest = "".join(pending) + decoder.decode(b"", final=True)
+        for line in rest.splitlines():
+            yield line
+
+    async def _parse_sse_stream(self, response: aiohttp.ClientResponse) -> str:
         """
         Parse Server-Sent Events (SSE) stream from Codex API.
 
@@ -779,7 +907,7 @@ class CodexLLM(LLMInterface):
         full_text = ""
         event_type = None
 
-        async for line in response.aiter_lines():
+        async for line in self._iter_sse_lines(response):
             if not line:
                 continue
 
@@ -829,7 +957,8 @@ class CodexLLM(LLMInterface):
         max_retries: int = 5,
         initial_backoff: float = 1.0,
         max_backoff: float = 30.0,
-        tool_choice: str | dict[str, Any] = "auto",
+        tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_AUTO,
+        attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> LLMToolCallResult:
         """
         Make API call with tool calling support.
@@ -846,7 +975,7 @@ class CodexLLM(LLMInterface):
             max_retries: Maximum retry attempts.
             initial_backoff: Initial backoff time in seconds.
             max_backoff: Maximum backoff time in seconds.
-            tool_choice: How to choose tools - "auto", "none", "required", or a specific function.
+            tool_choice: Canonical tool-selection policy.
 
         Returns:
             LLMToolCallResult with content and/or tool_calls.
@@ -900,32 +1029,28 @@ class CodexLLM(LLMInterface):
                 }
             )
 
-        # Older codex models (5.1, 5.2) only support "detailed" reasoning summary;
-        # only gpt-5.3-codex (non-mini) supports concise/auto
-        _supports_concise = "5.3-codex" in self.model and "mini" not in self.model
-        reasoning_summary = self.reasoning_summary if _supports_concise else "detailed"
+        reasoning_summary = self._reasoning_summary_for_request()
 
         payload = {
             "model": self.model,
             "instructions": system_instruction,
             "input": user_messages,
             "tools": codex_tools,
-            "tool_choice": self._normalize_tool_choice(tool_choice),
+            "tool_choice": (
+                {"type": "function", "name": tool_choice.selected_function_name}
+                if tool_choice.mode is LLMToolChoiceMode.NAMED
+                else tool_choice.mode.value
+            ),
             "parallel_tool_calls": True,
-            "reasoning": {"summary": reasoning_summary},
+            "reasoning": self._reasoning_payload(reasoning_summary),
             "store": False,
             "stream": True,
             "include": ["reasoning.encrypted_content"],
             "prompt_cache_key": str(uuid.uuid4()),
         }
+        payload.update(self._extra_body)
 
-        headers = {
-            "Authorization": f"Bearer {self.access_token}",
-            "Content-Type": "application/json",
-            "OpenAI-Account-ID": self.account_id,
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-            "Origin": "https://chatgpt.com",
-        }
+        headers = self._build_request_headers()
 
         url = f"{self.base_url}/codex/responses"
 
@@ -938,19 +1063,44 @@ class CodexLLM(LLMInterface):
         # surfaces immediately to keep behavior identical for callers.
         attempted_refresh_after_auth_error = False
 
-        try:
-            response = await self._client.post(url, json=payload, headers=headers, timeout=120.0)
+        async def _request_attempt(attempt: int) -> tuple[str | None, list[LLMToolCall]]:
+            async with attempt_context() if attempt_context is not None else nullcontext():
+                set_stage(f"llm.codex.tools.attempt={attempt}/2")
+                try:
+                    async with self._stream_request(url, payload, headers) as response:
+                        return await self._parse_sse_tool_stream(response)
+                except UpstreamHTTPError as e:
+                    _raise_codex_quota_defer(
+                        e,
+                        provider=self.provider,
+                        model=self.model,
+                        scope=scope,
+                        max_backoff=max_backoff,
+                    )
+                    # 401/403 on the first attempt may still be recovered by the
+                    # reactive token refresh below — don't log those as errors yet.
+                    detail = f"Codex API error {e.status_code}: {e.body[:500]}"
+                    if e.status_code in (401, 403) and not attempted_refresh_after_auth_error:
+                        logger.warning(f"{detail} (will attempt token refresh)")
+                    else:
+                        logger.error(detail)
+                    raise
 
-            if response.status_code in (401, 403) and not attempted_refresh_after_auth_error:
+        try:
+            try:
+                content, tool_calls = await _request_attempt(1)
+            except UpstreamHTTPError as auth_error:
+                if auth_error.status_code not in (401, 403) or attempted_refresh_after_auth_error:
+                    raise
                 attempted_refresh_after_auth_error = True
                 try:
                     await self._refresh_oauth_tokens(
-                        reason=f"reactive (HTTP {response.status_code} from codex backend in call_with_tools)",
+                        reason=f"reactive (HTTP {auth_error.status_code} from codex backend in call_with_tools)",
                         force=True,
                     )
                     headers["Authorization"] = f"Bearer {self.access_token}"
                     logger.info("Codex auth refreshed after auth error; retrying tool-call request once")
-                    response = await self._client.post(url, json=payload, headers=headers, timeout=120.0)
+                    content, tool_calls = await _request_attempt(2)
                 except CodexRefreshExpiredError as refresh_err:
                     logger.error(
                         "Codex refresh_token is permanently invalid; cannot recover from auth error in tool-call path"
@@ -963,16 +1113,7 @@ class CodexLLM(LLMInterface):
                     logger.error(
                         f"Codex token refresh attempt failed in tool-call path: {type(refresh_err).__name__}: {refresh_err}"
                     )
-                    # Fall through to the normal error path below.
-
-            # Log response details on error
-            if response.status_code != 200:
-                logger.error(f"Codex API error {response.status_code}: {response.text[:500]}")
-
-            response.raise_for_status()
-
-            # Parse SSE for tool calls and content
-            content, tool_calls = await self._parse_sse_tool_stream(response)
+                    raise auth_error
 
             duration = time.time() - start_time
             metrics = get_metrics_collector()
@@ -1022,10 +1163,12 @@ class CodexLLM(LLMInterface):
             )
 
         except Exception as e:
+            # Diagnostic dump (opt-in) of the exact request behind any 4xx.
+            dump_request_on_4xx(scope=scope, provider=self.provider, model=self.model, err=e, request=payload)
             logger.error(f"Codex tool call error: {e}")
             raise
 
-    async def _parse_sse_tool_stream(self, response: httpx.Response) -> tuple[str | None, list[LLMToolCall]]:
+    async def _parse_sse_tool_stream(self, response: aiohttp.ClientResponse) -> tuple[str | None, list[LLMToolCall]]:
         """
         Parse SSE stream for tool calls and content.
 
@@ -1036,7 +1179,7 @@ class CodexLLM(LLMInterface):
         tool_calls: list[LLMToolCall] = []
         event_type = None
 
-        async for line in response.aiter_lines():
+        async for line in self._iter_sse_lines(response):
             if not line:
                 continue
 
@@ -1066,8 +1209,13 @@ class CodexLLM(LLMInterface):
                             try:
                                 arguments = json.loads(arguments_str)
                             except json.JSONDecodeError:
-                                logger.warning(f"Failed to parse tool arguments: {arguments_str}")
-                                arguments = {}
+                                # Escape-heavy content can emit invalid \escape
+                                # sequences (issue #2504); repair before giving up.
+                                try:
+                                    arguments = json.loads(_repair_invalid_json_escapes(arguments_str))
+                                except json.JSONDecodeError:
+                                    logger.warning(f"Failed to parse tool arguments: {arguments_str}")
+                                    arguments = {}
 
                             tool_calls.append(
                                 LLMToolCall(
@@ -1083,5 +1231,9 @@ class CodexLLM(LLMInterface):
         return content if content else None, tool_calls
 
     async def cleanup(self) -> None:
-        """Clean up HTTP client."""
-        await self._client.aclose()
+        """Clean up HTTP sessions."""
+        await self._session.close()
+        await self._auth_manager.close()
+
+    def supports_attempt_scoped_concurrency(self) -> bool:
+        return True

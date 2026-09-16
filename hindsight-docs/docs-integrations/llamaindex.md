@@ -11,6 +11,8 @@ Persistent long-term memory for [LlamaIndex](https://docs.llamaindex.ai/) agents
 - **`HindsightToolSpec`** — Agent-driven memory tools (retain/recall/reflect)
 - **`HindsightMemory`** — Automatic memory via LlamaIndex's `BaseMemory` interface
 
+[View Changelog →](/changelog/integrations/llamaindex)
+
 ## Installation
 
 ```bash
@@ -168,7 +170,7 @@ tools = create_hindsight_tools(bank_id="user-123")
 | `retain_metadata` | `dict[str, str]` | `None` | Default metadata for retain operations |
 | `retain_document_id` | `str` | `None` | Document ID for retain. Auto-generates `{session}-{timestamp}` if not set |
 | `retain_context` | `str` | `"llamaindex"` | Source label for retain operations |
-| `recall_types` | `list[str]` | `None` | Fact types: `world`, `experience`, `opinion`, `observation` |
+| `recall_types` | `list[str]` | `None` | Fact types: `world`, `experience`, `observation` |
 | `recall_include_entities` | `bool` | `False` | Include entity info in recall results |
 | `reflect_context` | `str` | `None` | Additional context for reflect |
 | `reflect_max_tokens` | `int` | `None` | Max tokens for reflect (defaults to `max_tokens`) |

@@ -1,25 +1,17 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
+import { useTranslations } from "next-intl";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useRouter } from "next/navigation";
 import { client } from "@/lib/api";
 import { useBank } from "@/lib/bank-context";
-import { useFeatures } from "@/lib/features-context";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import {
   Dialog,
   DialogContent,
@@ -39,33 +31,18 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import {
   RefreshCw,
-  Save,
   Brain,
-  Clock,
-  AlertCircle,
-  CheckCircle,
-  Database,
-  Link2,
-  FolderOpen,
-  Activity,
   Trash2,
   Target,
   AlertTriangle,
   Plus,
   Tag,
-  Loader2,
   X,
-  MoreVertical,
   Pencil,
 } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
+import { TagChip } from "@/components/ui/facet-chip";
 
 interface DispositionTraits {
   skepticism: number;
@@ -103,16 +80,6 @@ interface BankStats {
   total_observations: number;
 }
 
-interface Operation {
-  id: string;
-  task_type: string;
-  items_count: number;
-  document_id: string | null;
-  created_at: string;
-  status: string;
-  error_message: string | null;
-}
-
 interface Directive {
   id: string;
   bank_id: string;
@@ -125,44 +92,51 @@ interface Directive {
   updated_at: string;
 }
 
-const TRAIT_LABELS: Record<
-  keyof DispositionTraits,
-  { label: string; shortLabel: string; description: string; lowLabel: string; highLabel: string }
-> = {
-  skepticism: {
-    label: "Skepticism",
-    shortLabel: "S",
-    description: "How skeptical vs trusting when forming observations",
-    lowLabel: "Trusting",
-    highLabel: "Skeptical",
-  },
-  literalism: {
-    label: "Literalism",
-    shortLabel: "L",
-    description: "How literally to interpret information when forming observations",
-    lowLabel: "Flexible",
-    highLabel: "Literal",
-  },
-  empathy: {
-    label: "Empathy",
-    shortLabel: "E",
-    description: "How much to consider emotional context when forming observations",
-    lowLabel: "Detached",
-    highLabel: "Empathetic",
-  },
+const TRAIT_KEYS: Array<keyof DispositionTraits> = ["skepticism", "literalism", "empathy"];
+
+const TRAIT_SHORT_LABELS: Record<keyof DispositionTraits, string> = {
+  skepticism: "S",
+  literalism: "L",
+  empathy: "E",
 };
+
+function useTraitLabels() {
+  const t = useTranslations("bankProfile");
+  return {
+    skepticism: {
+      label: t("skepticismLabel"),
+      shortLabel: TRAIT_SHORT_LABELS.skepticism,
+      description: t("skepticismDescription"),
+      lowLabel: t("skepticismLow"),
+      highLabel: t("skepticismHigh"),
+    },
+    literalism: {
+      label: t("literalismLabel"),
+      shortLabel: TRAIT_SHORT_LABELS.literalism,
+      description: t("literalismDescription"),
+      lowLabel: t("literalismLow"),
+      highLabel: t("literalismHigh"),
+    },
+    empathy: {
+      label: t("empathyLabel"),
+      shortLabel: TRAIT_SHORT_LABELS.empathy,
+      description: t("empathyDescription"),
+      lowLabel: t("empathyLow"),
+      highLabel: t("empathyHigh"),
+    },
+  } as const;
+}
 
 export function BankProfileView({ hideReflectFields = false }: { hideReflectFields?: boolean }) {
   const router = useRouter();
+  const t = useTranslations("bankProfile");
+  const tCommon = useTranslations("common");
+  const tBank = useTranslations("bank");
+  const traitLabels = useTraitLabels();
   const { currentBank, setCurrentBank, loadBanks } = useBank();
-  const { features } = useFeatures();
-  const observationsEnabled = features?.observations ?? false;
   const [profile, setProfile] = useState<BankProfile | null>(null);
   const [stats, setStats] = useState<BankStats | null>(null);
-  const [operations, setOperations] = useState<Operation[]>([]);
-  const [totalOperations, setTotalOperations] = useState(0);
   const [directives, setDirectives] = useState<Directive[]>([]);
-  const [mentalModelsCount, setMentalModelsCount] = useState(0);
   const [loading, setLoading] = useState(false);
   const [showDispositionDialog, setShowDispositionDialog] = useState(false);
   const [showMissionDialog, setShowMissionDialog] = useState(false);
@@ -184,49 +158,20 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
   const [showClearObservationsDialog, setShowClearObservationsDialog] = useState(false);
   const [isClearingObservations, setIsClearingObservations] = useState(false);
 
-  // Consolidation state
-  const [isConsolidating, setIsConsolidating] = useState(false);
-
-  // Operations filter/pagination state
-  const [opsStatusFilter, setOpsStatusFilter] = useState<string | null>(null);
-  const [opsLimit] = useState(10);
-  const [opsOffset, setOpsOffset] = useState(0);
-  const [cancellingOpId, setCancellingOpId] = useState<string | null>(null);
-
-  const loadOperations = async (
-    statusFilter: string | null = opsStatusFilter,
-    offset: number = opsOffset
-  ) => {
-    if (!currentBank) return;
-    try {
-      const opsData = await client.listOperations(currentBank, {
-        status: statusFilter || undefined,
-        limit: opsLimit,
-        offset,
-      });
-      setOperations(opsData.operations || []);
-      setTotalOperations(opsData.total || 0);
-    } catch (error) {
-      console.error("Error loading operations:", error);
-    }
-  };
-
   const loadData = async (isPolling = false) => {
     if (!currentBank) return;
 
-    // During polling, only refresh stats (not operations to avoid interfering with filters)
+    // During polling, only refresh read-only profile data to avoid overwriting form edits.
     // Use ref to get current value (avoids stale closure in setInterval)
     if (isPolling) {
       try {
-        const [statsData, directivesData, mentalModelsData] = await Promise.all([
+        const [statsData, directivesData] = await Promise.all([
           client.getBankStats(currentBank),
-          client.listDirectives(currentBank),
-          client.listMentalModels(currentBank),
+          // The view lists every directive, so page past the endpoint's cap.
+          client.listAllDirectives(currentBank),
         ]);
         setStats(statsData as BankStats);
-        setDirectives(directivesData.items || []);
-        setMentalModelsCount(mentalModelsData.items?.length || 0);
-        // Skip operations refresh during polling to not interfere with filter/pagination state
+        setDirectives(directivesData);
       } catch (error) {
         console.error("Error refreshing stats:", error);
       }
@@ -235,17 +180,14 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
 
     setLoading(true);
     try {
-      const [profileData, statsData, directivesData, mentalModelsData] = await Promise.all([
+      const [profileData, statsData, directivesData] = await Promise.all([
         client.getBankProfile(currentBank),
         client.getBankStats(currentBank),
-        client.listDirectives(currentBank),
-        client.listMentalModels(currentBank),
+        client.listAllDirectives(currentBank),
       ]);
       setProfile(profileData);
       setStats(statsData as BankStats);
-      setDirectives(directivesData.items || []);
-      setMentalModelsCount(mentalModelsData.items?.length || 0);
-      await loadOperations();
+      setDirectives(directivesData);
     } catch (error) {
       // Error toast is shown automatically by the API client interceptor
     } finally {
@@ -288,47 +230,6 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
     }
   };
 
-  const handleTriggerConsolidation = async () => {
-    if (!currentBank) return;
-
-    setIsConsolidating(true);
-    try {
-      await client.triggerConsolidation(currentBank);
-      // Reload to show the new operation in the list
-      await loadData();
-      await loadOperations();
-    } catch (error) {
-      // Error toast is shown automatically by the API client interceptor
-    } finally {
-      setIsConsolidating(false);
-    }
-  };
-
-  const handleOpsFilterChange = (newFilter: string | null) => {
-    setOpsStatusFilter(newFilter);
-    setOpsOffset(0); // Reset to first page when filter changes
-    loadOperations(newFilter, 0);
-  };
-
-  const handleOpsPageChange = (newOffset: number) => {
-    setOpsOffset(newOffset);
-    loadOperations(opsStatusFilter, newOffset);
-  };
-
-  const handleCancelOperation = async (operationId: string) => {
-    if (!currentBank) return;
-
-    setCancellingOpId(operationId);
-    try {
-      await client.cancelOperation(currentBank, operationId);
-      await loadOperations();
-    } catch (error) {
-      // Error toast is shown automatically by the API client interceptor
-    } finally {
-      setCancellingOpId(null);
-    }
-  };
-
   const handleDeleteDirective = async () => {
     if (!currentBank || !directiveDeleteTarget) return;
 
@@ -348,7 +249,7 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
   useEffect(() => {
     if (currentBank) {
       loadData();
-      // Refresh stats/operations every 5 seconds (isPolling=true to avoid overwriting form)
+      // Refresh read-only profile data every 5 seconds without overwriting form state.
       const interval = setInterval(() => loadData(true), 5000);
       return () => clearInterval(interval);
     }
@@ -369,10 +270,8 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
     return (
       <Card>
         <CardContent className="p-10 text-center">
-          <h3 className="text-xl font-semibold mb-2 text-card-foreground">No Bank Selected</h3>
-          <p className="text-muted-foreground">
-            Please select a memory bank from the dropdown above to view its profile.
-          </p>
+          <h3 className="text-xl font-semibold mb-2 text-card-foreground">{t("noBankSelected")}</h3>
+          <p className="text-muted-foreground">{t("noBankSelectedDescription")}</p>
         </CardContent>
       </Card>
     );
@@ -382,8 +281,8 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
     return (
       <Card>
         <CardContent className="text-center py-10">
-          <Clock className="w-12 h-12 mx-auto mb-3 text-muted-foreground animate-pulse" />
-          <div className="text-lg text-muted-foreground">Loading profile...</div>
+          <Spinner size="lg" variant="jump" className="mx-auto mb-3" />
+          <div className="text-lg text-muted-foreground">{t("loadingProfile")}</div>
         </CardContent>
       </Card>
     );
@@ -400,9 +299,9 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
                 <div>
                   <CardTitle className="flex items-center gap-2 text-lg">
                     <Brain className="w-5 h-5 text-primary" />
-                    Disposition Profile
+                    {t("dispositionProfileTitle")}
                   </CardTitle>
-                  <CardDescription>Traits that shape the reasoning and perspective</CardDescription>
+                  <CardDescription>{t("editDispositionDescription")}</CardDescription>
                 </div>
                 <Button onClick={() => setShowDispositionDialog(true)} variant="ghost" size="sm">
                   <Pencil className="h-4 w-4" />
@@ -412,15 +311,15 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
             <CardContent>
               {profile && (
                 <div className="space-y-4">
-                  {(Object.keys(TRAIT_LABELS) as Array<keyof DispositionTraits>).map((trait) => (
+                  {TRAIT_KEYS.map((trait) => (
                     <div key={trait} className="space-y-2">
                       <div className="flex justify-between items-center">
                         <div>
                           <label className="text-sm font-medium text-foreground">
-                            {TRAIT_LABELS[trait].label}
+                            {traitLabels[trait].label}
                           </label>
                           <p className="text-xs text-muted-foreground">
-                            {TRAIT_LABELS[trait].description}
+                            {traitLabels[trait].description}
                           </p>
                         </div>
                         <span className="text-sm font-bold text-primary">
@@ -429,7 +328,7 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
                       </div>
                       <div className="flex items-center gap-2">
                         <span className="text-xs text-muted-foreground">
-                          {TRAIT_LABELS[trait].lowLabel}
+                          {traitLabels[trait].lowLabel}
                         </span>
                         <div className="flex-1 h-2 bg-muted rounded-full overflow-hidden">
                           <div
@@ -438,7 +337,7 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
                           />
                         </div>
                         <span className="text-xs text-muted-foreground">
-                          {TRAIT_LABELS[trait].highLabel}
+                          {traitLabels[trait].highLabel}
                         </span>
                       </div>
                     </div>
@@ -455,11 +354,9 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
                 <div>
                   <CardTitle className="flex items-center gap-2 text-lg">
                     <Target className="w-5 h-5 text-primary" />
-                    Mission
+                    {t("missionTitle")}
                   </CardTitle>
-                  <CardDescription>
-                    Affects how observations, reflect, and mental models are created
-                  </CardDescription>
+                  <CardDescription>{t("editMissionDescription")}</CardDescription>
                 </div>
                 <Button onClick={() => setShowMissionDialog(true)} variant="ghost" size="sm">
                   <Pencil className="h-4 w-4" />
@@ -468,8 +365,7 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
             </CardHeader>
             <CardContent>
               <p className="text-sm text-foreground whitespace-pre-wrap leading-relaxed">
-                {profile?.mission ||
-                  "No mission set. Set a mission to derive structural mental models and personalize reflect responses."}
+                {profile?.mission || t("noMissionSet")}
               </p>
             </CardContent>
           </Card>
@@ -482,11 +378,9 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
           <div>
             <h3 className="text-lg font-semibold flex items-center gap-2">
               <AlertTriangle className="w-5 h-5 text-rose-500" />
-              Directives
+              {t("directivesTitle")}
             </h3>
-            <p className="text-sm text-muted-foreground">
-              Hard rules that must be followed during reflect
-            </p>
+            <p className="text-sm text-muted-foreground">{t("directivesDescription")}</p>
           </div>
           <Button
             onClick={() => setShowCreateDirective(true)}
@@ -495,7 +389,7 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
             className="h-8"
           >
             <Plus className="w-4 h-4 mr-1" />
-            Add
+            {t("addDirective")}
           </Button>
         </div>
         {directives.length > 0 ? (
@@ -520,12 +414,7 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
                         <div className="flex items-center gap-1 mt-2 flex-wrap">
                           <Tag className="w-3 h-3 text-muted-foreground" />
                           {d.tags.map((tag) => (
-                            <span
-                              key={tag}
-                              className="text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground"
-                            >
-                              {tag}
-                            </span>
+                            <TagChip key={tag} tag={tag} size="xs" />
                           ))}
                         </div>
                       )}
@@ -538,9 +427,7 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
         ) : (
           <div className="p-6 border border-dashed border-rose-500/30 rounded-lg text-center">
             <AlertTriangle className="w-6 h-6 mx-auto mb-2 text-rose-500/50" />
-            <p className="text-sm text-muted-foreground">
-              No directives yet. Directives are hard rules that must be followed during reflect.
-            </p>
+            <p className="text-sm text-muted-foreground">{t("noDirectivesMessage")}</p>
           </div>
         )}
       </div>
@@ -549,28 +436,33 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
       <AlertDialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete Memory Bank</AlertDialogTitle>
+            <AlertDialogTitle>{tBank("deleteMemoryBank")}</AlertDialogTitle>
             <AlertDialogDescription asChild>
               <div className="space-y-2 text-sm text-muted-foreground">
                 <p>
-                  Are you sure you want to delete the memory bank{" "}
-                  <span className="font-semibold text-foreground">{currentBank}</span>?
+                  {tBank.rich("deleteBankPrompt", {
+                    bankName: () => (
+                      <span className="font-semibold text-foreground">{currentBank}</span>
+                    ),
+                  })}
                 </p>
                 <p className="text-red-600 dark:text-red-400 font-medium">
-                  This action cannot be undone. All memories, entities, documents, and the bank
-                  profile will be permanently deleted.
+                  {tBank("deleteBankWarning")}
                 </p>
                 {stats && (
                   <p>
-                    This will delete {stats.total_nodes} memories, {stats.total_documents}{" "}
-                    documents, and {stats.total_links} links.
+                    {tBank("deleteWillDeleteDetails", {
+                      memories: stats.total_nodes,
+                      documents: stats.total_documents,
+                      links: stats.total_links,
+                    })}
                   </p>
                 )}
               </div>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={isDeleting}>Cancel</AlertDialogCancel>
+            <AlertDialogCancel disabled={isDeleting}>{tCommon("cancel")}</AlertDialogCancel>
             <AlertDialogAction
               onClick={handleDeleteBank}
               disabled={isDeleting}
@@ -579,12 +471,12 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
               {isDeleting ? (
                 <>
                   <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
-                  Deleting...
+                  {tBank("deleting")}
                 </>
               ) : (
                 <>
                   <Trash2 className="w-4 h-4 mr-2" />
-                  Delete Bank
+                  {tBank("deleteBank")}
                 </>
               )}
             </AlertDialogAction>
@@ -596,25 +488,31 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
       <AlertDialog open={showClearObservationsDialog} onOpenChange={setShowClearObservationsDialog}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Clear Observations</AlertDialogTitle>
+            <AlertDialogTitle>{tBank("clearObservationsTitle")}</AlertDialogTitle>
             <AlertDialogDescription asChild>
               <div className="space-y-2 text-sm text-muted-foreground">
                 <p>
-                  Are you sure you want to clear all observations for{" "}
-                  <span className="font-semibold text-foreground">{currentBank}</span>?
+                  {tBank.rich("clearObservationsPrompt", {
+                    bankName: () => (
+                      <span className="font-semibold text-foreground">{currentBank}</span>
+                    ),
+                  })}
                 </p>
                 <p className="text-amber-600 dark:text-amber-400 font-medium">
-                  This will delete all consolidated knowledge. Observations will be regenerated the
-                  next time consolidation runs.
+                  {tBank("clearObservationsWarning")}
                 </p>
                 {stats && stats.total_observations > 0 && (
-                  <p>This will delete {stats.total_observations} observations.</p>
+                  <p>
+                    {tBank("deleteWillDeleteObservations", { count: stats.total_observations })}
+                  </p>
                 )}
               </div>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={isClearingObservations}>Cancel</AlertDialogCancel>
+            <AlertDialogCancel disabled={isClearingObservations}>
+              {tCommon("cancel")}
+            </AlertDialogCancel>
             <AlertDialogAction
               onClick={handleClearObservations}
               disabled={isClearingObservations}
@@ -622,13 +520,13 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
             >
               {isClearingObservations ? (
                 <>
-                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                  Clearing...
+                  <Spinner size="sm" className="mr-2" />
+                  {tBank("clearing")}
                 </>
               ) : (
                 <>
                   <Trash2 className="w-4 h-4 mr-2" />
-                  Clear Observations
+                  {tBank("clearObservations")}
                 </>
               )}
             </AlertDialogAction>
@@ -654,24 +552,23 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete Directive</AlertDialogTitle>
+            <AlertDialogTitle>{t("deleteDirectiveTitle")}</AlertDialogTitle>
             <AlertDialogDescription>
-              Are you sure you want to delete{" "}
-              <span className="font-semibold">&quot;{directiveDeleteTarget?.name}&quot;</span>?
+              {t("deleteDirectiveConfirm", { name: `"${directiveDeleteTarget?.name ?? ""}"` })}
               <br />
               <br />
-              <span className="text-destructive font-semibold">This action cannot be undone.</span>
+              <span className="text-destructive font-semibold">{t("deleteDirectiveWarning")}</span>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter className="flex-row justify-end space-x-2">
-            <AlertDialogCancel className="mt-0">Cancel</AlertDialogCancel>
+            <AlertDialogCancel className="mt-0">{tCommon("cancel")}</AlertDialogCancel>
             <AlertDialogAction
               onClick={handleDeleteDirective}
               disabled={deletingDirective}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
-              {deletingDirective ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : null}
-              Delete
+              {deletingDirective ? <Spinner size="sm" className="mr-1" /> : null}
+              {tCommon("delete")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -733,6 +630,8 @@ function DispositionEditDialog({
   onClose: () => void;
   onSaved: () => void;
 }) {
+  const t = useTranslations("bankProfile");
+  const traitLabels = useTraitLabels();
   const { currentBank } = useBank();
   const [saving, setSaving] = useState(false);
   const [editDisposition, setEditDisposition] = useState<DispositionTraits>(disposition);
@@ -759,25 +658,25 @@ function DispositionEditDialog({
     <Dialog open onOpenChange={onClose}>
       <DialogContent className="max-w-xl">
         <DialogHeader>
-          <DialogTitle>Edit Disposition Traits</DialogTitle>
-          <DialogDescription>Traits that shape the reasoning and perspective</DialogDescription>
+          <DialogTitle>{t("editDispositionTitle")}</DialogTitle>
+          <DialogDescription>{t("editDispositionDescription")}</DialogDescription>
         </DialogHeader>
 
         <div className="space-y-4 py-4">
-          {(Object.keys(TRAIT_LABELS) as Array<keyof DispositionTraits>).map((trait) => (
+          {TRAIT_KEYS.map((trait) => (
             <div key={trait} className="space-y-2">
               <div className="flex justify-between items-center">
                 <div>
                   <label className="text-sm font-medium text-foreground">
-                    {TRAIT_LABELS[trait].label}
+                    {traitLabels[trait].label}
                   </label>
-                  <p className="text-xs text-muted-foreground">{TRAIT_LABELS[trait].description}</p>
+                  <p className="text-xs text-muted-foreground">{traitLabels[trait].description}</p>
                 </div>
                 <span className="text-sm font-bold text-primary">{editDisposition[trait]}/5</span>
               </div>
               <div className="flex justify-between text-[10px] text-muted-foreground">
-                <span>{TRAIT_LABELS[trait].lowLabel}</span>
-                <span>{TRAIT_LABELS[trait].highLabel}</span>
+                <span>{traitLabels[trait].lowLabel}</span>
+                <span>{traitLabels[trait].highLabel}</span>
               </div>
               <input
                 type="range"
@@ -796,16 +695,16 @@ function DispositionEditDialog({
 
         <DialogFooter>
           <Button onClick={onClose} variant="outline" disabled={saving}>
-            Cancel
+            {t("cancel")}
           </Button>
           <Button onClick={handleSave} disabled={saving}>
             {saving ? (
               <>
                 <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
-                Saving...
+                {t("saving")}
               </>
             ) : (
-              "Save Changes"
+              t("saveChanges")
             )}
           </Button>
         </DialogFooter>
@@ -825,6 +724,7 @@ function MissionEditDialog({
   onClose: () => void;
   onSaved: () => void;
 }) {
+  const t = useTranslations("bankProfile");
   const { currentBank } = useBank();
   const [saving, setSaving] = useState(false);
   const [editMission, setEditMission] = useState(mission);
@@ -849,17 +749,15 @@ function MissionEditDialog({
     <Dialog open onOpenChange={onClose}>
       <DialogContent className="max-w-xl">
         <DialogHeader>
-          <DialogTitle>Edit Mission</DialogTitle>
-          <DialogDescription>
-            Affects how observations, reflect, and mental models are created
-          </DialogDescription>
+          <DialogTitle>{t("editMissionTitle")}</DialogTitle>
+          <DialogDescription>{t("editMissionDescription")}</DialogDescription>
         </DialogHeader>
 
         <div className="space-y-2 py-4">
           <Textarea
             value={editMission}
             onChange={(e) => setEditMission(e.target.value)}
-            placeholder="e.g., I am a PM for the engineering team. I help coordinate sprints and track project progress..."
+            placeholder={t("missionPlaceholder")}
             rows={8}
             className="resize-none"
           />
@@ -867,16 +765,16 @@ function MissionEditDialog({
 
         <DialogFooter>
           <Button onClick={onClose} variant="outline" disabled={saving}>
-            Cancel
+            {t("cancel")}
           </Button>
           <Button onClick={handleSave} disabled={saving}>
             {saving ? (
               <>
                 <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
-                Saving...
+                {t("saving")}
               </>
             ) : (
-              "Save Changes"
+              t("saveChanges")
             )}
           </Button>
         </DialogFooter>
@@ -902,6 +800,7 @@ function DirectiveFormDialog({
   onCreated?: (d: Directive) => void;
   onSaved?: (d: Directive) => void;
 }) {
+  const t = useTranslations("bankProfile");
   const { currentBank } = useBank();
   const [submitting, setSubmitting] = useState(false);
   const [form, setForm] = useState({ name: "", content: "", tags: "" });
@@ -966,54 +865,55 @@ function DirectiveFormDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <AlertTriangle className="w-5 h-5 text-rose-500" />
-            {mode === "create" ? "Create" : "Edit"} Directive
+            {mode === "create" ? t("directiveFormCreateTitle") : t("directiveFormEditTitle")}
           </DialogTitle>
-          <DialogDescription>
-            Directives are hard rules that must be followed during reflect.
-          </DialogDescription>
+          <DialogDescription>{t("directiveFormDescription")}</DialogDescription>
         </DialogHeader>
 
         <div className="space-y-4 py-4">
           <div className="space-y-2">
-            <label className="text-sm font-medium text-foreground">Name *</label>
+            <label className="text-sm font-medium text-foreground">{t("directiveNameLabel")}</label>
             <Input
               value={form.name}
               onChange={(e) => setForm({ ...form, name: e.target.value })}
-              placeholder="e.g., Competitor Policy"
+              placeholder={t("directiveNamePlaceholder")}
             />
           </div>
           <div className="space-y-2">
-            <label className="text-sm font-medium text-foreground">Rule *</label>
+            <label className="text-sm font-medium text-foreground">{t("directiveRuleLabel")}</label>
             <Textarea
               value={form.content}
               onChange={(e) => setForm({ ...form, content: e.target.value })}
-              placeholder="e.g., Never mention competitor products directly."
+              placeholder={t("directiveRulePlaceholder")}
               className="min-h-[120px]"
             />
           </div>
           <div className="space-y-2">
             <label className="text-sm font-medium text-foreground">
-              Tags <span className="text-muted-foreground font-normal">(optional)</span>
+              {t("directiveTagsLabel")}{" "}
+              <span className="text-muted-foreground font-normal">
+                {t("directiveTagsOptional")}
+              </span>
             </label>
             <Input
               value={form.tags}
               onChange={(e) => setForm({ ...form, tags: e.target.value })}
-              placeholder="e.g., project-x, team-alpha (comma-separated)"
+              placeholder={t("directiveTagsPlaceholder")}
             />
           </div>
         </div>
 
         <DialogFooter>
           <Button variant="outline" onClick={handleClose} disabled={submitting}>
-            Cancel
+            {t("cancel")}
           </Button>
           <Button
             onClick={handleSubmit}
             disabled={submitting || !form.name.trim() || !form.content.trim()}
             className="bg-rose-500 hover:bg-rose-600"
           >
-            {submitting ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : null}
-            {mode === "create" ? "Create" : "Save"}
+            {submitting ? <Spinner size="sm" className="mr-1" /> : null}
+            {mode === "create" ? t("create") : t("save")}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -1034,6 +934,7 @@ function DirectiveDetailPanel({
   onDelete: () => void;
   onUpdated: (d: Directive) => void;
 }) {
+  const t = useTranslations("bankProfile");
   const [showEditModal, setShowEditModal] = useState(false);
 
   return (
@@ -1056,7 +957,7 @@ function DirectiveDetailPanel({
                 </Button>
               </div>
               <span className="text-xs px-1.5 py-0.5 rounded bg-rose-500/10 text-rose-600 dark:text-rose-400">
-                directive
+                {t("directiveDetailBadge")}
               </span>
             </div>
           </div>
@@ -1079,7 +980,7 @@ function DirectiveDetailPanel({
           {/* Description */}
           <div>
             <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-3">
-              Rule
+              {t("directiveDetailRuleLabel")}
             </div>
             <div className="prose prose-base dark:prose-invert max-w-none">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>{directive.content}</ReactMarkdown>
@@ -1090,16 +991,11 @@ function DirectiveDetailPanel({
           {directive.tags && directive.tags.length > 0 && (
             <div>
               <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-3">
-                Tags
+                {t("directiveDetailTagsLabel")}
               </div>
               <div className="flex flex-wrap gap-2">
                 {directive.tags.map((tag) => (
-                  <span
-                    key={tag}
-                    className="px-2 py-1 rounded bg-muted text-muted-foreground text-sm"
-                  >
-                    {tag}
-                  </span>
+                  <TagChip key={tag} tag={tag} size="md" />
                 ))}
               </div>
             </div>
@@ -1108,7 +1004,7 @@ function DirectiveDetailPanel({
           {/* ID */}
           <div>
             <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
-              ID
+              {t("directiveDetailIdLabel")}
             </div>
             <code className="text-sm font-mono break-all text-muted-foreground">
               {directive.id}

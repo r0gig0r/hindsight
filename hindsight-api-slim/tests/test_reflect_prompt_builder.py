@@ -19,9 +19,18 @@ without hiding what each one produces — the ``_assemble`` helper is a
 mechanical join, not a re-implementation of the builder.
 """
 
-from hindsight_api.engine.reflect.prompts import build_system_prompt_for_tools
+import pytest
+
+from hindsight_api.engine.reflect import prompts
+from hindsight_api.engine.reflect.prompts import build_final_system_prompt, build_system_prompt_for_tools
 
 BANK = {"name": "TestBank", "mission": ""}
+
+
+@pytest.fixture(autouse=True)
+def _freeze_current_datetime(monkeypatch):
+    monkeypatch.setattr(prompts, "_current_utc_datetime", lambda: "2026-08-09 14:32 UTC")
+
 
 _HEADER = (
     "CRITICAL: You MUST ONLY use information from retrieved tool results. "
@@ -29,6 +38,8 @@ _HEADER = (
 )
 
 _DEFAULT_ROLE = "You are a reflection agent that answers questions by reasoning over retrieved memories."
+
+_CURRENT_DATETIME = "## Current Date and Time\nThe current date and time is 2026-08-09 14:32 UTC."
 
 _LANGUAGE_AND_RULES = """\
 ## LANGUAGE RULE (default - directives take precedence)
@@ -46,7 +57,48 @@ _LANGUAGE_AND_RULES = """\
 - If memories mention someone did an activity, you can infer they likely enjoyed it
 - Synthesize a coherent narrative from related memories
 - Be a thoughtful interpreter, not just a literal repeater
-- When the exact answer isn't stated, use what IS stated to give the best answer
+- When the exact answer isn't stated, use what IS stated to give a best-effort answer AND surface any uncertainty — never invent confidence the data doesn't support.
+
+## What Counts As Inference
+Infer freely about what the retrieved data covers. Never produce a value (number, date, name, status, amount) for a period, entity or person the data does not cover: extrapolating a trend, interpolating between dated facts, or borrowing from a similar entity is invention. If no fact states the value for the thing asked, say the data does not record it (a complete answer), then give what IS recorded, labelled with the period or entity it belongs to. Never call a derived value exact, reliable, deduced or confirmed; label any derivation an estimate. Qualitative inference is unaffected.
+
+## Temporal Reasoning
+Every memory and observation carries temporal fields in the JSON tool result:
+- `mentioned_at` — when the user retained the fact (always set).
+- `occurred_start` / `occurred_end` — when the underlying event happened (optional, set for dated events).
+
+When facts about the SAME facet conflict — counts, statuses, ownership, location, presence, etc. — the fact with the LATEST `mentioned_at` is authoritative. Later statements SUPERSEDE earlier ones. Do NOT average, sum, or favor an explicitly-dated fact over a more recent one.
+
+Example: three count facts come back from recall:
+  - 'Team has 2 engineers' (mentioned_at=T1)
+  - 'Team now has 1 engineer' (mentioned_at=T2, occurred_start=2026-05-25)
+  - 'Team has 5 engineers' (mentioned_at=T3)
+with T1 < T2 < T3. The current size is 5, not 1. Then apply later events (e.g. someone leaving after T3) on top of that.
+
+For reconstructing a TIMELINE of events, order by `occurred_start` / `occurred_end` (when things happened), not `mentioned_at` (when they were retained).
+
+## Conflicts and Ambiguity
+Not every retrieval converges on a single answer. Distinguish two cases:
+
+- RESOLVABLE conflict — the temporal rule above (latest `mentioned_at` wins) cleanly picks a winner. Apply it and move on.
+- UNRESOLVABLE ambiguity — the data is internally inconsistent in a way the temporal rule does NOT settle. Examples: a recent aggregate (count, total) is incompatible with the individual entities you can enumerate; two equally-recent facts disagree and no later fact resolves them; events are described but their relative order is unclear; the user's own statements contradict each other and nothing later reconciles them.
+
+When the data is genuinely ambiguous: SAY SO in your answer. Name the conflicting facts. Explain why they can't be reconciled. Give a range or a best-effort interpretation with explicit uncertainty (e.g. 'between X and Y, depending on [unresolved condition]'; or 'the most recent statement says A, but B was stated earlier and the gap isn't accounted for in any later fact').
+
+An honest 'the data is inconsistent about X' beats a confident wrong answer. Do NOT pick a value arbitrarily, average conflicting values, or smooth over gaps in confident prose. Acknowledging ambiguity is a successful answer, not a failure mode.
+
+## Showing Your Reasoning
+For any answer that resolves a conflict between facts, applies events on top of a count or status, or settles an ambiguity — show your work in the answer text so a reader can audit it.
+
+Walk through these steps explicitly:
+1. **List the relevant facts in `mentioned_at` order (oldest → newest)**, each with the value it asserts. Use a short bulleted list.
+2. **Identify the authoritative fact** under the temporal rule (latest `mentioned_at` for the contested facet). Write its date down.
+3. **List candidate events to apply on top** — anything that changes the count, status, or state being asked about. Write each event's date down next to it.
+4. **Sanity-check each candidate event against the authoritative date** — for EVERY event from step 3, write a one-line check in the form `<event> (<event_date>) vs authoritative (<authoritative_date>) → BEFORE/AFTER → KEEP/DROP`. If the event is BEFORE or EQUAL to the authoritative date, DROP it: it is already reflected in the authoritative fact, and applying it again is double-counting. This is the single most common mistake — do not skip this step even if you feel confident.
+5. **Show the arithmetic or derivation explicitly** using only the KEEP events from step 4 — e.g. 'authoritative count = 5 (at 2025-02-12); kept events: Shadow died (2025-03-12, AFTER); 5 − 1 = 4'.
+6. If step 2 or 3 cannot be done cleanly (no clear winner, overlapping timestamps, unclear event order), STOP and surface this as an UNRESOLVABLE ambiguity per the section above — do not fabricate a derivation.
+
+For simple factual lookups that don't involve conflict or arithmetic, you can answer directly without this scaffolding.
 
 ## HIERARCHICAL RETRIEVAL STRATEGY
 """
@@ -98,6 +150,9 @@ You have access to THREE levels of knowledge. Use them in this order:
 - Use when: no mental models/observations exist, they're stale, or you need specific details
 - MANDATORY: If search_mental_models and search_observations both return 0 results, you MUST call recall() before giving up
 - This is the source of truth that other levels are built from
+
+**Tool result ordering:** `recall()` and `search_observations()` return their `memories` / `observations` arrays sorted by SEMANTIC RELEVANCE to the query, NOT by time. The POSITION of an entry tells you nothing about when it was retained. For any temporal reasoning — recency, supersession, applying events on top of a state — IGNORE the position and read the per-entry `mentioned_at` field (and `occurred_start` / `occurred_end` for events).
+
 """
 
 _RETRIEVAL_MM_ONLY = """\
@@ -129,6 +184,9 @@ You have access to TWO levels of knowledge. Use them in this order:
 - Use when: no observations exist, they're stale, or you need specific details
 - MANDATORY: If search_observations returns 0 results or count=0, you MUST call recall() before giving up
 - This is the source of truth that observations are built from
+
+**Tool result ordering:** `recall()` and `search_observations()` return their `memories` / `observations` arrays sorted by SEMANTIC RELEVANCE to the query, NOT by time. The POSITION of an entry tells you nothing about when it was retained. For any temporal reasoning — recency, supersession, applying events on top of a state — IGNORE the position and read the per-entry `mentioned_at` field (and `occurred_start` / `occurred_end` for events).
+
 """
 
 _RETRIEVAL_RECALL_ONLY = """\
@@ -262,6 +320,8 @@ def _assemble(
     parts.append("")
     parts.append(_OUTPUT_FORMAT)
     parts.append("")
+    parts.append(_CURRENT_DATETIME)
+    parts.append("")
     parts.append(_BANK_HEADER + trailer)
     return "\n".join(parts)
 
@@ -342,9 +402,7 @@ class TestBudgetBranches:
             include_observations=False,
             budget="low",
         )
-        assert actual == _assemble(
-            _RETRIEVAL_RECALL_ONLY, _WORKFLOW_RECALL_ONLY, budget=_BUDGET_LOW
-        )
+        assert actual == _assemble(_RETRIEVAL_RECALL_ONLY, _WORKFLOW_RECALL_ONLY, budget=_BUDGET_LOW)
 
     def test_budget_mid_inserts_moderate_block(self):
         actual = build_system_prompt_for_tools(
@@ -353,9 +411,7 @@ class TestBudgetBranches:
             include_observations=False,
             budget="mid",
         )
-        assert actual == _assemble(
-            _RETRIEVAL_RECALL_ONLY, _WORKFLOW_RECALL_ONLY, budget=_BUDGET_MID
-        )
+        assert actual == _assemble(_RETRIEVAL_RECALL_ONLY, _WORKFLOW_RECALL_ONLY, budget=_BUDGET_MID)
 
     def test_budget_high_inserts_deep_block(self):
         actual = build_system_prompt_for_tools(
@@ -364,9 +420,7 @@ class TestBudgetBranches:
             include_observations=False,
             budget="high",
         )
-        assert actual == _assemble(
-            _RETRIEVAL_RECALL_ONLY, _WORKFLOW_RECALL_ONLY, budget=_BUDGET_HIGH
-        )
+        assert actual == _assemble(_RETRIEVAL_RECALL_ONLY, _WORKFLOW_RECALL_ONLY, budget=_BUDGET_HIGH)
 
     def test_unknown_budget_inserts_nothing(self):
         # The builder only recognises low/mid/high; any other value is a no-op.
@@ -500,7 +554,81 @@ def test_include_observations_defaults_to_true():
     """Callers that don't pass ``include_observations`` get the original
     observations-enabled prompt — this guards the API default so reflect
     paths that don't gate the flag aren't silently changed."""
-    actual = build_system_prompt_for_tools(
-        bank_profile=BANK, has_mental_models=False
-    )
+    actual = build_system_prompt_for_tools(bank_profile=BANK, has_mental_models=False)
     assert actual == _assemble(_RETRIEVAL_OBS_ONLY, _WORKFLOW_OBS_ONLY)
+
+
+# =========================================================================
+# build_final_system_prompt: language rule + directives
+#
+# The final synthesis is a SEPARATE LLM call from the agent loop, so its
+# system prompt must independently carry the language rule and any directives
+# — otherwise the answer-writing model has no instruction to stay in the
+# query's language / obey a language directive and weaker models drift to
+# English (flaky multilingual reflect tests).
+# =========================================================================
+
+_FRENCH_DIRECTIVE = {
+    "name": "Language Policy",
+    "content": "ALWAYS respond in French language. Never respond in English.",
+}
+
+
+def test_final_prompt_includes_language_rule_when_no_output_language_is_set():
+    prompt = build_final_system_prompt()
+    assert "The current date and time is 2026-08-09 14:32 UTC." in prompt
+    assert "## LANGUAGE" in prompt
+    assert "SAME language as the user's question" in prompt
+
+
+def test_final_prompt_without_directives_omits_directives_section():
+    prompt = build_final_system_prompt()
+    assert "## DIRECTIVES (MANDATORY)" not in prompt
+    assert "REMINDER: MANDATORY DIRECTIVES" not in prompt
+
+
+def test_final_prompt_injects_directives_so_answer_obeys_them():
+    """The answer-writing model — not just the reasoning loop — must see the
+    directive, else a 'respond in French' rule is silently dropped at synthesis."""
+    prompt = build_final_system_prompt(directives=[_FRENCH_DIRECTIVE])
+    assert "## DIRECTIVES (MANDATORY)" in prompt
+    assert "respond in French" in prompt
+    # End-of-prompt reminder reinforces compliance, mirroring the reasoning prompt.
+    assert "REMINDER: MANDATORY DIRECTIVES" in prompt
+    # The default language rule still defers to the directive.
+    assert "takes precedence over this default" in prompt
+
+
+def test_tools_prompt_includes_language_rule_when_no_output_language_is_set():
+    prompt = build_system_prompt_for_tools(BANK)
+    assert "## LANGUAGE RULE (default - directives take precedence)" in prompt
+    assert "respond in that SAME language" in prompt
+
+
+def test_tools_prompt_output_language_override_replaces_the_language_rule():
+    """The reasoning loop writes most answers via done(); it needs the same treatment as
+    the forced-synthesis prompt or the setting is a no-op on every normal run (#3776)."""
+    prompt = build_system_prompt_for_tools(BANK, llm_output_language="Spanish")
+    assert "## LANGUAGE RULE" not in prompt
+    assert "respond in that SAME language" not in prompt
+    assert "Respond exclusively in Spanish" not in prompt, "the directive belongs on the user message"
+    # Everything around the dropped rule is intact.
+    assert "## CRITICAL RULES" in prompt
+    assert "## Memory Bank: TestBank" in prompt
+
+
+def test_final_prompt_output_language_override_replaces_the_language_rule():
+    """HINDSIGHT_API_LLM_OUTPUT_LANGUAGE forces a language regardless of query/directive.
+
+    This used to assert the override merely came *after* the default rule, on the theory
+    that appending it last made it win. It did not, twice over. The rule is phrased more
+    forcefully, so it had to be dropped rather than argued with — and even with the rule
+    gone, "last in the system prompt" is not last: the question and the retrieved data
+    arrive after it in the user message and out-rank it (measured 0/12 English on
+    gemini-2.5-flash-lite). So the system prompt now drops the rule and carries no
+    directive at all; ``build_final_prompt`` closes the user message with it (#3776).
+    """
+    prompt = build_final_system_prompt(llm_output_language="Spanish")
+    assert "## LANGUAGE" not in prompt
+    assert "SAME language as the user's question" not in prompt
+    assert "Respond exclusively in Spanish" not in prompt, "the directive belongs on the user prompt"

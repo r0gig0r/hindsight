@@ -74,6 +74,31 @@ describe("event hook — session.idle", () => {
     expect(opts.metadata.session_id).toBe("sess-1");
   });
 
+  it("passes retainTags from config to retain call", async () => {
+    const client = makeClient();
+    const messages = [
+      { info: { role: "user" }, parts: [{ type: "text", text: "Hello" }] },
+      { info: { role: "assistant" }, parts: [{ type: "text", text: "Hi there" }] },
+    ];
+    const opencodeClient = makeOpencodeClient(messages);
+    const state = makeState();
+    const hooks = createHooks(
+      client,
+      "bank",
+      makeConfig({ retainTags: ["user:alice", "shared"], retainEveryNTurns: 1 }),
+      state,
+      opencodeClient
+    );
+
+    await hooks.event({
+      event: { type: "session.idle", properties: { sessionID: "sess-1" } },
+    });
+
+    expect(client.retain).toHaveBeenCalledTimes(1);
+    const opts = client.retain.mock.calls[0][2];
+    expect(opts.tags).toEqual(["user:alice", "shared"]);
+  });
+
   it("skips retain when autoRetain is false", async () => {
     const client = makeClient();
     const messages = [
@@ -162,39 +187,40 @@ describe("event hook — session.idle", () => {
   });
 });
 
-describe("event hook — session.created", () => {
-  it("tracks session for recall injection", async () => {
+describe("autoRecall is independent of session.created ordering (#1758)", () => {
+  it("injects recall on the first system.transform even if session.created never fired", async () => {
     const state = makeState();
-    const hooks = createHooks(makeClient(), "bank", makeConfig(), state, makeOpencodeClient());
+    const client = makeClient();
+    client.recall.mockResolvedValue({ results: [{ text: "User is a developer", type: "world" }] });
+    const hooks = createHooks(client, "bank", makeConfig(), state, makeOpencodeClient());
 
-    await hooks.event({
-      event: {
-        type: "session.created",
-        properties: { info: { id: "sess-1", title: "Test" } },
-      },
-    });
+    // No session.created beforehand — this is the #1758 reproduction.
+    const output: { system: string[] } = { system: [] };
+    await hooks["experimental.chat.system.transform"]({ sessionID: "sess-1", model: {} }, output);
 
+    expect(output.system.length).toBeGreaterThan(0);
+    expect(output.system[0]).toContain("hindsight_memories");
+    // Marked as recalled so it won't repeat on the next message.
     expect(state.recalledSessions.has("sess-1")).toBe(true);
   });
 
-  it("does not track when autoRecall is false", async () => {
+  it("injects recall even when system.transform fires BEFORE session.created", async () => {
     const state = makeState();
-    const hooks = createHooks(
-      makeClient(),
-      "bank",
-      makeConfig({ autoRecall: false }),
-      state,
-      makeOpencodeClient()
-    );
+    const client = makeClient();
+    client.recall.mockResolvedValue({ results: [{ text: "User is a developer", type: "world" }] });
+    const hooks = createHooks(client, "bank", makeConfig(), state, makeOpencodeClient());
 
+    const out1: { system: string[] } = { system: [] };
+    await hooks["experimental.chat.system.transform"]({ sessionID: "sess-1", model: {} }, out1);
+    expect(out1.system.length).toBeGreaterThan(0); // recall happened on turn 1
+
+    // session.created arriving late is a no-op and must not re-trigger recall.
     await hooks.event({
-      event: {
-        type: "session.created",
-        properties: { info: { id: "sess-1" } },
-      },
+      event: { type: "session.created", properties: { info: { id: "sess-1" } } },
     });
-
-    expect(state.recalledSessions.has("sess-1")).toBe(false);
+    const out2: { system: string[] } = { system: [] };
+    await hooks["experimental.chat.system.transform"]({ sessionID: "sess-1", model: {} }, out2);
+    expect(out2.system.length).toBe(0); // already recalled — deduped
   });
 });
 
@@ -249,6 +275,29 @@ describe("compacting hook", () => {
     const opts = client.retain.mock.calls[0][2];
     expect(opts.documentId).toBe("sess-1");
     expect(opts.metadata.session_id).toBe("sess-1");
+  });
+
+  it("pre-compaction retain passes retainTags from config", async () => {
+    const client = makeClient();
+    client.recall.mockResolvedValue({ results: [] });
+    const messages = [
+      { info: { role: "user" }, parts: [{ type: "text", text: "Hello" }] },
+      { info: { role: "assistant" }, parts: [{ type: "text", text: "Hi" }] },
+    ];
+    const output = { context: [] as string[] };
+    const hooks = createHooks(
+      client,
+      "bank",
+      makeConfig({ retainTags: ["user:alice", "auto-tag"] }),
+      makeState(),
+      makeOpencodeClient(messages)
+    );
+
+    await hooks["experimental.session.compacting"]({ sessionID: "sess-1" }, output);
+
+    expect(client.retain).toHaveBeenCalledTimes(1);
+    const opts = client.retain.mock.calls[0][2];
+    expect(opts.tags).toEqual(["user:alice", "auto-tag"]);
   });
 
   it("pre-compaction retain uses chunked documentId in last-turn mode", async () => {
@@ -307,13 +356,12 @@ describe("compacting hook", () => {
 });
 
 describe("system transform hook", () => {
-  it("injects memories for tracked sessions", async () => {
+  it("injects memories on the first transform for a session", async () => {
     const client = makeClient();
     client.recall.mockResolvedValue({
       results: [{ text: "User is a developer", type: "world" }],
     });
     const state = makeState();
-    state.recalledSessions.add("sess-1");
     const output = { system: [] as string[] };
     const hooks = createHooks(client, "bank", makeConfig(), state, makeOpencodeClient());
 
@@ -321,39 +369,56 @@ describe("system transform hook", () => {
 
     expect(output.system.length).toBeGreaterThan(0);
     expect(output.system[0]).toContain("hindsight_memories");
-    // Session should be removed after first injection
-    expect(state.recalledSessions.has("sess-1")).toBe(false);
+    // Marked as recalled so it won't repeat.
+    expect(state.recalledSessions.has("sess-1")).toBe(true);
   });
 
-  it("skips untracked sessions", async () => {
+  it("appends recall into the existing first system section, not a new one", async () => {
+    // OpenCode emits each system[] entry as a separate system message and some
+    // providers only honor the first; recall must fold into system[0].
     const client = makeClient();
+    client.recall.mockResolvedValue({
+      results: [{ text: "User is a developer", type: "world" }],
+    });
     const state = makeState();
-    const output = { system: [] as string[] };
+    const output = { system: ["You are a helpful coding assistant."] as string[] };
     const hooks = createHooks(client, "bank", makeConfig(), state, makeOpencodeClient());
 
-    await hooks["experimental.chat.system.transform"](
-      { sessionID: "sess-unknown", model: {} },
-      output
-    );
+    await hooks["experimental.chat.system.transform"]({ sessionID: "sess-1", model: {} }, output);
 
-    expect(output.system.length).toBe(0);
-    expect(client.recall).not.toHaveBeenCalled();
+    // Still a single system section — appended, not pushed.
+    expect(output.system.length).toBe(1);
+    expect(output.system[0]).toContain("You are a helpful coding assistant.");
+    expect(output.system[0]).toContain("hindsight_memories");
+    expect(output.system[0]).toContain("User is a developer");
   });
 
-  it("consumes session on empty recall (no repeated queries for empty banks)", async () => {
+  it("deduplicates: does not recall again for an already-recalled session", async () => {
     const client = makeClient();
-    // No results — empty bank
-    client.recall.mockResolvedValue({ results: [] });
     const state = makeState();
-    state.recalledSessions.add("sess-1");
+    state.recalledSessions.add("sess-1"); // already recalled
     const output = { system: [] as string[] };
     const hooks = createHooks(client, "bank", makeConfig(), state, makeOpencodeClient());
 
     await hooks["experimental.chat.system.transform"]({ sessionID: "sess-1", model: {} }, output);
 
-    // No injection, but session consumed — won't re-query on next transform
     expect(output.system.length).toBe(0);
-    expect(state.recalledSessions.has("sess-1")).toBe(false);
+    expect(client.recall).not.toHaveBeenCalled();
+  });
+
+  it("marks session recalled on empty recall (no repeated queries for empty banks)", async () => {
+    const client = makeClient();
+    // No results — empty bank
+    client.recall.mockResolvedValue({ results: [] });
+    const state = makeState();
+    const output = { system: [] as string[] };
+    const hooks = createHooks(client, "bank", makeConfig(), state, makeOpencodeClient());
+
+    await hooks["experimental.chat.system.transform"]({ sessionID: "sess-1", model: {} }, output);
+
+    // No injection, but session marked — won't re-query on next transform
+    expect(output.system.length).toBe(0);
+    expect(state.recalledSessions.has("sess-1")).toBe(true);
   });
 
   it("retries recall on next transform after transient API failure", async () => {
@@ -365,26 +430,24 @@ describe("system transform hook", () => {
       results: [{ text: "Found it", type: "world" }],
     });
     const state = makeState();
-    state.recalledSessions.add("sess-1");
     const hooks = createHooks(client, "bank", makeConfig(), state, makeOpencodeClient());
 
-    // First attempt — API error, session preserved for retry
+    // First attempt — API error, NOT marked, so it retries next time
     const output1 = { system: [] as string[] };
     await hooks["experimental.chat.system.transform"]({ sessionID: "sess-1", model: {} }, output1);
     expect(output1.system.length).toBe(0);
-    expect(state.recalledSessions.has("sess-1")).toBe(true);
+    expect(state.recalledSessions.has("sess-1")).toBe(false);
 
-    // Second attempt — succeeds, session consumed
+    // Second attempt — succeeds, injected and marked
     const output2 = { system: [] as string[] };
     await hooks["experimental.chat.system.transform"]({ sessionID: "sess-1", model: {} }, output2);
     expect(output2.system.length).toBeGreaterThan(0);
-    expect(state.recalledSessions.has("sess-1")).toBe(false);
+    expect(state.recalledSessions.has("sess-1")).toBe(true);
   });
 
   it("skips when autoRecall is false", async () => {
     const client = makeClient();
     const state = makeState();
-    state.recalledSessions.add("sess-1");
     const output = { system: [] as string[] };
     const hooks = createHooks(
       client,
@@ -397,5 +460,68 @@ describe("system transform hook", () => {
     await hooks["experimental.chat.system.transform"]({ sessionID: "sess-1", model: {} }, output);
 
     expect(output.system.length).toBe(0);
+    expect(client.recall).not.toHaveBeenCalled();
+  });
+
+  it("queries on the user's latest message instead of a fixed string", async () => {
+    const client = makeClient();
+    const messages = [
+      {
+        info: { role: "user" },
+        parts: [{ type: "text", text: "How do I configure Oracle vector search?" }],
+      },
+    ];
+    const state = makeState();
+    const output = { system: [] as string[] };
+    const hooks = createHooks(
+      client,
+      "bank",
+      makeConfig({ recallContextTurns: 1 }),
+      state,
+      makeOpencodeClient(messages)
+    );
+
+    await hooks["experimental.chat.system.transform"]({ sessionID: "sess-1", model: {} }, output);
+
+    expect(client.recall).toHaveBeenCalledTimes(1);
+    expect(client.recall.mock.calls[0][1]).toBe("How do I configure Oracle vector search?");
+  });
+
+  it("includes prior turns when recallContextTurns > 1", async () => {
+    const client = makeClient();
+    const messages = [
+      { info: { role: "user" }, parts: [{ type: "text", text: "Set up the database" }] },
+      { info: { role: "assistant" }, parts: [{ type: "text", text: "Which engine?" }] },
+      { info: { role: "user" }, parts: [{ type: "text", text: "Use Postgres with pgvector" }] },
+    ];
+    const state = makeState();
+    const output = { system: [] as string[] };
+    const hooks = createHooks(
+      client,
+      "bank",
+      makeConfig({ recallContextTurns: 3 }),
+      state,
+      makeOpencodeClient(messages)
+    );
+
+    await hooks["experimental.chat.system.transform"]({ sessionID: "sess-1", model: {} }, output);
+
+    const query = client.recall.mock.calls[0][1] as string;
+    expect(query).toContain("Use Postgres with pgvector");
+    expect(query).toContain("Prior context:");
+    expect(query).toContain("Set up the database");
+  });
+
+  it("falls back to the generic query when there is no user message yet", async () => {
+    const client = makeClient();
+    const state = makeState();
+    const output = { system: [] as string[] };
+    // No messages available on the session.
+    const hooks = createHooks(client, "bank", makeConfig(), state, makeOpencodeClient());
+
+    await hooks["experimental.chat.system.transform"]({ sessionID: "sess-1", model: {} }, output);
+
+    expect(client.recall).toHaveBeenCalledTimes(1);
+    expect(client.recall.mock.calls[0][1]).toBe("project context and recent work");
   });
 });

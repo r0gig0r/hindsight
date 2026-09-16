@@ -15,13 +15,20 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lib.client import HindsightClient
 from lib.config import debug_log, load_config
 from lib.daemon import get_api_url, prestart_daemon_background
+from lib.upgrade_notice import upgrade_notice
 
 
 def main():
     config = load_config()
+
+    # Emitted BEFORE any of the early returns below: whether memory is enabled, or the server is
+    # even reachable, has no bearing on whether this plugin has been superseded. `systemMessage` is
+    # the channel Claude Code shows to the USER (additionalContext would only reach the model).
+    notice = upgrade_notice(config)
+    if notice:
+        print(json.dumps({"systemMessage": notice, "hookSpecificOutput": {"hookEventName": "SessionStart"}}))
 
     if not config.get("autoRecall") and not config.get("autoRetain"):
         debug_log(config, "Both autoRecall and autoRetain disabled, skipping session start")
@@ -42,7 +49,6 @@ def main():
 
     try:
         api_url = get_api_url(config, debug_fn=_dbg, allow_daemon_start=False)
-        client = HindsightClient(api_url, config.get("hindsightApiToken"))
         debug_log(config, f"Hindsight server reachable at {api_url}")
     except (RuntimeError, ValueError) as e:
         # Server not running — kick off background pre-start so it's ready

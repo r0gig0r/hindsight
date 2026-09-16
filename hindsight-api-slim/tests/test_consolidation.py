@@ -4,9 +4,11 @@ These tests exercise the real consolidation implementation with actual database 
 Note: Consolidation runs automatically after retain via SyncTaskBackend in tests.
 """
 
+from hindsight_api.engine.response_models import LLMCallResult, TokenUsage
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -24,6 +26,21 @@ from hindsight_api.engine.reflect.tools import (
     tool_search_mental_models,
     tool_search_observations,
 )
+from tests.llm_judge import assert_meets_criteria
+
+
+async def _unconsolidated(memory: MemoryEngine, bank_id: str, request_context) -> int:
+    """How many source facts are still waiting to be consolidated.
+
+    consolidation_state='pending' is the read API's name for the predicate these
+    tests used to spell out in SQL: consolidated_at IS NULL and a source fact type.
+    It additionally excludes facts whose consolidation permanently failed — the
+    stricter reading, and the one the assertions here actually mean.
+    """
+    page = await memory.list_memory_units(
+        bank_id=bank_id, consolidation_state="pending", limit=1, request_context=request_context
+    )
+    return page["total"]
 
 
 @pytest.fixture(autouse=True)
@@ -61,23 +78,18 @@ class TestConsolidationIntegration:
             request_context=request_context,
         )
 
-        # Verify observation exists in memory_units
+        # Verify observation exists via the list API
         # (consolidation already ran as part of retain via SyncTaskBackend)
-        async with memory._pool.acquire() as conn:
-            observations = await conn.fetch(
-                """
-                SELECT id, text, proof_count, fact_type
-                FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                """,
-                bank_id,
+        observations = (
+            await memory.list_memory_units(
+                bank_id, fact_type="observation", limit=1000, request_context=request_context
             )
-            # Observation may or may not be created depending on LLM relevance judgment
-            # The important thing is no errors occurred
-            if observations:
-                obs = observations[0]
-                assert obs["proof_count"] >= 1
-                assert obs["fact_type"] == "observation"
+        )["items"]
+        # With the deterministic mock, consolidation always produces observations
+        assert len(observations) >= 1, "Consolidation must create at least one observation"
+        obs = observations[0]
+        assert obs["proof_count"] >= 1
+        assert obs["fact_type"] == "observation"
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -105,24 +117,16 @@ class TestConsolidationIntegration:
         )
 
         # Check observations after both retains
-        async with memory._pool.acquire() as conn:
-            observations = await conn.fetch(
-                """
-                SELECT id, text, proof_count
-                FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                ORDER BY proof_count DESC
-                """,
-                bank_id,
+        observations = (
+            await memory.list_memory_units(
+                bank_id, fact_type="observation", limit=1000, request_context=request_context
             )
+        )["items"]
 
-            # Should have at least one observation
-            # If the LLM determined both memories support the same observation,
-            # proof_count might be > 1
-            if observations:
-                # Verify structure is correct
-                assert all(obs["text"] for obs in observations)
-                assert all(obs["proof_count"] >= 1 for obs in observations)
+        # Must have at least one observation from consolidation
+        assert len(observations) >= 1, "Consolidation must create observations from retained memories"
+        assert all(obs["text"] for obs in observations)
+        assert all(obs["proof_count"] >= 1 for obs in observations)
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -210,30 +214,17 @@ class TestConsolidationIntegration:
         )
 
         # Check observation and its entity links
-        async with memory._pool.acquire() as conn:
-            observation = await conn.fetchrow(
-                """
-                SELECT id
-                FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                LIMIT 1
-                """,
-                bank_id,
-            )
+        observations = await memory.list_memory_units(
+            bank_id, fact_type="observation", limit=1, request_context=request_context
+        )
 
-            if observation:
-                # Check if entity links were copied
-                entity_links = await conn.fetch(
-                    """
-                    SELECT entity_id
-                    FROM unit_entities
-                    WHERE unit_id = $1
-                    """,
-                    observation["id"],
-                )
-                # Observation should have inherited entity links from source memory
-                # (may be empty if no entities were extracted, which is fine)
-                assert entity_links is not None
+        # Consolidation must create an observation
+        assert observations["items"], "Consolidation must create an observation"
+
+        # An observation carries the entities of the facts it was drawn from, so the
+        # detail view is where the copied links show up.
+        observation = await memory.get_memory_unit(bank_id, observations["items"][0]["id"], request_context)
+        assert observation["entities"] is not None
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -268,6 +259,7 @@ class TestConsolidationIntegration:
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
+    @pytest.mark.memory_backend_incompatible
     async def test_consolidation_uses_source_memory_ids(self, memory: MemoryEngine, request_context):
         """Test that observations use source_memory_ids (not memory_links) to track source facts.
 
@@ -302,122 +294,48 @@ class TestConsolidationIntegration:
                 bank_id,
             )
 
-            if observation:
-                # Observation should have source_memory_ids
-                assert observation["source_memory_ids"] is not None, "Observation should have source_memory_ids"
-                assert len(observation["source_memory_ids"]) > 0, "Observation should have at least one source memory"
+            assert observation is not None, "Consolidation must create an observation"
 
-                source_memory_id = observation["source_memory_ids"][0]
+            # Observation should have source_memory_ids
+            assert observation["source_memory_ids"] is not None, "Observation should have source_memory_ids"
+            assert len(observation["source_memory_ids"]) > 0, "Observation should have at least one source memory"
 
-                # Verify the source memory exists
-                source_memory = await conn.fetchrow(
-                    """
-                    SELECT id, fact_type FROM memory_units WHERE id = $1
-                    """,
-                    source_memory_id,
-                )
-                assert source_memory is not None, "Source memory should exist"
-                assert source_memory["fact_type"] in ("world", "experience"), "Source should be a fact"
+            source_memory_id = observation["source_memory_ids"][0]
 
-                # No memory_links should exist between observation and source
-                # (observations rely on source_memory_ids for traversal)
-                links = await conn.fetch(
-                    """
-                    SELECT * FROM memory_links
-                    WHERE (from_unit_id = $1 AND to_unit_id = $2)
-                       OR (from_unit_id = $2 AND to_unit_id = $1)
-                    """,
-                    source_memory_id,
-                    observation["id"],
-                )
-                assert len(links) == 0, "No memory_links should exist between observation and source"
-
-        # Cleanup
-        await memory.delete_bank(bank_id, request_context=request_context)
-
-    @pytest.mark.hs_llm_mat
-    @pytest.mark.asyncio
-    async def test_consolidation_merges_only_redundant_facts(self, memory: MemoryEngine, request_context):
-        """Test that consolidation only merges truly redundant facts.
-
-        Observations should be fine-grained (almost 1:1 with memories).
-        Only merge when facts are truly redundant (saying the same thing differently)
-        or when one directly updates another (e.g., location change).
-
-        Given:
-        - "Alex lives in Italy"
-        - "Alex moved to the US recently" (updates the living location)
-
-        The second fact should UPDATE the first, not create a separate observation.
-        But unrelated facts like "Alex works at Vectorize" should stay separate.
-        """
-        bank_id = f"test-consolidation-merge-{uuid.uuid4().hex[:8]}"
-
-        # Create the bank
-        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
-
-        # Retain a memory about living location
-        await memory.retain_async(
-            bank_id=bank_id,
-            content="Alex lives in Italy.",
-            request_context=request_context,
-        )
-
-        # Retain an unrelated memory (different topic - should NOT merge)
-        await memory.retain_async(
-            bank_id=bank_id,
-            content="Alex works at Vectorize as an engineer.",
-            request_context=request_context,
-        )
-
-        # Check observations - should have 2 separate observations
-        async with memory._pool.acquire() as conn:
-            obs_before = await conn.fetch(
+            # Verify the source memory exists
+            source_memory = await conn.fetchrow(
                 """
-                SELECT id, text FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
+                SELECT id, fact_type FROM memory_units WHERE id = $1
                 """,
-                bank_id,
+                source_memory_id,
             )
+            assert source_memory is not None, "Source memory should exist"
+            assert source_memory["fact_type"] in ("world", "experience"), "Source should be a fact"
 
-        # Add a memory that UPDATES the living location (should merge with first)
-        await memory.retain_async(
-            bank_id=bank_id,
-            content="Alex recently moved to the United States.",
-            request_context=request_context,
-        )
-
-        # Check observations after consolidation
-        async with memory._pool.acquire() as conn:
-            observations = await conn.fetch(
+            # No memory_links should exist between observation and source
+            # (observations rely on source_memory_ids for traversal)
+            links = await conn.fetch(
                 """
-                SELECT id, text, proof_count, source_memory_ids
-                FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                ORDER BY created_at
+                SELECT * FROM memory_links
+                WHERE (from_unit_id = $1 AND to_unit_id = $2)
+                   OR (from_unit_id = $2 AND to_unit_id = $1)
                 """,
-                bank_id,
+                source_memory_id,
+                observation["id"],
             )
-
-            # Key assertions:
-            # 1. Consolidation ran without errors
-            # 2. Observations exist
-            assert len(observations) >= 1, "Expected at least one observation"
-
-            # The work-related fact should remain separate from location facts
-            # (LLM behavior varies, so we check structure rather than exact count)
-            for obs in observations:
-                assert obs["text"], "Observation should have text"
+            assert len(links) == 0, "No memory_links should exist between observation and source"
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
-    async def test_consolidation_keeps_different_people_separate(self, memory: MemoryEngine, request_context):
+    @pytest.mark.hs_llm_core
+    async def test_consolidation_keeps_different_people_separate(self, memory_real_llm: MemoryEngine, request_context):
         """Test that consolidation NEVER merges facts about different people.
 
         Each person's facts should stay in separate observations.
         """
+        memory = memory_real_llm
         bank_id = f"test-consolidation-people-{uuid.uuid4().hex[:8]}"
 
         # Create the bank
@@ -441,34 +359,52 @@ class TestConsolidationIntegration:
         )
 
         # Check observations - should have separate observations for each person
-        async with memory._pool.acquire() as conn:
-            observations = await conn.fetch(
-                """
-                SELECT id, text, source_memory_ids
-                FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                """,
-                bank_id,
+        observations = (
+            await memory.list_memory_units(
+                bank_id, fact_type="observation", limit=1000, request_context=request_context
             )
+        )["items"]
 
-            # Should have multiple observations (one per person/fact)
-            # Not everything merged into one
-            assert len(observations) >= 2, (
-                f"Expected multiple observations for different people, got {len(observations)}"
-            )
+        # Should have multiple observations (one per person/fact)
+        # Not everything merged into one
+        assert len(observations) >= 2, f"Expected multiple observations for different people, got {len(observations)}"
 
-            # No single observation should mention multiple different people
-            # (This is a structural check - each observation should be focused)
-            for obs in observations:
-                text = obs["text"].lower()
-                people_mentioned = sum([1 for name in ["john", "mary", "bob"] if name in text])
-                assert people_mentioned <= 1, f"Observation should not merge different people: {obs['text']}"
+        # Fast structural check first: no single observation should name more
+        # than one of {John, Mary, Bob}.  This catches the obvious failure mode
+        # cheaply without paying for a judge call per observation.
+        for obs in observations:
+            text = obs["text"].lower()
+            people_mentioned = sum(1 for name in ["john", "mary", "bob"] if name in text)
+            assert people_mentioned <= 1, f"Observation should not merge different people: {obs['text']}"
+
+        obs_listing = "\n".join(f"Observation {i + 1}: {obs['text']}" for i, obs in enumerate(observations))
+
+        # Semantic backup: catch the case where the LLM merges facts about different
+        # people using pronouns or referent shifts that bypass the proper-noun check
+        # (e.g. an observation that says "They each live in different cities and one
+        # works at Google").
+        await assert_meets_criteria(
+            response=obs_listing,
+            criteria=(
+                "No single observation in the numbered list blends facts about multiple different "
+                "people. It's fine if there are several observations and each focuses on one person "
+                "(John, Mary, or Bob); the failure case is a single observation that conflates "
+                "two or more of them into one combined statement."
+            ),
+            context=(
+                "Three independent facts were stored: 'John lives in New York.', "
+                "'Mary lives in Boston.', and 'Bob works at Google.' These should produce "
+                "separate observations — they are unrelated."
+            ),
+            msg=f"Observations should not conflate distinct people. Got: {[obs['text'] for obs in observations]}",
+        )
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
-    async def test_consolidation_merges_contradictions(self, memory: MemoryEngine, request_context):
+    @pytest.mark.hs_llm_core
+    async def test_consolidation_merges_contradictions(self, memory_real_llm: MemoryEngine, request_context):
         """Test that contradictions about the same topic are merged with history.
 
         When facts contradict each other (same person, same topic, opposite info),
@@ -479,6 +415,7 @@ class TestConsolidationIntegration:
         - "Alex hates pizza"
         → Should become: "Alex used to love pizza but now hates it" (or similar)
         """
+        memory = memory_real_llm
         bank_id = f"test-consolidation-contradict-{uuid.uuid4().hex[:8]}"
 
         # Create the bank
@@ -493,15 +430,12 @@ class TestConsolidationIntegration:
         await memory.wait_for_background_tasks()
 
         # Check we have one observation
-        async with memory._pool.acquire() as conn:
-            obs_before = await conn.fetch(
-                """
-                SELECT id, text FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                """,
-                bank_id,
+        obs_before = (
+            await memory.list_memory_units(
+                bank_id, fact_type="observation", limit=1000, request_context=request_context
             )
-            count_before = len(obs_before)
+        )["items"]
+        count_before = len(obs_before)
 
         # Add contradicting fact (same person, same topic, opposite sentiment)
         await memory.retain_async(
@@ -512,40 +446,98 @@ class TestConsolidationIntegration:
         await memory.wait_for_background_tasks()
 
         # Check observations after consolidation
-        async with memory._pool.acquire() as conn:
-            observations = await conn.fetch(
-                """
-                SELECT id, text, source_memory_ids, history
-                FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                """,
-                bank_id,
-            )
+        observations = (
+            await memory.list_memory_units(bank_id, fact_type="observation", limit=500, request_context=request_context)
+        )["items"]
 
-            # The contradiction should be reflected in observations — either:
-            # 1. Merged into one observation with temporal context (e.g., "used to love, now hates")
-            # 2. The original observation updated to reflect the new state
-            # 3. Two separate observations capturing each state
-            # The key is that the contradiction is tracked, not ignored.
-            assert len(observations) >= 1, "Should have at least one observation after contradiction"
+        # The contradiction should be reflected in observations — either:
+        # 1. Merged into one observation with temporal context (e.g., "used to love, now hates")
+        # 2. The original observation updated to reflect the new state
+        # 3. Two separate observations capturing each state
+        # The key is that the contradiction is tracked, not ignored.
+        assert len(observations) >= 1, "Should have at least one observation after contradiction"
 
-            all_texts = " ".join(obs["text"].lower() for obs in observations)
-            all_source_ids = []
-            for obs in observations:
-                all_source_ids.extend(obs["source_memory_ids"] or [])
-            # At least one observation should reference the contradiction
-            # (either via text content or by having multiple source memories)
-            has_contradiction_awareness = (
-                ("hate" in all_texts or "hates" in all_texts)
-                or ("used to" in all_texts or "now" in all_texts or "but" in all_texts)
-                or len(all_source_ids) > 1
-            )
-            assert has_contradiction_awareness, (
-                f"Observations should reflect the contradiction. Got: {[obs['text'] for obs in observations]}"
+        # Format as numbered list rather than pipe-separated — weaker judge
+        # models read pipe-joins as a single conflated statement.
+        obs_listing = "\n".join(f"Observation {i + 1}: {obs['text']}" for i, obs in enumerate(observations))
+        all_source_ids = []
+        for obs in observations:
+            all_source_ids.extend(obs["source_memory_ids"])
+
+        # Either the observations reference both sentiments (via text content) or the
+        # consolidation linked both source memories together. The judge evaluates the
+        # text path semantically — without it, paraphrases like "no longer enjoys" or
+        # "switched away from" would fail a literal substring check.
+        if len(all_source_ids) <= 1:
+            await assert_meets_criteria(
+                response=obs_listing,
+                criteria=(
+                    "The observation(s) reflect that Alex's feelings about pizza changed — either by "
+                    "mentioning both states (loved/hated), using temporal language (used to, now, "
+                    "but, no longer, switched, changed), or otherwise capturing the contradiction."
+                ),
+                context="Source facts: 'Alex loves pizza.' followed by 'Alex hates pizza.'",
+                msg=f"Observations should track the contradiction. Got: {[obs['text'] for obs in observations]}",
             )
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    @pytest.mark.hs_llm_core
+    @pytest.mark.flaky(reruns=2, reruns_delay=2)
+    async def test_consolidation_reduces_count_for_near_duplicate_facts(
+        self, memory_real_llm: MemoryEngine, request_context
+    ):
+        """Consolidation with a real LLM should merge near-duplicate facts.
+
+        MockLLM always emits one observation per fact — it never merges.  This test
+        verifies that the real consolidation prompt actually collapses semantically
+        redundant information.  Three phrasings of the same email address should
+        yield fewer than three observations.
+        """
+        memory = memory_real_llm
+        bank_id = f"test-consolidation-count-{uuid.uuid4().hex[:8]}"
+        try:
+            await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+            # Three near-identical facts — same information, different wording
+            for content in [
+                "Sarah's email is sarah@example.com.",
+                "You can reach Sarah at sarah@example.com.",
+                "Sarah's contact email address is sarah@example.com.",
+            ]:
+                await memory.retain_async(bank_id=bank_id, content=content, request_context=request_context)
+
+            await memory.wait_for_background_tasks()
+
+            # Two clearly distinct facts that should stay separate
+            await memory.retain_async(
+                bank_id=bank_id, content="Sarah is a product manager.", request_context=request_context
+            )
+            await memory.retain_async(
+                bank_id=bank_id, content="Sarah is based in Austin, Texas.", request_context=request_context
+            )
+
+            await memory.wait_for_background_tasks()
+
+            observations = (
+                await memory.list_memory_units(
+                    bank_id, fact_type="observation", limit=1000, request_context=request_context
+                )
+            )["items"]
+
+            obs_count = len(observations)
+            obs_texts = [o["text"] for o in observations]
+
+            # 5 input facts, 3 are near-duplicates — real consolidation must merge some
+            assert obs_count < 5, (
+                f"Expected fewer than 5 observations after merging near-duplicates. Got {obs_count}: {obs_texts}"
+            )
+            # The two distinct facts should still have representation
+            assert obs_count >= 2, f"Expected at least 2 observations for distinct facts. Got {obs_count}: {obs_texts}"
+        finally:
+            await memory.delete_bank(bank_id, request_context=request_context)
 
 
 class TestConsolidationDisabled:
@@ -694,6 +686,7 @@ class TestRecallObservationFactType:
         await memory.delete_bank(bank_id, request_context=request_context)
 
 
+@pytest.mark.hs_llm_core
 class TestConsolidationTagRouting:
     """Test tag routing during consolidation.
 
@@ -703,6 +696,11 @@ class TestConsolidationTagRouting:
     - Different scopes (non-overlapping tags): create untagged cross-scope insight
     - No match: create with fact's tags
     """
+
+    @pytest.fixture
+    def memory(self, memory_real_llm):
+        """Override the memory fixture to use real LLM for this class."""
+        return memory_real_llm
 
     async def _retain_with_tags(
         self,
@@ -740,19 +738,16 @@ class TestConsolidationTagRouting:
         await self._retain_with_tags(memory, bank_id, "Alice likes coffee.", ["alice"], request_context)
 
         # Check observation has correct tags
-        async with memory._pool.acquire() as conn:
-            obs_before = await conn.fetch(
-                """
-                SELECT id, text, tags FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                """,
-                bank_id,
+        obs_before = (
+            await memory.list_memory_units(
+                bank_id, fact_type="observation", limit=1000, request_context=request_context
             )
-            count_before = len(obs_before)
-            if obs_before:
-                assert "alice" in (obs_before[0]["tags"] or []), (
-                    f"Expected observation to have 'alice' tag, got: {obs_before[0]['tags']}"
-                )
+        )["items"]
+        count_before = len(obs_before)
+        if obs_before:
+            assert "alice" in (obs_before[0]["tags"] or []), (
+                f"Expected observation to have 'alice' tag, got: {obs_before[0]['tags']}"
+            )
 
         # Retain related memory with same tags
         await self._retain_with_tags(
@@ -760,25 +755,22 @@ class TestConsolidationTagRouting:
         )
 
         # Check observations - should NOT have increased (same scope update)
-        async with memory._pool.acquire() as conn:
-            obs_after = await conn.fetch(
-                """
-                SELECT id, text, tags, source_memory_ids FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                """,
-                bank_id,
+        obs_after = (
+            await memory.list_memory_units(
+                bank_id, fact_type="observation", limit=1000, request_context=request_context
             )
+        )["items"]
 
-            # Count of observations should stay same or decrease (merge)
-            assert len(obs_after) <= count_before + 1, (
-                f"Same scope fact should update existing observation, not create new. "
-                f"Before: {count_before}, After: {len(obs_after)}"
-            )
+        # Count of observations should stay same or decrease (merge)
+        assert len(obs_after) <= count_before + 1, (
+            f"Same scope fact should update existing observation, not create new. "
+            f"Before: {count_before}, After: {len(obs_after)}"
+        )
 
-            # The observation(s) should still have alice tag
-            for obs in obs_after:
-                if "coffee" in obs["text"].lower() or "espresso" in obs["text"].lower():
-                    assert "alice" in (obs["tags"] or []), f"Updated observation should keep 'alice' tag: {obs['text']}"
+        # The observation(s) should still have alice tag
+        for obs in obs_after:
+            if "coffee" in obs["text"].lower() or "espresso" in obs["text"].lower():
+                assert "alice" in (obs["tags"] or []), f"Updated observation should keep 'alice' tag: {obs['text']}"
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -808,48 +800,41 @@ class TestConsolidationTagRouting:
         await memory.wait_for_background_tasks()
 
         # Check untagged observation exists
-        async with memory._pool.acquire() as conn:
-            obs_before = await conn.fetch(
-                """
-                SELECT id, text, tags FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                """,
-                bank_id,
+        obs_before = (
+            await memory.list_memory_units(
+                bank_id, fact_type="observation", limit=1000, request_context=request_context
             )
-            count_before = len(obs_before)
-            # Should be untagged or have empty tags
-            if obs_before:
-                assert not obs_before[0]["tags"] or len(obs_before[0]["tags"]) == 0, (
-                    f"Expected untagged observation, got: {obs_before[0]['tags']}"
-                )
+        )["items"]
+        count_before = len(obs_before)
+        # Should be untagged or have empty tags
+        if obs_before:
+            assert not obs_before[0]["tags"] or len(obs_before[0]["tags"]) == 0, (
+                f"Expected untagged observation, got: {obs_before[0]['tags']}"
+            )
 
         # Retain scoped memory that relates to the global topic
         await self._retain_with_tags(memory, bank_id, "Pizza originated in Naples.", ["history"], request_context)
         await memory.wait_for_background_tasks()
 
         # Check - global observation should be updated OR new scoped observation created
-        async with memory._pool.acquire() as conn:
-            obs_after = await conn.fetch(
-                """
-                SELECT id, text, tags, source_memory_ids FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                ORDER BY created_at
-                """,
-                bank_id,
+        obs_after = (
+            await memory.list_memory_units(
+                bank_id, fact_type="observation", limit=1000, request_context=request_context
             )
+        )["items"]
 
-            # At least one observation should exist
-            assert len(obs_after) >= 1, "Expected at least one observation"
+        # At least one observation should exist
+        assert len(obs_after) >= 1, "Expected at least one observation"
 
-            # Check that global observation was updated (source_memory_ids increased)
-            # OR new observation was created with appropriate tags
-            global_observations = [o for o in obs_after if not o["tags"] or len(o["tags"]) == 0]
-            scoped_observations = [o for o in obs_after if o["tags"] and len(o["tags"]) > 0]
+        # Check that global observation was updated (source_memory_ids increased)
+        # OR new observation was created with appropriate tags
+        global_observations = [o for o in obs_after if not o["tags"] or len(o["tags"]) == 0]
+        scoped_observations = [o for o in obs_after if o["tags"] and len(o["tags"]) > 0]
 
-            # Either global was updated or scoped was created
-            assert len(global_observations) >= 1 or len(scoped_observations) >= 1, (
-                "Expected either global observation update or scoped observation creation"
-            )
+        # Either global was updated or scoped was created
+        assert len(global_observations) >= 1 or len(scoped_observations) >= 1, (
+            "Expected either global observation update or scoped observation creation"
+        )
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -877,15 +862,12 @@ class TestConsolidationTagRouting:
         await memory.wait_for_background_tasks()
 
         # Check Alice's observation exists with correct tags
-        async with memory._pool.acquire() as conn:
-            obs_alice = await conn.fetch(
-                """
-                SELECT id, text, tags FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                """,
-                bank_id,
+        obs_alice = (
+            await memory.list_memory_units(
+                bank_id, fact_type="observation", limit=1000, request_context=request_context
             )
-            count_before = len(obs_alice)
+        )["items"]
+        count_before = len(obs_alice)
 
         # Retain Bob's memory that relates to Alice's topic (cross-scope)
         await self._retain_with_tags(
@@ -894,28 +876,22 @@ class TestConsolidationTagRouting:
         await memory.wait_for_background_tasks()
 
         # Check observations
-        async with memory._pool.acquire() as conn:
-            obs_after = await conn.fetch(
-                """
-                SELECT id, text, tags, source_memory_ids FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                ORDER BY created_at
-                """,
-                bank_id,
+        obs_after = (
+            await memory.list_memory_units(
+                bank_id, fact_type="observation", limit=1000, request_context=request_context
             )
+        )["items"]
 
-            # Note: some LLMs may or may not consolidate cross-scope facts.
-            # Just verify structural correctness of any observations that exist.
+        # Note: some LLMs may or may not consolidate cross-scope facts.
+        # Just verify structural correctness of any observations that exist.
 
-            # If observations were created, ensure alice and bob are not merged into same observation
-            # (cross-scope merging should not produce an observation with both tags)
-            if obs_after:
-                observations_with_both = [
-                    o for o in obs_after if o["tags"] and "alice" in o["tags"] and "bob" in o["tags"]
-                ]
-                assert len(observations_with_both) == 0, (
-                    "Should not merge different scopes into one observation with both tags"
-                )
+        # If observations were created, ensure alice and bob are not merged into same observation
+        # (cross-scope merging should not produce an observation with both tags)
+        if obs_after:
+            observations_with_both = [o for o in obs_after if o["tags"] and "alice" in o["tags"] and "bob" in o["tags"]]
+            assert len(observations_with_both) == 0, (
+                "Should not merge different scopes into one observation with both tags"
+            )
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -942,21 +918,18 @@ class TestConsolidationTagRouting:
         )
 
         # Check observation was created with correct tags
-        async with memory._pool.acquire() as conn:
-            observations = await conn.fetch(
-                """
-                SELECT id, text, tags FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                """,
-                bank_id,
+        observations = (
+            await memory.list_memory_units(
+                bank_id, fact_type="observation", limit=1000, request_context=request_context
             )
+        )["items"]
 
-            assert len(observations) >= 1, "Expected observation to be created"
+        assert len(observations) >= 1, "Expected observation to be created"
 
-            # The observation should have the fact's tags
-            obs = observations[0]
-            assert obs["tags"] is not None, "Observation should have tags"
-            assert "project_x" in obs["tags"], f"Observation should have 'project_x' tag, got: {obs['tags']}"
+        # The observation should have the fact's tags
+        obs = observations[0]
+        assert obs["tags"] is not None, "Observation should have tags"
+        assert "project_x" in obs["tags"], f"Observation should have 'project_x' tag, got: {obs['tags']}"
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -993,22 +966,18 @@ class TestConsolidationTagRouting:
         await memory.wait_for_background_tasks()
 
         # Check observations
-        async with memory._pool.acquire() as conn:
-            observations = await conn.fetch(
-                """
-                SELECT id, text, tags, source_memory_ids FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                ORDER BY created_at
-                """,
-                bank_id,
+        observations = (
+            await memory.list_memory_units(
+                bank_id, fact_type="observation", limit=1000, request_context=request_context
             )
+        )["items"]
 
-            # Either alice's observation was updated OR a global observation was created
-            # This is valid LLM behavior - just verify no errors and structure is correct.
-            # Note: with some LLMs, a single simple fact may not generate an observation,
-            # so we don't assert a minimum count - just verify structural correctness if any exist.
-            for obs in observations:
-                assert obs["text"], "Observation should have text"
+        # Either alice's observation was updated OR a global observation was created
+        # This is valid LLM behavior - just verify no errors and structure is correct.
+        # Note: with some LLMs, a single simple fact may not generate an observation,
+        # so we don't assert a minimum count - just verify structural correctness if any exist.
+        for obs in observations:
+            assert obs["text"], "Observation should have text"
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -1079,15 +1048,12 @@ class TestConsolidationTagRouting:
         await self._retain_with_tags(memory, bank_id, "Alice drinks coffee every morning.", ["alice"], request_context)
 
         # Check observations before
-        async with memory._pool.acquire() as conn:
-            obs_before = await conn.fetch(
-                """
-                SELECT id, text, tags, source_memory_ids FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                """,
-                bank_id,
+        obs_before = (
+            await memory.list_memory_units(
+                bank_id, fact_type="observation", limit=1000, request_context=request_context
             )
-            count_before = len(obs_before)
+        )["items"]
+        count_before = len(obs_before)
 
         # Add fact that could relate to both
         await self._retain_with_tags(
@@ -1095,24 +1061,20 @@ class TestConsolidationTagRouting:
         )
 
         # Check observations after
-        async with memory._pool.acquire() as conn:
-            obs_after = await conn.fetch(
-                """
-                SELECT id, text, tags, source_memory_ids, proof_count FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                ORDER BY created_at
-                """,
-                bank_id,
+        obs_after = (
+            await memory.list_memory_units(
+                bank_id, fact_type="observation", limit=1000, request_context=request_context
             )
+        )["items"]
 
-            # Should have processed without errors
-            assert len(obs_after) >= 1, "Expected at least one observation"
+        # Should have processed without errors
+        assert len(obs_after) >= 1, "Expected at least one observation"
 
-            # Check that consolidation worked (either updates or maintains structure)
-            # The key is no errors and proper tag handling
-            for obs in obs_after:
-                assert obs["text"], "Observation should have text"
-                # Tags should be consistent (not mixing alice and bob, etc.)
+        # Check that consolidation worked (either updates or maintains structure)
+        # The key is no errors and proper tag handling
+        for obs in obs_after:
+            assert obs["text"], "Observation should have text"
+            # Tags should be consistent (not mixing alice and bob, etc.)
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -1175,22 +1137,23 @@ class TestConsolidationTagRouting:
                 bank_id,
             )
 
-            if observation:
-                # Observation should have inherited the date from the source memory
-                obs_occurred = observation["occurred_start"]
-                obs_event_date = observation["event_date"]
+            assert observation is not None, "Consolidation must create an observation"
 
-                # Dates should match the source memory's date (2023-06-15), not today
-                assert obs_occurred is not None, "Observation should have occurred_start"
-                assert obs_event_date is not None, "Observation should have event_date"
+            # Observation should have inherited the date from the source memory
+            obs_occurred = observation["occurred_start"]
+            obs_event_date = observation["event_date"]
 
-                # The date should be from 2023, not today
-                assert obs_occurred.year == 2023, (
-                    f"Expected occurred_start year 2023, got {obs_occurred.year}. "
-                    "Observation should inherit date from source memory."
-                )
-                assert obs_occurred.month == 6, f"Expected month 6, got {obs_occurred.month}"
-                assert obs_occurred.day == 15, f"Expected day 15, got {obs_occurred.day}"
+            # Dates should match the source memory's date (2023-06-15), not today
+            assert obs_occurred is not None, "Observation should have occurred_start"
+            assert obs_event_date is not None, "Observation should have event_date"
+
+            # The date should be from 2023, not today
+            assert obs_occurred.year == 2023, (
+                f"Expected occurred_start year 2023, got {obs_occurred.year}. "
+                "Observation should inherit date from source memory."
+            )
+            assert obs_occurred.month == 6, f"Expected month 6, got {obs_occurred.month}"
+            assert obs_occurred.day == 15, f"Expected day 15, got {obs_occurred.day}"
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -1355,17 +1318,22 @@ class TestObservationDrillDown:
             request_context=request_context,
         )
 
-        # Search for observations
+        # Search for observations. Pass ``source_facts_max_tokens`` so the
+        # response actually carries ``source_fact_ids`` on each observation —
+        # without that flag the field is left empty (Pydantic ``None``) and
+        # then stripped by the tool's null-pruning, so the drill-down assertion
+        # below would have nothing to operate on.
         result = await tool_search_observations(
             memory_engine=memory,
             bank_id=bank_id,
             query="Sarah TechCorp",
             request_context=request_context,
+            source_facts_max_tokens=5000,
         )
 
         assert result["count"] > 0, "Expected at least one observation"
 
-        # Verify source_fact_ids is present (MemoryFact field name for source memories)
+        # Verify source_fact_ids is present and non-empty so drill-down can run.
         obs = result["observations"][0]
         assert "source_fact_ids" in obs, "Observation should have source_fact_ids"
 
@@ -1416,41 +1384,38 @@ class TestObservationDrillDown:
         )
 
         # Get the observation with source_memory_ids
-        async with memory._pool.acquire() as conn:
-            obs_rows = await conn.fetch(
-                """
-                SELECT id, text, proof_count, source_memory_ids
-                FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                """,
-                bank_id,
+        obs_rows = (
+            await memory.list_memory_units(bank_id, fact_type="observation", limit=500, request_context=request_context)
+        )["items"]
+
+        assert obs_rows, "Consolidation must create observations"
+
+        # Collect all source_memory_ids across all observations
+        all_source_ids = []
+        for obs in obs_rows:
+            all_source_ids.extend(obs["source_memory_ids"])
+
+        assert all_source_ids, "Observations must have source_memory_ids"
+
+        # Verify source_memory_ids point to actual memories. The list arm takes both
+        # source fact types at once, so the lineage is checked against the same set
+        # the SQL IN clause used to name.
+        source_facts = (
+            await memory.list_memory_units(
+                bank_id, fact_type=["world", "experience"], limit=500, request_context=request_context
             )
+        )["items"]
+        wanted = set(all_source_ids)
+        source_memories = [m for m in source_facts if m["id"] in wanted]
 
-        if obs_rows:
-            obs = obs_rows[0]
-            source_ids = obs["source_memory_ids"] or []
+        assert len(source_memories) >= 1, (
+            f"source_memory_ids should point to valid memories. IDs: {all_source_ids}, Found: {len(source_memories)}"
+        )
 
-            # Verify source_memory_ids point to actual memories
-            if source_ids:
-                async with memory._pool.acquire() as conn:
-                    source_memories = await conn.fetch(
-                        """
-                        SELECT id, text FROM memory_units
-                        WHERE id = ANY($1) AND fact_type IN ('world', 'experience')
-                        """,
-                        source_ids,
-                    )
-
-                # Should have found the source memories
-                assert len(source_memories) >= 1, (
-                    f"source_memory_ids should point to valid memories. "
-                    f"IDs: {source_ids}, Found: {len(source_memories)}"
-                )
-
-                # The source memories should contain our original content
-                source_texts = [m["text"].lower() for m in source_memories]
-                has_phoenix = any("phoenix" in t for t in source_texts)
-                assert has_phoenix, f"Source memories should contain original content. Got: {source_texts}"
+        # The source memories should contain our original content
+        source_texts = [m["text"].lower() for m in source_memories]
+        has_phoenix = any("phoenix" in t for t in source_texts)
+        assert has_phoenix, f"Source memories should contain original content. Got: {source_texts}"
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -1491,14 +1456,11 @@ class TestHierarchicalRetrieval:
         )
 
         # Verify observation was created
-        async with memory._pool.acquire() as conn:
-            obs_count = await conn.fetchval(
-                """
-                SELECT COUNT(*) FROM memory_units
-                WHERE bank_id = $1 AND fact_type = 'observation'
-                """,
-                bank_id,
+        obs_count = (
+            await memory.list_memory_units(
+                bank_id, fact_type="observation", limit=1000, request_context=request_context
             )
+        )["total"]
         assert obs_count >= 1, "Consolidation should have created an observation"
 
         # Create a mental model about John (higher quality, user-curated)
@@ -1514,7 +1476,7 @@ class TestHierarchicalRetrieval:
 
         # Search mental models - should find our mental model
         async with memory._pool.acquire() as conn:
-            query_embedding = memory.embeddings.encode(["What does John like?"])[0]
+            query_embedding = (await memory.embeddings.encode(["What does John like?"]))[0]
             mental_model_result = await tool_search_mental_models(
                 memory_engine=memory,
                 conn=conn,
@@ -1576,7 +1538,7 @@ class TestHierarchicalRetrieval:
 
         # Search mental models - should find nothing
         async with memory._pool.acquire() as conn:
-            query_embedding = memory.embeddings.encode(["Where does Sarah work?"])[0]
+            query_embedding = (await memory.embeddings.encode(["Where does Sarah work?"]))[0]
             mental_model_result = await tool_search_mental_models(
                 memory_engine=memory,
                 conn=conn,
@@ -1827,7 +1789,10 @@ class TestMentalModelRefreshAfterConsolidation:
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
-    async def test_graph_endpoint_observations_inherit_links_and_entities(self, memory: MemoryEngine, request_context):
+    @pytest.mark.hs_llm_core
+    async def test_graph_endpoint_observations_inherit_links_and_entities(
+        self, memory_real_llm: MemoryEngine, request_context
+    ):
         """Test that graph endpoint shows links and entities for observations filtered by type.
 
         When filtering graph by type=observation:
@@ -1835,6 +1800,7 @@ class TestMentalModelRefreshAfterConsolidation:
         - Observations should show entities inherited from source memories
         - Even when source memories are not visible, their links should be copied to observations
         """
+        memory = memory_real_llm
         bank_id = f"test-graph-obs-{uuid.uuid4().hex[:8]}"
 
         # Create the bank
@@ -1913,40 +1879,6 @@ class TestMentalModelRefreshAfterConsolidation:
         await memory.delete_bank(bank_id, request_context=request_context)
 
 
-def test_consolidation_prompt_default():
-    """Test that the default consolidation prompt contains the built-in mission and processing rules."""
-    from hindsight_api.engine.consolidation.prompts import build_batch_consolidation_prompt
-
-    prompt = build_batch_consolidation_prompt()
-    # Verify core structural elements are present (not exact wording)
-    assert "STATE CHANGES" in prompt
-    assert "RESOLVE REFERENCES" in prompt
-    assert "{facts_text}" in prompt
-    assert "{observations_text}" in prompt
-
-
-def test_consolidation_prompt_observations_mission():
-    """Test that observations_mission replaces the default mission but keeps processing rules."""
-    from hindsight_api.engine.consolidation.prompts import build_batch_consolidation_prompt
-
-    spec = "Observations are weekly summaries of sprint outcomes and team dynamics."
-    prompt = build_batch_consolidation_prompt(observations_mission=spec)
-
-    # Spec is injected
-    assert spec in prompt
-    # Processing rules and output format always remain
-    assert "RESOLVE REFERENCES" in prompt
-    assert "creates" in prompt
-    assert "updates" in prompt
-    assert "{facts_text}" in prompt
-    assert "{observations_text}" in prompt
-
-    # Renders cleanly
-    rendered = prompt.format(facts_text="Alice fixed a bug.", observations_text="[]")
-    assert "{facts_text}" not in rendered
-    assert spec in rendered
-
-
 def test_observations_mission_config():
     """Test that observations_mission is loaded from env and exposed as configurable."""
     import os
@@ -1994,11 +1926,11 @@ async def test_consolidation_with_observations_mission(memory: "MemoryEngine", r
                 content="Alice uses Python for data analysis and loves its simplicity.",
                 request_context=request_context,
             )
-            async with memory._pool.acquire() as conn:
-                observations = await conn.fetch(
-                    "SELECT id, text, fact_type FROM memory_units WHERE bank_id = $1 AND fact_type = 'observation'",
-                    bank_id,
+            observations = (
+                await memory.list_memory_units(
+                    bank_id, fact_type="observation", limit=1000, request_context=request_context
                 )
+            )["items"]
             assert isinstance(observations, list)
         finally:
             memory._config_resolver._global_config = original_global_config
@@ -2012,6 +1944,7 @@ async def test_consolidation_with_observations_mission(memory: "MemoryEngine", r
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_observation_scopes_explicit_multi_pass(memory: MemoryEngine, request_context):
     """Test that observation_scopes with an explicit list triggers separate consolidation passes.
 
@@ -2039,16 +1972,9 @@ async def test_observation_scopes_explicit_multi_pass(memory: MemoryEngine, requ
         request_context=request_context,
     )
 
-    async with memory._pool.acquire() as conn:
-        observations = await conn.fetch(
-            """
-            SELECT id, text, tags
-            FROM memory_units
-            WHERE bank_id = $1 AND fact_type = 'observation'
-            ORDER BY created_at
-            """,
-            bank_id,
-        )
+    observations = (
+        await memory.list_memory_units(bank_id, fact_type="observation", limit=1000, request_context=request_context)
+    )["items"]
 
     try:
         # Must have at least 2 observations (one per tag scope)
@@ -2075,6 +2001,7 @@ async def test_observation_scopes_explicit_multi_pass(memory: MemoryEngine, requ
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_observation_scopes_per_tag(memory: MemoryEngine, request_context):
     """Test that observation_scopes='per_tag' derives one pass per individual tag.
 
@@ -2097,16 +2024,9 @@ async def test_observation_scopes_per_tag(memory: MemoryEngine, request_context)
         request_context=request_context,
     )
 
-    async with memory._pool.acquire() as conn:
-        observations = await conn.fetch(
-            """
-            SELECT id, text, tags
-            FROM memory_units
-            WHERE bank_id = $1 AND fact_type = 'observation'
-            ORDER BY created_at
-            """,
-            bank_id,
-        )
+    observations = (
+        await memory.list_memory_units(bank_id, fact_type="observation", limit=1000, request_context=request_context)
+    )["items"]
 
     try:
         assert len(observations) >= 2, (
@@ -2149,16 +2069,9 @@ async def test_observation_scopes_combined(memory: MemoryEngine, request_context
         request_context=request_context,
     )
 
-    async with memory._pool.acquire() as conn:
-        observations = await conn.fetch(
-            """
-            SELECT id, text, tags
-            FROM memory_units
-            WHERE bank_id = $1 AND fact_type = 'observation'
-            ORDER BY created_at
-            """,
-            bank_id,
-        )
+    observations = (
+        await memory.list_memory_units(bank_id, fact_type="observation", limit=1000, request_context=request_context)
+    )["items"]
 
     try:
         assert len(observations) >= 1, "Expected at least 1 observation, got 0"
@@ -2180,6 +2093,7 @@ async def test_observation_scopes_combined(memory: MemoryEngine, request_context
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_observation_scopes_all_combinations(memory: MemoryEngine, request_context):
     """Test that observation_scopes='all_combinations' generates passes for every tag subset.
 
@@ -2203,16 +2117,9 @@ async def test_observation_scopes_all_combinations(memory: MemoryEngine, request
         request_context=request_context,
     )
 
-    async with memory._pool.acquire() as conn:
-        observations = await conn.fetch(
-            """
-            SELECT id, text, tags
-            FROM memory_units
-            WHERE bank_id = $1 AND fact_type = 'observation'
-            ORDER BY created_at
-            """,
-            bank_id,
-        )
+    observations = (
+        await memory.list_memory_units(bank_id, fact_type="observation", limit=1000, request_context=request_context)
+    )["items"]
 
     try:
         # With 2 tags there are 3 subsets: {alice}, {ben}, {alice, ben}
@@ -2442,50 +2349,33 @@ class TestConsolidationSourceFactsConfig:
 
 
 class TestBuildResponseModel:
-    """Unit tests for _build_response_model (dynamic Pydantic model factory)."""
+    """Unit tests for _build_response_model (consolidation response-model factory)."""
 
     def test_no_limit_returns_base_model(self):
-        """When max_creates is None or -1, the base model is returned."""
         from hindsight_api.engine.consolidation.consolidator import _ConsolidationBatchResponse
 
-        assert _build_response_model(None) is _ConsolidationBatchResponse
-        assert _build_response_model(-1) is _ConsolidationBatchResponse
+        for max_creates in (None, -1):
+            assert _build_response_model(max_creates) is _ConsolidationBatchResponse
 
-    def test_zero_limit_forbids_creates(self):
-        """When max_creates=0, the model rejects any creates."""
-        model = _build_response_model(0)
-        # Valid: no creates
-        result = model(creates=[], updates=[], deletes=[])
-        assert result.creates == []
+    def test_schema_contains_max_items_by_default(self):
+        for max_creates in (0, 3, 50):
+            schema = _build_response_model(max_creates).model_json_schema()
+            creates_prop = schema["properties"]["creates"]
+            assert creates_prop.get("maxItems") == max_creates
 
-        # Invalid: one create should be rejected
+    def test_schema_omits_max_items_when_unsupported(self):
+        """Regression for #2500: Bedrock rejects maxItems in response schemas."""
+        from hindsight_api.engine.consolidation.consolidator import _ConsolidationBatchResponse
+
+        for max_creates in (0, 3, 50):
+            model = _build_response_model(max_creates, supports_max_items=False)
+            assert model is _ConsolidationBatchResponse
+            assert "maxItems" not in model.model_json_schema()["properties"]["creates"]
+
+    def test_model_enforces_cap_by_default(self):
         from pydantic import ValidationError
 
-        with pytest.raises(ValidationError):
-            model(
-                creates=[{"text": "obs", "source_fact_ids": ["abc"]}],
-                updates=[],
-                deletes=[],
-            )
-
-    def test_positive_limit_allows_up_to_max(self):
-        """When max_creates=2, exactly 2 creates are allowed but 3 are rejected."""
         model = _build_response_model(2)
-
-        # 2 creates OK
-        result = model(
-            creates=[
-                {"text": "obs1", "source_fact_ids": ["a"]},
-                {"text": "obs2", "source_fact_ids": ["b"]},
-            ],
-            updates=[],
-            deletes=[],
-        )
-        assert len(result.creates) == 2
-
-        # 3 creates rejected
-        from pydantic import ValidationError
-
         with pytest.raises(ValidationError):
             model(
                 creates=[
@@ -2497,8 +2387,21 @@ class TestBuildResponseModel:
                 deletes=[],
             )
 
+    def test_model_accepts_over_cap_when_max_items_unsupported(self):
+        model = _build_response_model(2, supports_max_items=False)
+        result = model(
+            creates=[
+                {"text": "obs1", "source_fact_ids": ["a"]},
+                {"text": "obs2", "source_fact_ids": ["b"]},
+                {"text": "obs3", "source_fact_ids": ["c"]},
+            ],
+            updates=[],
+            deletes=[],
+        )
+        assert len(result.creates) == 3
+
     def test_updates_and_deletes_unconstrained(self):
-        """max_creates does not affect updates or deletes."""
+        """The creates cap never constrained updates or deletes (unchanged)."""
         model = _build_response_model(0)
         result = model(
             creates=[],
@@ -2511,47 +2414,145 @@ class TestBuildResponseModel:
         assert len(result.updates) == 2
         assert len(result.deletes) == 1
 
-    def test_json_schema_contains_max_items(self):
-        """The generated model's JSON schema should include maxItems for creates."""
-        model = _build_response_model(3)
-        schema = model.model_json_schema()
-        creates_prop = schema["properties"]["creates"]
-        assert creates_prop.get("maxItems") == 3
-
-
-class TestConsolidationPromptCapacity:
-    """Unit tests for the capacity constraint in the consolidation prompt."""
-
-    def test_no_capacity_note(self):
-        """When no capacity note is provided, prompt has no CAPACITY CONSTRAINT section."""
-        from hindsight_api.engine.consolidation.prompts import build_batch_consolidation_prompt
-
-        prompt = build_batch_consolidation_prompt()
-        assert "CAPACITY CONSTRAINT" not in prompt
-
-    def test_capacity_note_included(self):
-        """When a capacity note is provided, it appears in the prompt."""
-        from hindsight_api.engine.consolidation.prompts import build_batch_consolidation_prompt
-
-        prompt = build_batch_consolidation_prompt(
-            observation_capacity_note="OBSERVATION LIMIT REACHED. Only UPDATE or DELETE."
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("remaining_slots", "expected_creates"), [(0, 0), (2, 2)])
+    async def test_unsupported_max_items_still_truncates_creates(
+        self, remaining_slots: int, expected_creates: int
+    ) -> None:
+        """The operation config controls the schema while the runtime cap remains hard."""
+        from hindsight_api.engine.consolidation.consolidator import (
+            _consolidate_batch_with_llm,
+            _ConsolidationBatchResponse,
+            _CreateAction,
         )
-        assert "CAPACITY CONSTRAINT" in prompt
-        assert "OBSERVATION LIMIT REACHED" in prompt
 
-    def test_capacity_note_with_mission(self):
-        """Capacity note and custom mission can coexist."""
-        from hindsight_api.engine.consolidation.prompts import build_batch_consolidation_prompt
-
-        prompt = build_batch_consolidation_prompt(
-            observations_mission="Track food preferences only.",
-            observation_capacity_note="2 slots remaining.",
+        creates = [_CreateAction(text=f"observation {index}", source_fact_ids=[f"fact-{index}"]) for index in range(3)]
+        llm_config = SimpleNamespace(
+            _provider_impl=None,
+            call=AsyncMock(
+                return_value=LLMCallResult(content=_ConsolidationBatchResponse(creates=creates), usage=TokenUsage())
+            ),
         )
-        assert "Track food preferences only." in prompt
-        assert "2 slots remaining." in prompt
-        # Both should be present
-        assert "MISSION" in prompt
-        assert "CAPACITY CONSTRAINT" in prompt
+        config = SimpleNamespace(
+            llm_output_language=None,
+            observations_mission=None,
+            llm_strict_schema_consolidation=False,
+            llm_supports_max_items=False,
+            consolidation_max_attempts=1,
+            consolidation_llm_max_retries=None,
+            consolidation_max_completion_tokens=None,
+            llm_temperature_consolidation=0.0,
+        )
+
+        result = await _consolidate_batch_with_llm(
+            llm_config=llm_config,
+            memories=[{"id": "fact-0", "text": "a fact"}],
+            union_observations=[],
+            union_source_facts={},
+            config=config,
+            remaining_observation_slots=remaining_slots,
+            max_observations_per_scope=2,
+        )
+
+        response_model = llm_config.call.await_args.kwargs["response_format"]
+        assert response_model is _ConsolidationBatchResponse
+        assert len(result.creates) == expected_creates
+
+
+class TestDedupeUpdates:
+    """`_dedupe_updates` collapses LLM responses that target one observation_id
+    multiple times — without this, the second `_execute_update_action` call
+    silently overwrites the first (see horse-test trace, retain #9)."""
+
+    def _make_update(self, obs_id: str, text: str, source_fact_ids: list[str]):
+        from hindsight_api.engine.consolidation.consolidator import _UpdateAction
+
+        return _UpdateAction(text=text, observation_id=obs_id, source_fact_ids=source_fact_ids)
+
+    def test_empty_passes_through(self):
+        from hindsight_api.engine.consolidation.consolidator import _dedupe_updates
+
+        assert _dedupe_updates([], batch_label="t") == []
+
+    def test_single_update_passes_through(self):
+        from hindsight_api.engine.consolidation.consolidator import _dedupe_updates
+
+        u = self._make_update("obs-1", "one", ["fact-a"])
+        out = _dedupe_updates([u], batch_label="t")
+        assert len(out) == 1
+        assert out[0] is u  # same object, no copy on fast path
+
+    def test_distinct_observation_ids_kept_separately(self):
+        from hindsight_api.engine.consolidation.consolidator import _dedupe_updates
+
+        u1 = self._make_update("obs-1", "one", ["fact-a"])
+        u2 = self._make_update("obs-2", "two", ["fact-b"])
+        out = _dedupe_updates([u1, u2], batch_label="t")
+        ids = {u.observation_id for u in out}
+        assert ids == {"obs-1", "obs-2"}
+
+    def test_duplicate_observation_id_collapsed_keeping_last_text(self, caplog):
+        """The exact failure mode from horse-test retain #9: two updates to one
+        observation_id, both from the same fact, second silently clobbering
+        the first. After dedup we have one update with the last text and the
+        union of source_fact_ids."""
+        import logging
+
+        from hindsight_api.engine.consolidation.consolidator import _dedupe_updates
+
+        u1 = self._make_update("obs-shadow", "User owns a horse named Midnight.", ["fact-9"])
+        u2 = self._make_update("obs-shadow", "User owns a horse named Shadow.", ["fact-9"])
+
+        with caplog.at_level(logging.WARNING, logger="hindsight_api.engine.consolidation.consolidator"):
+            out = _dedupe_updates([u1, u2], batch_label="horse-batch-9")
+
+        assert len(out) == 1
+        merged = out[0]
+        assert merged.observation_id == "obs-shadow"
+        assert merged.text == "User owns a horse named Shadow.", "last text wins"
+        assert merged.source_fact_ids == ["fact-9"], "duplicate fact ids deduped via union"
+
+        # The collision must be logged loudly enough to surface in observability.
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("horse-batch-9" in r.message for r in warnings), (
+            "warning must include the batch label for traceability"
+        )
+        assert any("duplicate update" in r.message.lower() for r in warnings)
+
+    def test_source_fact_ids_union_preserves_order_and_deduplicates(self):
+        from hindsight_api.engine.consolidation.consolidator import _dedupe_updates
+
+        u1 = self._make_update("obs-1", "first", ["fact-a", "fact-b"])
+        u2 = self._make_update("obs-1", "second", ["fact-b", "fact-c"])
+        out = _dedupe_updates([u1, u2], batch_label="t")
+        assert len(out) == 1
+        assert out[0].source_fact_ids == ["fact-a", "fact-b", "fact-c"]
+
+    def test_three_way_collision_collapses_to_one(self):
+        from hindsight_api.engine.consolidation.consolidator import _dedupe_updates
+
+        u1 = self._make_update("obs-1", "v1", ["fact-a"])
+        u2 = self._make_update("obs-1", "v2", ["fact-b"])
+        u3 = self._make_update("obs-1", "v3", ["fact-c"])
+        out = _dedupe_updates([u1, u2, u3], batch_label="t")
+        assert len(out) == 1
+        assert out[0].text == "v3"
+        assert out[0].source_fact_ids == ["fact-a", "fact-b", "fact-c"]
+
+    def test_collisions_mixed_with_unique_updates(self):
+        from hindsight_api.engine.consolidation.consolidator import _dedupe_updates
+
+        u1 = self._make_update("obs-1", "one-a", ["fa1"])
+        u2 = self._make_update("obs-2", "two", ["fb"])
+        u3 = self._make_update("obs-1", "one-b", ["fa2"])
+        u4 = self._make_update("obs-3", "three", ["fc"])
+        out = _dedupe_updates([u1, u2, u3, u4], batch_label="t")
+        assert len(out) == 3
+        by_id = {u.observation_id: u for u in out}
+        assert by_id["obs-1"].text == "one-b"
+        assert by_id["obs-1"].source_fact_ids == ["fa1", "fa2"]
+        assert by_id["obs-2"].text == "two"
+        assert by_id["obs-3"].text == "three"
 
 
 def test_max_observations_per_scope_config():
@@ -2582,6 +2583,7 @@ def test_max_observations_per_scope_default():
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_count_observations_for_scope(memory: MemoryEngine, request_context):
     """Test _count_observations_for_scope counts observations filtered by tags."""
     bank_id = f"test-count-obs-scope-{uuid.uuid4().hex[:8]}"
@@ -2654,10 +2656,13 @@ def _make_mock_llm_one_obs_per_fact():
     def callback(messages, scope):
         if scope != "consolidation":
             return _ConsolidationBatchResponse()
-        # Parse all fact UUIDs from the prompt — one create per fact
+        # Parse all fact UUIDs from the prompt — one create per fact. Read only
+        # the user message(s): consolidation sends the facts there, while the
+        # stable (cacheable) system message carries example UUIDs in its OUTPUT
+        # FORMAT samples that must not be mistaken for real facts.
         import re
 
-        prompt = messages[0]["content"] if messages else ""
+        prompt = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
         fact_ids = re.findall(r"\[([0-9a-f-]{36})\]", prompt)
         creates = [_CreateAction(text=f"Observation about fact {fid[:8]}", source_fact_ids=[fid]) for fid in fact_ids]
         return _ConsolidationBatchResponse(creates=creates)
@@ -2670,6 +2675,7 @@ def _make_mock_llm_one_obs_per_fact():
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_max_observations_per_scope_limits_creates(memory: MemoryEngine, request_context):
     """Mock LLM tries to create 1 obs per fact; with limit=2, only 2 should exist after 5 facts."""
     bank_id = f"test-max-obs-limit-{uuid.uuid4().hex[:8]}"
@@ -2726,6 +2732,61 @@ async def test_max_observations_per_scope_limits_creates(memory: MemoryEngine, r
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_max_observations_per_scope_zero_forbids_all_creates(memory: MemoryEngine, request_context):
+    """limit=0 means "no new observations": consolidation must create none.
+
+    Regression for the ``> 0`` call-site guards that excluded 0, leaving
+    ``remaining_observation_slots=None`` (unconstrained) so a limit of 0 behaved
+    like unlimited — the inverse of the documented ``0 = no new observations``.
+    """
+    bank_id = f"test-max-obs-zero-{uuid.uuid4().hex[:8]}"
+    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+    raw = _get_raw_config()
+    fake_config = type(raw)(
+        **{
+            **{f: getattr(raw, f) for f in raw.__dataclass_fields__},
+            "max_observations_per_scope": 0,
+        }
+    )
+
+    try:
+        original_global_config = memory._config_resolver._global_config
+        memory._config_resolver._global_config = fake_config
+        wrapper, mock_llm = _make_mock_llm_one_obs_per_fact()
+        original_llm = memory._consolidation_llm_config
+        memory._consolidation_llm_config = wrapper
+
+        try:
+            # Insert tagged memories; the mock LLM will try to create 1 obs per
+            # fact, but limit=0 must block every create.
+            async with memory._pool.acquire() as conn:
+                await _insert_memories_with_tags(
+                    conn,
+                    bank_id,
+                    ["Alice loves hiking.", "Bob swims daily.", "Charlie does yoga."],
+                    tags=["scope:test"],
+                )
+
+            for _ in range(3):
+                await run_consolidation_job(memory_engine=memory, bank_id=bank_id, request_context=request_context)
+
+            async with memory._pool.acquire() as conn:
+                count = await _count_observations_for_scope(conn, bank_id, ["scope:test"])
+                assert count == 0, f"Expected 0 observations (limit=0), got {count}"
+
+                consolidation_calls = [c for c in mock_llm.get_mock_calls() if c["scope"] == "consolidation"]
+                assert len(consolidation_calls) >= 1, "LLM should have been called at least once"
+        finally:
+            memory._config_resolver._global_config = original_global_config
+            memory._consolidation_llm_config = original_llm
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_max_observations_per_scope_allows_updates_at_capacity(memory: MemoryEngine, request_context):
     """At capacity, the LLM can still update existing observations."""
     from hindsight_api.engine.consolidation.consolidator import (
@@ -2759,7 +2820,9 @@ async def test_max_observations_per_scope_allows_updates_at_capacity(memory: Mem
             call_count += 1
             import re
 
-            prompt = messages[0]["content"] if messages else ""
+            # Facts live in the user message; the system message (stable, cached)
+            # carries example UUIDs in its OUTPUT samples — read user only.
+            prompt = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
             fact_ids = re.findall(r"\[([0-9a-f-]{36})\]", prompt)
             if call_count == 1 and fact_ids:
                 # First call: create an observation
@@ -2824,6 +2887,7 @@ async def test_max_observations_per_scope_allows_updates_at_capacity(memory: Mem
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_max_observations_per_scope_no_tags_skips_limit(memory: MemoryEngine, request_context):
     """With limit=1, memories with no tags should bypass the limit and create freely."""
     bank_id = f"test-max-obs-no-tags-{uuid.uuid4().hex[:8]}"
@@ -2859,12 +2923,12 @@ async def test_max_observations_per_scope_no_tags_skips_limit(memory: MemoryEngi
                 await run_consolidation_job(memory_engine=memory, bank_id=bank_id, request_context=request_context)
 
             # No tag limit should apply — all 3 observations should be created
-            async with memory._pool.acquire() as conn:
-                obs = await conn.fetch(
-                    "SELECT id FROM memory_units WHERE bank_id = $1 AND fact_type = 'observation'",
-                    bank_id,
+            total = (
+                await memory.list_memory_units(
+                    bank_id, fact_type="observation", limit=1000, request_context=request_context
                 )
-                assert len(obs) == 3, f"Expected 3 observations (no limit for no-tag), got {len(obs)}"
+            )["total"]
+            assert total == 3, f"Expected 3 observations (no limit for no-tag), got {total}"
         finally:
             memory._config_resolver._global_config = original_global_config
             memory._consolidation_llm_config = original_llm
@@ -2873,6 +2937,7 @@ async def test_max_observations_per_scope_no_tags_skips_limit(memory: MemoryEngi
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_max_observations_unlimited_default(memory: MemoryEngine, request_context):
     """With default config (-1), all creates go through."""
     bank_id = f"test-max-obs-unlimited-{uuid.uuid4().hex[:8]}"
@@ -2903,3 +2968,286 @@ async def test_max_observations_unlimited_default(memory: MemoryEngine, request_
             memory._consolidation_llm_config = original_llm
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_targeted_consolidation_filters_by_scopes(memory: MemoryEngine, request_context):
+    """Consolidation with observation_scopes only processes memories matching those scopes."""
+    bank_id = f"test-targeted-{uuid.uuid4().hex[:8]}"
+    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+    wrapper, mock_llm = _make_mock_llm_one_obs_per_fact()
+    original_llm = memory._consolidation_llm_config
+    memory._consolidation_llm_config = wrapper
+
+    try:
+        # Insert memories with different tag scopes
+        async with memory._pool.acquire() as conn:
+            await _insert_memories_with_tags(conn, bank_id, ["Alice likes hiking."], tags=["user:alice"])
+            await _insert_memories_with_tags(conn, bank_id, ["Bob likes swimming."], tags=["user:bob"])
+            await _insert_memories_with_tags(conn, bank_id, ["Charlie likes yoga."], tags=["user:charlie"])
+
+        # Run consolidation targeting only user:alice
+        result = await run_consolidation_job(
+            memory_engine=memory,
+            bank_id=bank_id,
+            request_context=request_context,
+            observation_scopes=[["user:alice"]],
+        )
+
+        assert result["memories_processed"] == 1
+        assert result["observations_created"] == 1
+
+        # Verify only alice's memory was consolidated
+        async with memory._pool.acquire() as conn:
+            alice_obs = await _count_observations_for_scope(conn, bank_id, ["user:alice"])
+            assert alice_obs == 1
+
+        # Bob and Charlie should still be unconsolidated. consolidation_state='pending'
+        # is the read API's name for this predicate; it also excludes facts whose
+        # consolidation failed, which is the stricter (and here equivalent) reading.
+        assert await _unconsolidated(memory, bank_id, request_context) == 2
+
+        # Now consolidate bob
+        result = await run_consolidation_job(
+            memory_engine=memory,
+            bank_id=bank_id,
+            request_context=request_context,
+            observation_scopes=[["user:bob"]],
+        )
+        assert result["memories_processed"] == 1
+
+        # Charlie still unconsolidated
+        assert await _unconsolidated(memory, bank_id, request_context) == 1
+    finally:
+        memory._consolidation_llm_config = original_llm
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_targeted_consolidation_multiple_scopes(memory: MemoryEngine, request_context):
+    """Consolidation with multiple observation_scopes matches memories in any scope."""
+    bank_id = f"test-targeted-multi-{uuid.uuid4().hex[:8]}"
+    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+    wrapper, mock_llm = _make_mock_llm_one_obs_per_fact()
+    original_llm = memory._consolidation_llm_config
+    memory._consolidation_llm_config = wrapper
+
+    try:
+        async with memory._pool.acquire() as conn:
+            await _insert_memories_with_tags(conn, bank_id, ["Alice likes hiking."], tags=["user:alice"])
+            await _insert_memories_with_tags(conn, bank_id, ["Bob likes swimming."], tags=["user:bob"])
+            await _insert_memories_with_tags(conn, bank_id, ["Charlie likes yoga."], tags=["user:charlie"])
+
+        # Consolidate alice and charlie in one call
+        result = await run_consolidation_job(
+            memory_engine=memory,
+            bank_id=bank_id,
+            request_context=request_context,
+            observation_scopes=[["user:alice"], ["user:charlie"]],
+        )
+
+        assert result["memories_processed"] == 2
+        assert result["observations_created"] == 2
+
+        # Bob still unconsolidated
+        assert await _unconsolidated(memory, bank_id, request_context) == 1
+    finally:
+        memory._consolidation_llm_config = original_llm
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_targeted_consolidation_no_scopes_processes_all(memory: MemoryEngine, request_context):
+    """Consolidation without observation_scopes processes all unconsolidated memories (backward compat)."""
+    bank_id = f"test-targeted-all-{uuid.uuid4().hex[:8]}"
+    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+    wrapper, mock_llm = _make_mock_llm_one_obs_per_fact()
+    original_llm = memory._consolidation_llm_config
+    memory._consolidation_llm_config = wrapper
+
+    try:
+        async with memory._pool.acquire() as conn:
+            await _insert_memories_with_tags(conn, bank_id, ["Alice likes hiking."], tags=["user:alice"])
+            await _insert_memories_with_tags(conn, bank_id, ["Bob likes swimming."], tags=["user:bob"])
+
+        # No scopes — processes everything
+        result = await run_consolidation_job(
+            memory_engine=memory,
+            bank_id=bank_id,
+            request_context=request_context,
+        )
+
+        assert result["memories_processed"] == 2
+        assert result["observations_created"] == 2
+    finally:
+        memory._consolidation_llm_config = original_llm
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_targeted_consolidation_contains_semantics(memory: MemoryEngine, request_context):
+    """Scope ["user:alice"] matches memories tagged ["user:alice", "team:eng"] (contains)."""
+    bank_id = f"test-targeted-contains-{uuid.uuid4().hex[:8]}"
+    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+    wrapper, mock_llm = _make_mock_llm_one_obs_per_fact()
+    original_llm = memory._consolidation_llm_config
+    memory._consolidation_llm_config = wrapper
+
+    try:
+        async with memory._pool.acquire() as conn:
+            # Memory with two tags
+            await _insert_memories_with_tags(conn, bank_id, ["Alice works on infra."], tags=["user:alice", "team:eng"])
+            await _insert_memories_with_tags(conn, bank_id, ["Bob likes swimming."], tags=["user:bob"])
+
+        # Scope is ["user:alice"] — should match the multi-tag memory
+        result = await run_consolidation_job(
+            memory_engine=memory,
+            bank_id=bank_id,
+            request_context=request_context,
+            observation_scopes=[["user:alice"]],
+        )
+
+        assert result["memories_processed"] == 1
+        assert result["observations_created"] == 1
+    finally:
+        memory._consolidation_llm_config = original_llm
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_enable_auto_consolidation_flag(memory: MemoryEngine, request_context):
+    """When enable_auto_consolidation is False, retain does not trigger consolidation."""
+    bank_id = f"test-auto-consol-{uuid.uuid4().hex[:8]}"
+    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+    raw = _get_raw_config()
+    fake_config = type(raw)(
+        **{
+            **{f: getattr(raw, f) for f in raw.__dataclass_fields__},
+            "enable_auto_consolidation": False,
+        }
+    )
+
+    original_global_config = memory._config_resolver._global_config
+    memory._config_resolver._global_config = fake_config
+
+    try:
+        # Retain a memory — auto consolidation should NOT run
+        await memory.retain_async(
+            bank_id=bank_id,
+            content="Peter loves hiking in the mountains every weekend.",
+            request_context=request_context,
+        )
+
+        # Check that memories are NOT consolidated
+        unconsolidated = await _unconsolidated(memory, bank_id, request_context)
+        assert unconsolidated > 0, "Memories should remain unconsolidated when auto consolidation is disabled"
+
+        observations = (
+            await memory.list_memory_units(
+                bank_id, fact_type="observation", limit=1000, request_context=request_context
+            )
+        )["total"]
+        assert observations == 0, "No observations should be created when auto consolidation is disabled"
+    finally:
+        memory._config_resolver._global_config = original_global_config
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+def test_consolidation_prompt_split_is_cacheable_and_complete():
+    """The split consolidation prompt: bank-agnostic system prefix + per-batch user.
+
+    The system prefix must be byte-identical across batches AND across banks (the
+    property that lets a single Gemini context cache serve every bank), carry only
+    stable instructions, and the per-batch/per-bank data (mission, facts,
+    observations, capacity note) must live in the user message — never in the
+    cached prefix.
+    """
+    from hindsight_api.engine.consolidation.prompts import (
+        build_consolidation_input,
+        build_consolidation_system_prompt,
+    )
+
+    sys_prompt = build_consolidation_system_prompt()
+    # Byte-stable across calls and independent of any mission → one cache for all banks.
+    assert sys_prompt == build_consolidation_system_prompt()
+    # Instructions only: no per-batch placeholders leaked into the prefix.
+    assert "{facts_text}" not in sys_prompt
+    assert "{observations_text}" not in sys_prompt
+    # JSON examples are unescaped (single braces), i.e. .format() ran.
+    assert '{"creates"' in sys_prompt
+    assert "{{" not in sys_prompt
+    # The stable observation-format boilerplate lives in the cached prefix.
+    assert "proof_count" in sys_prompt
+
+    # Two banks with DIFFERENT missions share the identical cached prefix; the
+    # mission rides in the per-batch user message instead.
+    user_a = build_consolidation_input(
+        facts_text="[id-a] Fact A.", observations_text="[]", observations_mission="Track widgets."
+    )
+    user_b = build_consolidation_input(
+        facts_text="[id-b] Fact B.", observations_text="[]", observations_mission="Track gadgets."
+    )
+    assert "Track widgets." in user_a
+    assert "Track widgets." not in sys_prompt  # mission NOT in the cached prefix
+    assert "Fact A." in user_a
+    assert user_a != user_b
+    # The format boilerplate is NOT re-sent per batch (it's in the cached prefix).
+    assert "proof_count" not in user_a
+
+    # The capacity note is per-batch too — kept out of the cached prefix.
+    capped = build_consolidation_input(
+        facts_text="[id] F.", observations_text="[]", observation_capacity_note="OBSERVATION LIMIT REACHED"
+    )
+    assert "OBSERVATION LIMIT REACHED" in capped
+    assert "OBSERVATION LIMIT REACHED" not in sys_prompt
+
+    # When no mission is supplied the built-in default mission is emitted in the
+    # per-batch input, so consolidation always has a mission to follow.
+    default = build_consolidation_input(facts_text="[id] F.", observations_text="[]")
+    assert "Track anything notable in the new facts" in default
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_create_observation_populates_search_vector_native(memory, request_context):
+    """Observations created via consolidation must have search_vector populated
+    when text_search_extension == 'native', so BM25 retrieval finds them."""
+    from hindsight_api.config import get_config
+
+    config = get_config()
+    if config.text_search_extension != "native":
+        pytest.skip("Only applies to native text search backend")
+
+    bank_id = f"test-search-vector-{uuid.uuid4().hex[:8]}"
+    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+    await memory.retain_async(
+        bank_id=bank_id,
+        content="Django uses middleware for request processing.",
+        request_context=request_context,
+    )
+
+    async with memory._pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT search_vector
+            FROM memory_units
+            WHERE bank_id = $1 AND fact_type = 'observation'
+            LIMIT 1
+            """,
+            bank_id,
+        )
+
+    assert row is not None, "Consolidation should have created an observation"
+    assert row["search_vector"] is not None, "search_vector must be populated for BM25 retrieval under native backend"
+
+    await memory.delete_bank(bank_id, request_context=request_context)

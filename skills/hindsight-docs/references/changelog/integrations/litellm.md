@@ -6,7 +6,13 @@ import PageHero from '@site/src/components/PageHero';
 
 <PageHero title="LiteLLM Changelog" subtitle="hindsight-litellm — universal LLM memory integration via LiteLLM." />
 
-← LiteLLM integration
+[← LiteLLM integration](../../sdks/integrations/litellm.md)
+
+## [0.5.4](https://github.com/vectorize-io/hindsight/tree/integrations/litellm/v0.5.4)
+
+**Bug Fixes**
+
+- Fixes LiteLLM integration reliability by correcting injection mode behavior, ensuring context-manager state is restored properly, and making validation/errors consistent.<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/DK09876" target="_blank" rel="noopener noreferrer" style={{color: "var(--ifm-color-primary)", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px", verticalAlign: "middle"}}>@DK09876</a><span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/vectorize-io/hindsight/commit/dfe74b1d" target="_blank" rel="noopener noreferrer" style={{fontFamily: "var(--ifm-font-family-monospace, monospace)", fontSize: "0.85em", color: "var(--ifm-color-emphasis-600)"}}>dfe74b1d</a>
 
 ## [0.5.3](https://github.com/vectorize-io/hindsight/tree/integrations/litellm/v0.5.3)
 

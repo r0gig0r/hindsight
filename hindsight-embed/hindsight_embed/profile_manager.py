@@ -6,46 +6,84 @@ Each profile has its own config, daemon lock, log file, and port.
 
 import hashlib
 import json
+import logging
+import math
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import IO, Optional
+
+logger = logging.getLogger(__name__)
 
 # ==============================================================================
 # Cross-platform file locking implementation
 # ==============================================================================
 # Why not use a library like portalocker or fasteners?
 #
-# 1. Minimal dependency: Our use case is extremely simple - only basic
-#    exclusive file locking for metadata persistence. Adding a new dependency
-#    (even a small one) for such a narrow use case is unnecessary.
+# 1. Minimal dependency: Our use case is narrow — exclusive locking for
+#    metadata persistence and daemon-start serialization. Adding a new
+#    dependency for that is unnecessary.
 #
 # 2. Portability: We only need to support the two major platforms (Unix and
-#    Windows), both of which have well-understood file locking mechanisms
-#    that can be implemented in ~10 lines of code each.
+#    Windows), both of which expose a non-blocking exclusive lock primitive
+#    that we drive from one shared retry loop below.
 #
 # 3. Maintainability: The code is straightforward and has no external
 #    dependencies to track or update. The locking logic is localized here,
 #    making it easy to understand and modify if needed.
 #
-# 4. Feature scope: Libraries like portalocker provide many features we don't
-#    need (timeout handling, shared locks, lock files, etc.), which would add
-#    unnecessary complexity to our simple use case.
-#
-# If our locking requirements become more complex in the future (e.g., needing
-# timeouts, better error handling, or supporting more edge cases), reconsider
-# using a dedicated library like portalocker.
+# Locks are acquired with a bounded wait, never an unbounded blocking call:
+# the Windows `msvcrt.LK_LOCK` mode retries internally exactly 10 times and
+# then raises, which made concurrent daemon starts for the same profile fail
+# non-deterministically (issue #3100). Both platforms now take the
+# non-blocking mode in a retry loop with exponential backoff, and time out
+# with an error naming the lock file and its recorded holder.
 # ==============================================================================
+
+ENV_LOCK_TIMEOUT = "HINDSIGHT_EMBED_LOCK_TIMEOUT"
+# The daemon-start path holds the profile lock for the whole startup sequence
+# (up to HINDSIGHT_EMBED_DAEMON_STARTUP_TIMEOUT, 180s by default), so the wait
+# budget has to comfortably exceed that or a legitimate concurrent start would
+# time out waiting for the winner.
+DEFAULT_LOCK_TIMEOUT = 300.0
+_LOCK_RETRY_INITIAL = 0.01
+_LOCK_RETRY_MAX = 0.25
+
+
+class ProfileLockTimeout(TimeoutError):
+    """Raised when an exclusive lock could not be acquired within the timeout."""
+
+
+def _default_lock_timeout() -> float:
+    """Lock wait budget in seconds, overridable via HINDSIGHT_EMBED_LOCK_TIMEOUT."""
+    raw = os.getenv(ENV_LOCK_TIMEOUT)
+    if raw is None:
+        return DEFAULT_LOCK_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    # Reject nan/inf/non-positive: an unbounded wait is the bug being fixed.
+    if not math.isfinite(value) or value <= 0:
+        logger.warning("Invalid %s=%r; using %s", ENV_LOCK_TIMEOUT, raw, DEFAULT_LOCK_TIMEOUT)
+        return DEFAULT_LOCK_TIMEOUT
+    return value
+
 
 if sys.platform != "win32":
     import fcntl
 
-    def lock_file(file_obj):
-        fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX)
+    def _try_lock(file_obj: IO[str]) -> bool:
+        try:
+            fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
 
-    def unlock_file(file_obj):
+    def _release_lock(file_obj: IO[str]) -> None:
         fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
 else:
     import msvcrt
@@ -57,16 +95,94 @@ else:
     # position), then unlock — at which point the unlock request targets a
     # byte past the data and Windows returns EACCES. Seek to 0 on both sides
     # so lock and unlock always act on byte 0.
-    def lock_file(file_obj):
+    def _try_lock(file_obj: IO[str]) -> bool:
         file_obj.seek(0)
-        msvcrt.locking(file_obj.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            msvcrt.locking(file_obj.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
 
-    def unlock_file(file_obj):
+    def _release_lock(file_obj: IO[str]) -> None:
         file_obj.seek(0)
         msvcrt.locking(file_obj.fileno(), msvcrt.LK_UNLCK, 1)
 
 
-import httpx
+def _owner_path(file_obj: IO[str]) -> Optional[Path]:
+    """Sidecar file recording the PID currently holding `file_obj`'s lock.
+
+    The lock file itself is opened with mode "w" by callers, so a waiter
+    truncates it before it ever tries to lock — the holder's identity cannot
+    live there. The sidecar is only ever written by the lock holder.
+    """
+    name = getattr(file_obj, "name", None)
+    if not isinstance(name, str):
+        return None
+    return Path(name + ".owner")
+
+
+def _record_lock_owner(file_obj: IO[str]) -> None:
+    path = _owner_path(file_obj)
+    if path is None:
+        return
+    try:
+        path.write_text(str(os.getpid()))
+    except OSError:
+        logger.debug("Could not record lock owner for %s", path, exc_info=True)
+
+
+def _clear_lock_owner(file_obj: IO[str]) -> None:
+    path = _owner_path(file_obj)
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.debug("Could not clear lock owner for %s", path, exc_info=True)
+
+
+def _describe_lock_holder(file_obj: IO[str]) -> str:
+    path = _owner_path(file_obj)
+    if path is None:
+        return ""
+    try:
+        holder = path.read_text().strip()
+    except OSError:
+        return ""
+    return f" (held by PID {holder})" if holder else ""
+
+
+def lock_file(file_obj: IO[str], timeout: Optional[float] = None) -> None:
+    """Acquire an exclusive lock on `file_obj`, waiting up to `timeout` seconds.
+
+    Raises:
+        ProfileLockTimeout: if the lock is still held when the budget expires.
+    """
+    budget = _default_lock_timeout() if timeout is None else timeout
+    deadline = time.monotonic() + max(budget, 0.0)
+    delay = _LOCK_RETRY_INITIAL
+    while True:
+        if _try_lock(file_obj):
+            _record_lock_owner(file_obj)
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            name = getattr(file_obj, "name", "<unknown>")
+            raise ProfileLockTimeout(
+                f"Timed out after {budget:g}s waiting for the lock on {name}{_describe_lock_holder(file_obj)}. "
+                f"Set {ENV_LOCK_TIMEOUT} to wait longer, or remove the lock file if the holder is gone."
+            )
+        time.sleep(min(delay, remaining))
+        delay = min(delay * 2, _LOCK_RETRY_MAX)
+
+
+def unlock_file(file_obj: IO[str]) -> None:
+    """Release a lock acquired with lock_file()."""
+    _clear_lock_owner(file_obj)
+    _release_lock(file_obj)
+
+
+from ._http_probe import probe_get
 
 # Configuration paths
 CONFIG_DIR = Path.home() / ".hindsight"
@@ -83,6 +199,28 @@ PROFILE_PORT_RANGE = 1000  # 8889-9888
 # UI port offset from daemon port (e.g., daemon 8888 -> UI 18888)
 UI_PORT_OFFSET = 10000
 
+# Ports are stored in the profile's .env (source of truth) so they're editable
+# from the control center. The API port is allocated-then-persisted; the UI port
+# is optional and defaults to API + UI_PORT_OFFSET when unset.
+ENV_API_PORT = "HINDSIGHT_API_PORT"
+ENV_CP_PORT = "HINDSIGHT_EMBED_CP_PORT"
+
+
+@dataclass
+class _PortOverrides:
+    """API/UI ports read from a profile's .env (None when not set)."""
+
+    api: Optional[int] = None
+    ui: Optional[int] = None
+
+
+@dataclass
+class _ResolvedPorts:
+    """The effective API and UI ports for a profile."""
+
+    api: int
+    ui: int
+
 
 @dataclass
 class ProfilePaths:
@@ -93,10 +231,13 @@ class ProfilePaths:
     log: Path
     port: int
     ui_log: Path = None  # type: ignore[assignment]
+    ui_port: int = 0  # 0 → derive as port + UI_PORT_OFFSET
 
     def __post_init__(self):
         if self.ui_log is None:
             self.ui_log = self.log.parent / self.log.name.replace(".log", ".ui.log")
+        if not self.ui_port:
+            self.ui_port = self.port + UI_PORT_OFFSET
 
 
 @dataclass
@@ -159,27 +300,30 @@ class ProfileManager:
         # Add default profile if config exists
         default_config = self._get_config_dir() / "embed"
         if default_config.exists():
+            default_port = self.resolve_profile_paths("").port
             profiles.append(
                 ProfileInfo(
                     name="",  # Empty name = default
-                    port=DEFAULT_PORT,
+                    port=default_port,
                     created_at="",  # Don't track for default
                     last_used=None,
                     is_active=active_profile == "",
-                    daemon_running=self._check_daemon_running(DEFAULT_PORT),
+                    daemon_running=self._check_daemon_running(default_port),
                 )
             )
 
-        # Add named profiles
+        # Add named profiles. The port now lives in each profile's .env, so
+        # resolve it rather than reading the (port-less) metadata entry.
         for name, info in metadata.profiles.items():
+            port = self.resolve_profile_paths(name).port
             profiles.append(
                 ProfileInfo(
                     name=name,
-                    port=info["port"],
+                    port=port,
                     created_at=info.get("created_at", ""),
                     last_used=info.get("last_used"),
                     is_active=active_profile == name,
-                    daemon_running=self._check_daemon_running(info["port"]),
+                    daemon_running=self._check_daemon_running(port),
                 )
             )
 
@@ -255,32 +399,32 @@ class ProfileManager:
         # Load metadata to check if profile already exists
         metadata = self._load_metadata()
 
-        # Determine port: use provided port, preserve existing, or allocate new
-        if port is None:
-            if name in metadata.profiles and "port" in metadata.profiles[name]:
-                port = metadata.profiles[name]["port"]
-            else:
-                port = self._allocate_port(name)
-
-        # Write config file
         config_path = self._get_profiles_dir() / f"{name}.env"
-        config_lines = [f"{key}={value}" for key, value in config.items()]
-        config_path.write_text("\n".join(config_lines) + "\n")
 
-        # Update metadata (reuse metadata loaded earlier to avoid race conditions)
+        # The API port lives in the .env (source of truth), not metadata. Use the
+        # explicit port if given; otherwise keep whatever the caller already
+        # carries in the config, else resolve from the existing .env / legacy
+        # metadata / a fresh allocation (so legacy profiles migrate without
+        # changing port).
+        config = dict(config)
+        if port is None and ENV_API_PORT not in config:
+            port = self._resolve_ports(name, config_path, None).api
+        if port is not None:
+            config[ENV_API_PORT] = str(port)
+
+        # Write config file, seeded from the bundled .env.example template so
+        # the profile carries the full documented option set as comments.
+        from .env_template import render_config
+
+        config_path.write_text(render_config(config), encoding="utf-8")
+
+        # Metadata now only tracks discovery + timestamps; the port moved to .env.
         now_iso = datetime.now(timezone.utc).isoformat()
-
         if name in metadata.profiles:
-            # Update existing profile
             metadata.profiles[name]["last_used"] = now_iso
-            metadata.profiles[name]["port"] = port
+            metadata.profiles[name].pop("port", None)  # migrate away from metadata port
         else:
-            # Create new profile
-            metadata.profiles[name] = {
-                "port": port,
-                "created_at": now_iso,
-                "last_used": now_iso,
-            }
+            metadata.profiles[name] = {"created_at": now_iso, "last_used": now_iso}
 
         self._save_metadata(metadata)
 
@@ -304,15 +448,21 @@ class ProfileManager:
         if config_path.exists():
             config_path.unlink()
 
-        # Remove lock file
+        # Remove the lock file and the sidecar recording its holder (a crash
+        # while holding the lock leaves the sidecar behind).
         lock_path = self._get_profiles_dir() / f"{name}.lock"
-        if lock_path.exists():
-            lock_path.unlink()
+        lock_path.unlink(missing_ok=True)
+        lock_path.with_name(f"{lock_path.name}.owner").unlink(missing_ok=True)
 
-        # Remove log file
+        # Remove the active log and any retained rotation backups. A log that
+        # cannot be removed (still held open on Windows, say) must not abort the
+        # delete and leave the profile half-registered in metadata below.
         log_path = self._get_profiles_dir() / f"{name}.log"
-        if log_path.exists():
-            log_path.unlink()
+        for stale_log in [log_path, *log_path.parent.glob(f"{log_path.name}.*")]:
+            try:
+                stale_log.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Could not remove log %s while deleting profile '%s': %s", stale_log, name, exc)
 
         # Update metadata
         metadata = self._load_metadata()
@@ -338,7 +488,7 @@ class ProfileManager:
 
         active_file = self._get_active_profile_file()
         if name:
-            active_file.write_text(name)
+            active_file.write_text(name, encoding="utf-8")
         else:
             # Clear active profile
             if active_file.exists():
@@ -352,7 +502,7 @@ class ProfileManager:
         """
         active_file = self._get_active_profile_file()
         if active_file.exists():
-            return active_file.read_text().strip()
+            return active_file.read_text(encoding="utf-8").strip()
         return ""
 
     def resolve_profile_paths(self, name: str) -> ProfilePaths:
@@ -369,24 +519,70 @@ class ProfileManager:
         profiles_dir = config_dir / "profiles"
 
         if not name:
-            # Default profile
+            # Default profile — port also overridable via its .env (~/.hindsight/embed).
+            config_path = config_dir / "embed"
+            ports = self._resolve_ports("", config_path, DEFAULT_PORT)
             return ProfilePaths(
-                config=config_dir / "embed",
+                config=config_path,
                 lock=config_dir / "daemon.lock",
                 log=config_dir / "daemon.log",
-                port=DEFAULT_PORT,
+                port=ports.api,
+                ui_port=ports.ui,
             )
 
         # Named profile
-        metadata = self._load_metadata()
-        port = metadata.profiles.get(name, {}).get("port", self._allocate_port(name))
+        config_path = profiles_dir / f"{name}.env"
+        ports = self._resolve_ports(name, config_path, None)
 
         return ProfilePaths(
-            config=profiles_dir / f"{name}.env",
+            config=config_path,
             lock=profiles_dir / f"{name}.lock",
             log=profiles_dir / f"{name}.log",
-            port=port,
+            port=ports.api,
+            ui_port=ports.ui,
         )
+
+    def _read_port_overrides(self, config_path: Path) -> _PortOverrides:
+        """Parse a profile's .env for the API/UI port keys (no recursion into
+        load_profile_config, which itself resolves paths)."""
+        ov = _PortOverrides()
+        if not config_path.exists():
+            return ov
+        for line in config_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[7:]
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key, value = key.strip(), value.strip()
+            try:
+                if key == ENV_API_PORT:
+                    ov.api = int(value)
+                elif key == ENV_CP_PORT:
+                    ov.ui = int(value)
+            except ValueError:
+                continue
+        return ov
+
+    def _resolve_ports(self, name: str, config_path: Path, default_api: Optional[int]) -> _ResolvedPorts:
+        """Resolve the effective API/UI ports for a profile.
+
+        Priority for the API port: explicit ``.env`` value → ``default_api`` (the
+        default profile's fixed 8888) → legacy metadata port → fresh allocation.
+        The UI port uses its ``.env`` value, else API + UI_PORT_OFFSET.
+        """
+        ov = self._read_port_overrides(config_path)
+        if ov.api is not None:
+            api_port = ov.api
+        elif default_api is not None:
+            api_port = default_api
+        else:
+            # Legacy profiles stored the port in metadata; otherwise allocate.
+            legacy = self._load_metadata().profiles.get(name, {}).get("port")
+            api_port = legacy if legacy else self._allocate_port(name)
+        ui_port = ov.ui if ov.ui is not None else api_port + UI_PORT_OFFSET
+        return _ResolvedPorts(api=api_port, ui=ui_port)
 
     def load_profile_config(self, name: str) -> dict[str, str]:
         """Load configuration from a profile's .env file.
@@ -395,8 +591,15 @@ class ProfileManager:
             name: Profile name (empty string for default).
 
         Returns:
-            Dictionary of environment variable key-value pairs from the profile's .env file.
-            Also includes simple key aliases (e.g., 'idle_timeout' for 'HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT').
+            Dictionary of environment variable key-value pairs from the profile's
+            .env file, under their own names.
+
+            This used to also inject lowercase aliases ('llm_base_url' for
+            'HINDSIGHT_API_LLM_BASE_URL', and five others). Every consumer then
+            had to strip them back out before writing a profile, and the alias
+            table was a second place a setting had to be listed to be seen at
+            all — which is how HINDSIGHT_API_LLM_BASE_URL went missing (issue
+            #4094). Callers now read the environment variable names directly.
         """
         paths = self.resolve_profile_paths(name)
         config = {}
@@ -405,7 +608,7 @@ class ProfileManager:
             return config
 
         # Parse .env file
-        with open(paths.config) as f:
+        with open(paths.config, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 # Skip comments and empty lines
@@ -418,21 +621,6 @@ class ProfileManager:
                 if "=" in line:
                     key, value = line.split("=", 1)
                     config[key.strip()] = value.strip()
-
-        # Add simple key aliases for backward compatibility
-        # Some code checks config.get("idle_timeout") instead of the full env var name
-        key_aliases = {
-            "HINDSIGHT_API_LLM_API_KEY": "llm_api_key",
-            "HINDSIGHT_API_LLM_PROVIDER": "llm_provider",
-            "HINDSIGHT_API_LLM_MODEL": "llm_model",
-            "HINDSIGHT_API_LLM_BASE_URL": "llm_base_url",
-            "HINDSIGHT_API_LOG_LEVEL": "log_level",
-            "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT": "idle_timeout",
-        }
-
-        for env_key, simple_key in key_aliases.items():
-            if env_key in config and simple_key not in config:
-                config[simple_key] = config[env_key]
 
         return config
 
@@ -449,9 +637,9 @@ class ProfileManager:
         hash_val = int(hashlib.sha256(name.encode()).hexdigest(), 16)
         port = PROFILE_PORT_BASE + (hash_val % PROFILE_PORT_RANGE)
 
-        # Check if port is already allocated in metadata
-        metadata = self._load_metadata()
-        allocated_ports = {info["port"] for info in metadata.profiles.values() if info.get("port")}
+        # Ports now live in the .env files, so scan those (plus legacy metadata)
+        # to find what's already taken.
+        allocated_ports = self._allocated_api_ports()
 
         # If collision, find next available port
         attempt = 0
@@ -468,6 +656,20 @@ class ProfileManager:
 
         return port
 
+    def _allocated_api_ports(self) -> set[int]:
+        """API ports already taken by other profiles (from their .env files,
+        plus any legacy metadata ports not yet migrated)."""
+        ports: set[int] = set()
+        for env_path in self._get_profiles_dir().glob("*.env"):
+            api = self._read_port_overrides(env_path).api
+            if api is not None:
+                ports.add(api)
+        # Legacy: profiles whose port still lives in metadata (pre-migration).
+        for info in self._load_metadata().profiles.values():
+            if info.get("port"):
+                ports.add(info["port"])
+        return ports
+
     def _check_daemon_running(self, port: int) -> bool:
         """Check if daemon is running on a port.
 
@@ -477,12 +679,8 @@ class ProfileManager:
         Returns:
             True if daemon is responding.
         """
-        try:
-            with httpx.Client() as client:
-                response = client.get(f"http://127.0.0.1:{port}/health", timeout=1)
-                return response.status_code == 200
-        except Exception:
-            return False
+        response = probe_get(f"http://127.0.0.1:{port}/health", read_timeout=1.0)
+        return response is not None and response.status_code == 200
 
     def _load_metadata(self) -> ProfileMetadata:
         """Load profile metadata from disk.

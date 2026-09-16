@@ -2,7 +2,7 @@
 
 # Observations: Knowledge Consolidation
 
-After memories are retained, Hindsight automatically consolidates related facts into **observations** — deduplicated, evidence-grounded beliefs the bank has built up from multiple memories. Each observation tracks its supporting evidence (with exact quotes), a proof count, and a computed freshness trend, and is refined rather than overwritten when new evidence arrives.
+After memories are retained, Hindsight automatically consolidates related facts into **observations** — deduplicated, evidence-grounded beliefs the bank has built up from multiple memories. Each observation tracks its supporting evidence (with exact quotes) and a proof count, and is refined rather than overwritten when new evidence arrives.
 
 ```mermaid
 graph LR
@@ -30,7 +30,7 @@ Observations provide:
 - **Deduplication**: One durable belief instead of many overlapping facts
 - **Grounding**: Every observation references the specific memories (with quotes) that support it
 - **Evolution**: Refined as evidence strengthens, weakens, or contradicts it — history is preserved
-- **Freshness signal**: A computed trend (stable / strengthening / weakening / new / stale) tells you whether the belief still holds
+- **Freshness awareness**: when newer memories haven't been consolidated yet, `reflect` treats the affected observations as stale and verifies them against raw facts
 - **Efficiency**: Condensed knowledge for faster retrieval
 
 ---
@@ -45,6 +45,44 @@ After `retain()` completes, the consolidation engine runs automatically:
 2. **Pattern detection** — Related facts are grouped and synthesized
 3. **Observation creation/update** — New observations are created or existing ones refined
 4. **Evidence tracking** — Each observation maintains references to supporting facts
+
+### Near-Duplicate Reconciliation
+
+Consolidation can still produce two observations that say the same thing in slightly different words — for example when a weaker model writes a near-identical observation instead of refining the existing one, or when refining an observation reshapes its wording so it overlaps another one. Left alone, these near-duplicates clutter recall with redundant beliefs.
+
+When enabled, Hindsight reconciles them automatically. Whenever an observation is created **or** updated, it is compared against the existing observations it most closely resembles. If one is highly similar, a focused check decides whether to **merge** them into a single belief (folding both sets of supporting evidence together) or **keep** them separate. Because the check reads the full text of both, observations that differ in a meaningful detail — a number, a negation, a named entity or language — are correctly kept apart rather than collapsed.
+
+This is controlled by the [`HINDSIGHT_API_CONSOLIDATION_DEDUP_THRESHOLD`](configuration.md#observations) setting: the cosine similarity at or above which two observations are reconciled. It is **enabled by default** (`0.97`); a lower value reconciles more aggressively, and `1.0` disables it. Reconciliation runs on PostgreSQL deployments only — it is skipped on Oracle regardless of the threshold.
+
+Reconciliation only compares observations **within the same tag scope**. If you tag retains with a unique per-call value (e.g. a `session-id`), each session lands in its own scope and never dedups against the others — producing one near-identical observation per session. To consolidate across those volatile tags, retain with [`observation_scopes: "shared"`](api/retain.md#shared), which scopes observations to one global, untagged belief while leaving the session tag on the source facts for recall filtering.
+
+### Disabling Auto-Consolidation
+
+Set `HINDSIGHT_API_ENABLE_AUTO_CONSOLIDATION=false` (or configure per-bank via the [bank config API](api/memory-banks.md#observations-configuration)) to prevent consolidation from running automatically after retain, delete, and update operations. When disabled, consolidation only runs when you explicitly call the [consolidate endpoint](#trigger-consolidation).
+
+This is useful when you want full control over consolidation timing — for example, batching many retains before consolidating, or running consolidation only for specific scopes.
+
+### Targeted Consolidation
+
+By default, consolidation processes **all** unconsolidated memories in a bank. You can scope it to specific tag sets using the `observation_scopes` parameter on the consolidate endpoint:
+
+```python
+# Consolidate only memories tagged with user:alice
+client.consolidate(
+    bank_id="my-bank",
+    observation_scopes=[["user:alice"]]
+)
+
+# Consolidate memories for alice OR the engineering team
+client.consolidate(
+    bank_id="my-bank",
+    observation_scopes=[["user:alice"], ["team:engineering"]]
+)
+```
+
+Each scope is a list of tags. A memory matches a scope if its tags **contain all** tags in that scope. For example, scope `["user:alice"]` matches memories tagged `["user:alice", "team:eng"]`.
+
+When `observation_scopes` is omitted, all unconsolidated memories are processed (backward compatible).
 
 ### Evidence-Based Evolution
 
@@ -147,6 +185,8 @@ By default, observations are scoped to all of a memory's tags combined. The `obs
 
 See [`observation_scopes` in the Retain API](./api/retain#observation_scopes) for the full explanation and options.
 
+To inspect the scopes that already exist in a bank, call `GET /v1/default/banks/{bank_id}/observations/scopes`. The response lists each exact tag set with its observation count; the empty tag list is the global scope. The listing is paged (`limit`, default 100, and `offset`), with `total` reporting how many distinct scopes the bank holds. Use a returned scope as `tags` with `tags_match: "exact"` when you need to filter to that precise observation scope without also matching observations that carry extra tags. To recall **only** the global scope — the untagged observations written by `observation_scopes: "shared"` — pass an empty list with exact matching: `tags: []`, `tags_match: "exact"`.
+
 ---
 
 ## Observations Mission
@@ -210,9 +250,28 @@ This resets the consolidation state for all source memories in the bank, so the 
 
 ---
 
+## Trigger Consolidation {#trigger-consolidation}
+
+Use the consolidate endpoint to manually trigger consolidation:
+
+```http
+POST /v1/default/banks/{bank_id}/consolidate
+Content-Type: application/json
+
+{
+  "observation_scopes": [["user:alice"], ["team:engineering"]]
+}
+```
+
+The request body is optional. When omitted (or sent as an empty body), all unconsolidated memories in the bank are processed.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `observation_scopes` | `list[list[str]]` \| `null` | Optional list of tag scopes. Only memories whose tags contain all tags in at least one scope are processed. Omit for a full-bank sweep. |
+
 ## Configuration
 
-Observation consolidation runs automatically. You can monitor consolidation via the [Operations API](./api/operations).
+Observation consolidation runs automatically by default. You can disable auto-consolidation with [`HINDSIGHT_API_ENABLE_AUTO_CONSOLIDATION`](configuration.md#observations) and trigger it on-demand via the [consolidate endpoint](#trigger-consolidation). Monitor consolidation progress via the [Operations API](./api/operations).
 
 ---
 

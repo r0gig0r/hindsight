@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useMemo, useCallback } from "react";
+import { useTranslations } from "next-intl";
 import { client } from "@/lib/api";
 import { useBank } from "@/lib/bank-context";
 import { Button } from "@/components/ui/button";
@@ -11,7 +12,9 @@ import {
   ChevronsRight,
   List,
   ScatterChart,
+  Users,
 } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import {
   Table,
   TableBody,
@@ -21,7 +24,11 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Constellation } from "./constellation";
-import { convertHindsightGraphData, GraphNode } from "./graph-2d";
+import { convertHindsightGraphData, GraphNode } from "./graph-data";
+import { TimelineView } from "./data-view";
+import { MemoryDetailModal } from "./memory-detail-modal";
+
+type MemoryRow = Awaited<ReturnType<typeof client.listMemories>>["items"][number];
 
 type EntityGraphResponse = Awaited<ReturnType<typeof client.getEntityGraph>>;
 
@@ -41,11 +48,19 @@ type ViewMode = "relations" | "list";
 const ITEMS_PER_PAGE = 50;
 
 export function EntitiesView() {
+  const t = useTranslations("entitiesView");
   const { currentBank } = useBank();
   const [entities, setEntities] = useState<Entity[]>([]);
   const [loading, setLoading] = useState(false);
   const [selectedEntity, setSelectedEntity] = useState<EntityDetail | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
+  // Per-entity timeline: every memory linked to the entity (reverse lookup via
+  // the entity_id filter). We intentionally do NOT filter to observations —
+  // entity links live on the source world/experience facts (which carry the
+  // occurred dates the timeline plots); derived observations aren't entity-linked.
+  const [entityMemories, setEntityMemories] = useState<MemoryRow[]>([]);
+  const [loadingMemories, setLoadingMemories] = useState(false);
+  const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("relations");
   const [graphData, setGraphData] = useState<EntityGraphResponse | null>(null);
   const [graphLoading, setGraphLoading] = useState(false);
@@ -81,6 +96,8 @@ export function EntitiesView() {
     if (!currentBank) return;
 
     setLoadingDetail(true);
+    setEntityMemories([]);
+    setLoadingMemories(true);
     try {
       const result: any = await client.getEntity(entityId, currentBank);
       setSelectedEntity(result);
@@ -88,6 +105,21 @@ export function EntitiesView() {
       // Error toast is shown automatically by the API client interceptor
     } finally {
       setLoadingDetail(false);
+    }
+
+    // Reverse lookup: every memory linked to this entity, rendered as a timeline.
+    // Independent of the detail fetch above.
+    try {
+      const memories = await client.listMemories(currentBank, {
+        entityId,
+        limit: 500,
+      });
+      setEntityMemories(memories.items || []);
+    } catch (error) {
+      // Error toast is shown automatically by the API client interceptor
+      setEntityMemories([]);
+    } finally {
+      setLoadingMemories(false);
     }
   };
 
@@ -205,7 +237,7 @@ export function EntitiesView() {
   );
 
   const formatDate = (dateStr?: string) => {
-    if (!dateStr) return "N/A";
+    if (!dateStr) return t("na");
     return new Date(dateStr).toLocaleDateString();
   };
 
@@ -223,7 +255,7 @@ export function EntitiesView() {
             }`}
           >
             <ScatterChart className="w-4 h-4" />
-            Relations
+            {t("viewRelations")}
           </button>
           <button
             onClick={() => setViewMode("list")}
@@ -234,18 +266,18 @@ export function EntitiesView() {
             }`}
           >
             <List className="w-4 h-4" />
-            List
+            {t("viewList")}
           </button>
         </div>
       </div>
 
       {viewMode === "relations" && (
-        <div className="border border-border rounded-lg overflow-hidden">
+        <div className="bg-card border border-border border-solid rounded-[16px] overflow-hidden">
           {graphLoading ? (
             <div className="flex items-center justify-center py-20">
               <div className="text-center">
-                <div className="text-4xl mb-2">...</div>
-                <div className="text-sm text-muted-foreground">Loading entity graph...</div>
+                <Spinner size="xl" variant="jump" className="mx-auto mb-2" />
+                <div className="text-sm text-muted-foreground">{t("loadingEntityGraph")}</div>
               </div>
             </div>
           ) : constellationData.nodes.length > 0 ? (
@@ -255,7 +287,7 @@ export function EntitiesView() {
               onNodeClick={handleConstellationNodeClick}
               nodeSizeFn={nodeSizeFn}
               nodeHeatFn={recencyLookup ? nodeHeatFn : undefined}
-              heatLegendLabel={recencyLookup ? "recency · last co-occurrence" : undefined}
+              heatLegendLabel={recencyLookup ? t("heatLegendLabel") : undefined}
               heatLegendEndpoints={
                 recencyLookup
                   ? [
@@ -264,15 +296,15 @@ export function EntitiesView() {
                     ]
                   : undefined
               }
-              sizeLegendLabel="co-occurrences"
+              sizeLegendLabel={t("sizeLegendLabel")}
               compactLabels
             />
           ) : (
             <div className="flex items-center justify-center py-20">
               <div className="text-center">
-                <div className="text-sm text-muted-foreground">No entity co-occurrences yet</div>
+                <div className="text-sm text-muted-foreground">{t("noCooccurrences")}</div>
                 <div className="text-xs text-muted-foreground mt-1">
-                  Two entities co-occur when they appear in the same memory.
+                  {t("noCooccurrencesDescription")}
                 </div>
               </div>
             </div>
@@ -286,23 +318,23 @@ export function EntitiesView() {
           {loading ? (
             <div className="flex items-center justify-center py-20">
               <div className="text-center">
-                <div className="text-4xl mb-2">...</div>
-                <div className="text-sm text-muted-foreground">Loading entities...</div>
+                <Spinner size="xl" variant="jump" className="mx-auto mb-2" />
+                <div className="text-sm text-muted-foreground">{t("loadingEntities")}</div>
               </div>
             </div>
           ) : entities.length > 0 ? (
             <>
               <div className="mb-4 text-sm text-muted-foreground">
-                {total} {total === 1 ? "entity" : "entities"}
+                {t("entityCount", { count: total })}
               </div>
               <div className="overflow-x-auto">
                 <Table>
                   <TableHeader>
                     <TableRow>
-                      <TableHead>Name</TableHead>
-                      <TableHead>Mentions</TableHead>
-                      <TableHead>First Seen</TableHead>
-                      <TableHead>Last Seen</TableHead>
+                      <TableHead>{t("colName")}</TableHead>
+                      <TableHead>{t("colMentions")}</TableHead>
+                      <TableHead>{t("colFirstSeen")}</TableHead>
+                      <TableHead>{t("colLastSeen")}</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -385,10 +417,10 @@ export function EntitiesView() {
           ) : (
             <div className="flex items-center justify-center py-20">
               <div className="text-center">
-                <div className="text-4xl mb-2">...</div>
-                <div className="text-sm text-muted-foreground">No entities found</div>
+                <Users className="w-10 h-10 mx-auto mb-3 text-muted-foreground/50" />
+                <div className="text-sm text-muted-foreground">{t("noEntitiesFound")}</div>
                 <div className="text-xs text-muted-foreground mt-1">
-                  Entities are extracted from facts when memories are added.
+                  {t("noEntitiesDescription")}
                 </div>
               </div>
             </div>
@@ -398,7 +430,7 @@ export function EntitiesView() {
 
       {/* Entity Detail Panel - Fixed overlay */}
       {selectedEntity && (
-        <div className="fixed right-0 top-0 h-screen w-[420px] bg-card border-l-2 border-primary shadow-2xl z-50 overflow-y-auto animate-in slide-in-from-right duration-300 ease-out">
+        <div className="fixed right-0 top-0 h-screen w-[620px] max-w-[95vw] bg-card border-l-2 border-primary shadow-2xl z-50 overflow-y-auto animate-in slide-in-from-right duration-300 ease-out">
           <div className="p-5">
             {/* Header */}
             <div className="flex justify-between items-center mb-6 pb-4 border-b border-border">
@@ -406,12 +438,15 @@ export function EntitiesView() {
                 <h3 className="text-xl font-bold text-card-foreground">
                   {selectedEntity.canonical_name}
                 </h3>
-                <p className="text-sm text-muted-foreground mt-1">Entity details</p>
+                <p className="text-sm text-muted-foreground mt-1">{t("entityDetails")}</p>
               </div>
               <Button
                 variant="ghost"
                 size="sm"
-                onClick={() => setSelectedEntity(null)}
+                onClick={() => {
+                  setSelectedEntity(null);
+                  setEntityMemories([]);
+                }}
                 className="h-8 w-8 p-0"
               >
                 <span className="text-lg">x</span>
@@ -423,7 +458,7 @@ export function EntitiesView() {
               <div className="grid grid-cols-2 gap-4">
                 <div className="p-4 bg-muted/50 rounded-lg">
                   <div className="text-xs font-bold text-muted-foreground uppercase mb-2">
-                    Mentions
+                    {t("mentionsLabel")}
                   </div>
                   <div className="text-lg font-semibold text-card-foreground">
                     {selectedEntity.mention_count}
@@ -431,7 +466,7 @@ export function EntitiesView() {
                 </div>
                 <div className="p-4 bg-muted/50 rounded-lg">
                   <div className="text-xs font-bold text-muted-foreground uppercase mb-2">
-                    First Seen
+                    {t("firstSeenLabel")}
                   </div>
                   <div className="text-sm font-medium text-card-foreground">
                     {formatDate(selectedEntity.first_seen)}
@@ -442,16 +477,47 @@ export function EntitiesView() {
               {/* ID */}
               <div className="p-4 bg-muted/50 rounded-lg">
                 <div className="text-xs font-bold text-muted-foreground uppercase mb-2">
-                  Entity ID
+                  {t("entityIdLabel")}
                 </div>
                 <code className="text-xs font-mono break-all text-muted-foreground">
                   {selectedEntity.id}
                 </code>
               </div>
+
+              {/* Timeline — every memory linked to this entity */}
+              <div>
+                <div className="text-xs font-bold text-muted-foreground uppercase mb-3">
+                  {t("linkedMemoriesLabel")}
+                </div>
+                {loadingMemories ? (
+                  <div className="py-8 text-center">
+                    <Spinner size="md" variant="jump" className="mx-auto mb-2" />
+                    <div className="text-sm text-muted-foreground">
+                      {t("loadingLinkedMemories")}
+                    </div>
+                  </div>
+                ) : entityMemories.length > 0 ? (
+                  <div className="-mx-4">
+                    <TimelineView
+                      data={null}
+                      filteredRows={entityMemories}
+                      bankId={currentBank ?? undefined}
+                      onMemoryClick={setSelectedMemoryId}
+                    />
+                  </div>
+                ) : (
+                  <div className="py-8 text-center text-sm text-muted-foreground">
+                    {t("noLinkedMemories")}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </div>
       )}
+
+      {/* Memory detail modal, opened by clicking a timeline item */}
+      <MemoryDetailModal memoryId={selectedMemoryId} onClose={() => setSelectedMemoryId(null)} />
     </div>
   );
 }

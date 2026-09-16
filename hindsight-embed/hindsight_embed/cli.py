@@ -11,17 +11,16 @@ Usage:
     hindsight-embed daemon status          # Check daemon status
 
 Environment variables:
-    HINDSIGHT_API_LLM_API_KEY: Required. API key for LLM provider.
+    HINDSIGHT_API_LLM_API_KEY: Required when the selected LLM provider uses an API key.
     HINDSIGHT_API_LLM_PROVIDER: Optional. LLM provider (default: "openai").
     HINDSIGHT_API_LLM_MODEL: Optional. LLM model (default: provider-specific, resolved by hindsight-api).
-    HINDSIGHT_EMBED_BANK_ID: Optional. Memory bank ID (default: "default").
     HINDSIGHT_EMBED_API_URL: Optional. Use external API server instead of starting local daemon.
     HINDSIGHT_EMBED_API_TOKEN: Optional. Authentication token for external API (sent as Bearer token).
     HINDSIGHT_EMBED_API_DATABASE_URL: Optional. Database URL for daemon (default: "pg0://hindsight-embed").
-    HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT: Optional. Seconds before daemon auto-exits when idle (default: 300).
     HINDSIGHT_EMBED_API_VERSION: Optional. hindsight-api version to use (default: matches embed version).
                                  Note: Only applies when starting daemon. To change version, stop daemon first.
     HINDSIGHT_EMBED_CLI_VERSION: Optional. hindsight CLI version to install (default: {embed_version}).
+    HINDSIGHT_EMBED_CONTROL_PORT: Optional. Port for the control center web app (default: 7878).
 """
 
 import argparse
@@ -79,9 +78,6 @@ def setup_logging(verbose: bool = False):
         stream=sys.stderr,
     )
 
-    # Set httpx to warning level to reduce noise
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-
     return logging.getLogger(__name__)
 
 
@@ -104,7 +100,7 @@ def load_config_file():
 
     # Load ONLY this profile's config, never fall back to default
     if config_path.exists():
-        with open(config_path) as f:
+        with open(config_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
@@ -116,22 +112,36 @@ def load_config_file():
                         os.environ[key] = value
 
 
-def get_config():
-    """Get configuration from environment variables.
+ENV_LLM_PROVIDER = "HINDSIGHT_API_LLM_PROVIDER"
+ENV_LLM_API_KEY = "HINDSIGHT_API_LLM_API_KEY"
 
-    `llm_model` is left unset (None) when the env var is missing — the daemon's
-    hindsight-api process owns `PROVIDER_DEFAULT_MODELS` and resolves the
-    provider-keyed default itself. Duplicating that table here would silently
-    desync, and importing it from `hindsight_api.config` fails in standalone
-    venvs (e.g. `uvx hindsight-embed`) where `hindsight-api` isn't installed.
+
+def get_config() -> dict[str, str]:
+    """This invocation's daemon overrides, as ``HINDSIGHT_*`` environment variables.
+
+    Every ``HINDSIGHT_*`` variable in the process environment is forwarded
+    verbatim; there is no whitelist of known settings. A whitelist is exactly
+    how ``HINDSIGHT_API_LLM_BASE_URL`` came to be dropped while KEY/MODEL
+    applied (issue #4094) — ``hindsight-api``, not this wrapper, owns the list
+    of settings that exist, and it grows every release.
+
+    No provider or model default is injected: ``hindsight-api`` resolves both
+    (its ``DEFAULT_LLM_PROVIDER`` is this same ``"openai"``, and
+    ``PROVIDER_DEFAULT_MODELS`` is provider-keyed). Duplicating those tables
+    here would silently desync — and importing them fails in standalone venvs
+    (``uvx hindsight-embed``) where ``hindsight-api`` isn't installed anyway.
     """
     load_config_file()
-    return {
-        "llm_api_key": os.environ.get("HINDSIGHT_API_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY"),
-        "llm_provider": os.environ.get("HINDSIGHT_API_LLM_PROVIDER", "openai"),
-        "llm_model": os.environ.get("HINDSIGHT_API_LLM_MODEL"),
-        "bank_id": os.environ.get("HINDSIGHT_EMBED_BANK_ID", "default"),
-    }
+    config = {key: value for key, value in os.environ.items() if key.startswith("HINDSIGHT_")}
+
+    # OPENAI_API_KEY is the one non-HINDSIGHT_ name honoured here, and only for
+    # providers that authenticate with an LLM API key at all.
+    provider = config.get(ENV_LLM_PROVIDER) or "openai"
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if openai_key and ENV_LLM_API_KEY not in config and provider not in NO_API_KEY_PROVIDERS:
+        config[ENV_LLM_API_KEY] = openai_key
+
+    return config
 
 
 # Provider -> API-key env var (None = no key needed)
@@ -141,7 +151,9 @@ PROVIDER_API_KEYS = {
     "gemini": "GEMINI_API_KEY",
     "ollama": None,
     "vertexai": None,
+    "github-copilot": None,
 }
+NO_API_KEY_PROVIDERS = frozenset(provider for provider, key_env in PROVIDER_API_KEYS.items() if key_env is None)
 
 
 def do_configure(args):
@@ -195,29 +207,31 @@ def _has_non_interactive_env() -> bool:
     """Whether the env vars required by _do_configure_from_env are already set.
 
     Returns True when an API key is present, OR when the provider is one that
-    doesn't need a key (ollama, vertexai — the latter authenticates via a
-    service-account file path). Prevents the interactive prompt from kicking
-    in when the user clearly wants CI/scripted behavior.
+    doesn't need a key. Prevents the interactive prompt from kicking in when
+    the user clearly wants CI/scripted behavior.
     """
     if os.environ.get("HINDSIGHT_API_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY"):
         return True
-    return os.environ.get("HINDSIGHT_API_LLM_PROVIDER") in ("ollama", "vertexai")
+    return os.environ.get("HINDSIGHT_API_LLM_PROVIDER") in NO_API_KEY_PROVIDERS
 
 
 def _do_configure_from_env():
     """Non-interactive configuration from environment variables (for CI)."""
     # Check for required environment variables
-    api_key = os.environ.get("HINDSIGHT_API_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
     provider = os.environ.get("HINDSIGHT_API_LLM_PROVIDER", "openai")
+    api_key = (
+        None
+        if provider in NO_API_KEY_PROVIDERS
+        else os.environ.get("HINDSIGHT_API_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    )
 
-    # Don't gate on PROVIDER_API_KEYS — that's only the interactive-menu set
-    # (5 entries). hindsight-api's PROVIDER_DEFAULT_MODELS supports ~18
+    # Don't gate on PROVIDER_API_KEYS — that's only the small interactive-menu
+    # set. hindsight-api's PROVIDER_DEFAULT_MODELS supports many more
     # providers (anthropic, claude-code, bedrock, openrouter, ...). Let the
     # daemon validate; rejecting here would block valid configurations.
 
-    # Check for API key (required for non-ollama and non-vertexai providers)
-    # vertexai uses GCP service account credentials instead of an API key
-    if not api_key and provider not in ("ollama", "vertexai"):
+    # These providers authenticate locally rather than through an LLM API key.
+    if not api_key and provider not in NO_API_KEY_PROVIDERS:
         print("Error: Cannot run interactive configuration without a terminal.", file=sys.stderr)
         print("", file=sys.stderr)
         print("For non-interactive (CI) mode, set environment variables:", file=sys.stderr)
@@ -229,28 +243,34 @@ def _do_configure_from_env():
         return 1
 
     model = os.environ.get("HINDSIGHT_API_LLM_MODEL")
-    bank_id = os.environ.get("HINDSIGHT_EMBED_BANK_ID", "default")
 
     print()
     print("\033[1m\033[36m  Hindsight Embed - Non-interactive Configuration\033[0m")
     print()
     print(f"  \033[2mProvider:\033[0m {provider}")
     print(f"  \033[2mModel:\033[0m {model or '(provider default)'}")
-    print(f"  \033[2mBank ID:\033[0m {bank_id}")
 
     # Save configuration
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-    with open(CONFIG_FILE, "w") as f:
-        f.write("# Hindsight Embed Configuration\n")
-        f.write("# Generated by hindsight-embed configure (non-interactive)\n\n")
-        f.write(f"HINDSIGHT_API_LLM_PROVIDER={provider}\n")
-        if model:
-            f.write(f"HINDSIGHT_API_LLM_MODEL={model}\n")
-        f.write(f"HINDSIGHT_EMBED_BANK_ID={bank_id}\n")
-        if api_key:
-            f.write(f"HINDSIGHT_API_LLM_API_KEY={api_key}\n")
+    # Persist every HINDSIGHT_API_* variable the caller set, not a hand-listed
+    # subset: the subset is why HINDSIGHT_API_LLM_BASE_URL never reached the
+    # written profile (issue #4094). HINDSIGHT_EMBED_* is deliberately excluded
+    # — those configure this wrapper for one invocation (API URL, component
+    # versions), and baking them into the profile is not what a user setting
+    # them for a single `configure` run asked for.
+    config_values = {key: value for key, value in os.environ.items() if key.startswith("HINDSIGHT_API_") and value}
+    config_values[ENV_LLM_PROVIDER] = provider
+    if api_key:
+        config_values[ENV_LLM_API_KEY] = api_key
+    else:
+        # Providers in NO_API_KEY_PROVIDERS authenticate locally; don't persist
+        # a stale key that the resolved provider will never use.
+        config_values.pop(ENV_LLM_API_KEY, None)
 
+    from .env_template import render_config
+
+    CONFIG_FILE.write_text(render_config(config_values), encoding="utf-8")
     CONFIG_FILE.chmod(0o600)
 
     print()
@@ -377,6 +397,7 @@ def _do_configure_interactive(profile_name: str | None = None, port: int | None 
         ("Groq (fast & free tier)", "groq"),
         ("Google Gemini", "gemini"),
         ("Ollama (local, no API key)", "ollama"),
+        ("GitHub Copilot (signed-in account, no LLM API key)", "github-copilot"),
     ]
 
     provider = _prompt_choice("Select your LLM provider:", providers, default=1)
@@ -411,17 +432,11 @@ def _do_configure_interactive(profile_name: str | None = None, port: int | None 
         return 1
     print()
 
-    # Bank ID
-    bank_id = _prompt_text("Memory bank ID", default="default")
-    if bank_id is None:
-        return 1
-
     # Save configuration
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
     config_dict = {
         "HINDSIGHT_API_LLM_PROVIDER": provider,
-        "HINDSIGHT_EMBED_BANK_ID": bank_id,
     }
     if model:
         config_dict["HINDSIGHT_API_LLM_MODEL"] = model
@@ -440,11 +455,9 @@ def _do_configure_interactive(profile_name: str | None = None, port: int | None 
             return 1
     else:
         # Save to default profile
-        with open(CONFIG_FILE, "w") as f:
-            f.write("# Hindsight Embed Configuration\n")
-            f.write("# Generated by hindsight-embed configure\n\n")
-            for key, value in config_dict.items():
-                f.write(f"{key}={value}\n")
+        from .env_template import render_config
+
+        CONFIG_FILE.write_text(render_config(config_dict), encoding="utf-8")
         CONFIG_FILE.chmod(0o600)
 
     # Stop existing daemon if running (it needs to pick up new config)
@@ -456,13 +469,7 @@ def _do_configure_interactive(profile_name: str | None = None, port: int | None 
         daemon_client.stop_daemon(daemon_profile)
 
     # Start daemon with new config
-    new_config = {
-        "llm_api_key": api_key,
-        "llm_provider": provider,
-        "llm_model": model,
-        "bank_id": bank_id,
-    }
-    if daemon_client.ensure_daemon_running(new_config, daemon_profile):
+    if daemon_client.ensure_daemon_running(dict(config_dict), daemon_profile):
         print("  \033[32m✓ Daemon started\033[0m")
     else:
         print("  \033[33m⚠ Failed to start daemon (will start on first command)\033[0m")
@@ -679,7 +686,7 @@ def do_daemon(args, config: dict, logger):
         else:
             # Show last N lines
             try:
-                with open(daemon_log_path) as f:
+                with open(daemon_log_path, encoding="utf-8", errors="replace") as f:
                     lines = f.readlines()
                     for line in lines[-args.lines :]:
                         print(line, end="")
@@ -696,16 +703,16 @@ def do_daemon(args, config: dict, logger):
 def do_ui(args, config: dict, logger):
     """Handle UI subcommands."""
     from . import daemon_client
-    from .profile_manager import UI_PORT_OFFSET, ProfileManager
+    from .profile_manager import ProfileManager
 
     profile = args.profile
     ui_port = getattr(args, "port", None)
     hostname = getattr(args, "hostname", "0.0.0.0")
 
-    # Resolve default UI port
+    # Resolve default UI port (from the profile's .env, else API + offset)
     pm = ProfileManager()
     paths = pm.resolve_profile_paths(profile or "")
-    default_ui_port = paths.port + UI_PORT_OFFSET
+    default_ui_port = paths.ui_port
 
     if args.ui_command == "start":
         from rich.console import Console
@@ -798,7 +805,8 @@ def do_ui(args, config: dict, logger):
             status_text = Text()
             status_text.append("UI is running\n\n", style="green bold")
             status_text.append("  URL: ", style="dim")
-            status_text.append(f"http://127.0.0.1:{effective_port}\n", style="cyan")
+            # localhost, not a loopback literal: the UI can be bound to ::1 only.
+            status_text.append(f"http://localhost:{effective_port}\n", style="cyan")
             status_text.append("  Logs: ", style="dim")
             status_text.append(f"{paths.ui_log}", style="")
 
@@ -840,7 +848,7 @@ def do_ui(args, config: dict, logger):
             return 0
         else:
             try:
-                with open(ui_log_path) as f:
+                with open(ui_log_path, encoding="utf-8", errors="replace") as f:
                     lines = f.readlines()
                     for line in lines[-args.lines :]:
                         print(line, end="")
@@ -948,6 +956,124 @@ def _do_configure_profile_interactive(profile_name: str, port: int | None) -> in
 
     # Use the same interactive flow as default profile but save to named profile
     return _do_configure_interactive(profile_name, port)
+
+
+def do_control(args) -> int:
+    """Handle control-center subcommands (start/stop/status/logs).
+
+    The control center is a persistent, localhost-only web app that writes
+    profile config (the LLM wizard) and supervises the daemon. It runs as its
+    own detached process, so it survives daemon restarts.
+    """
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+
+    from .control_center import (
+        control_status,
+        resolve_control_port,
+        start_control_center,
+        stop_control_center,
+    )
+    from .control_center.lifecycle import log_file
+
+    console = Console()
+    port = getattr(args, "port", None) or resolve_control_port()
+    command = args.control_command
+
+    if command == "start":
+        result = start_control_center(port, open_browser=not getattr(args, "no_open", False))
+        if not result.ok:
+            console.print(
+                Panel(
+                    Text(result.message, style="red"), title="[bold red]✗ Control Center[/bold red]", border_style="red"
+                )
+            )
+            return 1
+        body = Text()
+        body.append(
+            "Control center already running\n\n" if result.already_running else "Control center started\n\n",
+            style="green bold",
+        )
+        body.append("  Open: ", style="dim")
+        body.append(f"{result.url}\n", style="cyan")
+        body.append("  Logs: ", style="dim")
+        body.append(str(log_file()), style="")
+        console.print(
+            Panel(
+                body,
+                title=f"[bold green]✓ Control Center[/bold green] [dim](:{port})[/dim]",
+                border_style="green",
+                padding=(1, 2),
+            )
+        )
+        return 0
+
+    if command == "stop":
+        if stop_control_center(port):
+            console.print(
+                Panel(
+                    Text("Control center stopped", style="green"),
+                    title="[bold green]✓ Control Center[/bold green]",
+                    border_style="green",
+                )
+            )
+            return 0
+        console.print(
+            Panel(
+                Text("Failed to stop control center", style="red"),
+                title="[bold red]✗ Error[/bold red]",
+                border_style="red",
+            )
+        )
+        return 1
+
+    if command == "status":
+        status = control_status(port)
+        if status.running:
+            body = Text()
+            body.append("Control center is running\n\n", style="green bold")
+            body.append("  URL: ", style="dim")
+            body.append(f"http://localhost:{status.port}\n", style="cyan")
+            console.print(
+                Panel(
+                    body,
+                    title=f"[bold green]✓ Control Center[/bold green] [dim](:{status.port})[/dim]",
+                    border_style="green",
+                    padding=(1, 2),
+                )
+            )
+            return 0
+        console.print(
+            Panel(
+                Text("Control center is not running", style="dim"),
+                title="[bold]Control Center[/bold]",
+                border_style="dim",
+            )
+        )
+        return 1
+
+    if command == "logs":
+        log_path = log_file()
+        if not log_path.exists():
+            print("No control center logs found", file=sys.stderr)
+            print(f"  Expected at: {log_path}")
+            return 1
+        if getattr(args, "follow", False):
+            import subprocess
+
+            try:
+                subprocess.run(["tail", "-f", str(log_path)])
+            except KeyboardInterrupt:
+                pass
+            return 0
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            for line in f.readlines()[-getattr(args, "lines", 50) :]:
+                print(line, end="")
+        return 0
+
+    print("Usage: hindsight-embed control {start|stop|status|logs}", file=sys.stderr)
+    return 1
 
 
 def do_profile_command(args: list[str]) -> int:
@@ -1100,7 +1226,7 @@ def do_profile_command(args: list[str]) -> int:
                 config_path = CONFIG_FILE
 
             if config_path.exists():
-                for line in config_path.read_text().splitlines():
+                for line in config_path.read_text(encoding="utf-8").splitlines():
                     line = line.strip()
                     if line and not line.startswith("#") and "=" in line:
                         k, v = line.split("=", 1)
@@ -1152,7 +1278,7 @@ def do_profile_command(args: list[str]) -> int:
         # Parse existing config
         config = {}
         if config_path.exists():
-            for line in config_path.read_text().splitlines():
+            for line in config_path.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
@@ -1197,7 +1323,7 @@ def do_profile_command(args: list[str]) -> int:
         # Parse existing config
         config = {}
         if config_path.exists():
-            for line in config_path.read_text().splitlines():
+            for line in config_path.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
@@ -1394,6 +1520,11 @@ def main():
                 action="append",
                 help="Environment variable (KEY=VALUE, can be repeated)",
             )
+            parser.add_argument(
+                "--web",
+                action="store_true",
+                help="Launch the browser-based control center wizard instead of the terminal prompts",
+            )
             args = parser.parse_args(remaining_args[1:])  # Skip 'configure' itself
 
             # If --profile was consumed by parent_parser, use global_profile
@@ -1401,6 +1532,11 @@ def main():
                 args.profile = global_profile
 
             logger = setup_logging(False)
+            if getattr(args, "web", False):
+                # Delegate to the control center: a persistent local web UI
+                # that writes config and supervises the daemon.
+                control_args = argparse.Namespace(control_command="start", port=None, no_open=False)
+                sys.exit(do_control(control_args))
             exit_code = do_configure(args)
             sys.exit(exit_code)
 
@@ -1454,6 +1590,28 @@ def main():
             exit_code = do_ui(args, config, logger)
             sys.exit(exit_code)
 
+        # Handle control-center subcommands
+        if command == "control":
+            parser = argparse.ArgumentParser(prog="hindsight-embed control")
+            subparsers = parser.add_subparsers(dest="control_command")
+            start_parser = subparsers.add_parser("start", help="Start the control center web app")
+            start_parser.add_argument("--port", type=int, help="Port for the control center (default: 7878)")
+            start_parser.add_argument("--no-open", action="store_true", help="Don't open the browser automatically")
+            stop_parser = subparsers.add_parser("stop", help="Stop the control center")
+            stop_parser.add_argument("--port", type=int, help="Port the control center is running on")
+            status_parser = subparsers.add_parser("status", help="Check control center status")
+            status_parser.add_argument("--port", type=int, help="Port to check")
+            logs_parser = subparsers.add_parser("logs", help="View control center logs")
+            logs_parser.add_argument("--follow", "-f", action="store_true")
+            logs_parser.add_argument("--lines", "-n", type=int, default=50)
+
+            args = parser.parse_args(remaining_args[1:])
+            if not args.control_command:
+                parser.print_help()
+                sys.exit(1)
+            setup_logging(False)
+            sys.exit(do_control(args))
+
         # Handle --help / -h
         if command in ("--help", "-h"):
             print_help()
@@ -1469,14 +1627,6 @@ def main():
 
         # Forward all other commands to hindsight-cli
         config = get_config()
-
-        # Check for LLM API key (not required for vertexai which uses GCP credentials)
-        llm_provider = config.get("llm_provider", "openai")
-        providers_without_api_key = ("ollama", "vertexai", "llamacpp")
-        if not config["llm_api_key"] and llm_provider not in providers_without_api_key:
-            print("Error: LLM API key is required.", file=sys.stderr)
-            print("Run 'hindsight-embed configure' to set up.", file=sys.stderr)
-            sys.exit(1)
 
         from . import daemon_client
 
@@ -1517,6 +1667,12 @@ UI (control plane):
     ui stop [--port PORT]                     Stop the web UI
     ui status [--port PORT]                   Check UI status
     ui logs [-f] [-n]                         View UI logs
+
+Control center (config wizard + daemon supervisor):
+    control start [--port PORT] [--no-open]   Start the local control center (default port: 7878)
+    control stop [--port PORT]                Stop the control center
+    control status [--port PORT]              Check control center status
+    control logs [-f] [-n]                    View control center logs
 
 CLI commands (forwarded to hindsight-cli):
     memory retain <bank> <content>   Store a memory

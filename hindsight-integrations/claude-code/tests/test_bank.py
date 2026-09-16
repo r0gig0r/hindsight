@@ -5,7 +5,6 @@ import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from lib.bank import _resolve_project_name, derive_bank_id, ensure_bank_mission
 
 
@@ -140,6 +139,19 @@ class TestResolveProjectName:
         assert _resolve_project_name("/tmp/worktrees/feature-x", _cfg()) == "hindsight"
 
     @patch("lib.bank.subprocess.run")
+    def test_bare_hub_resolves_to_hidden_directory_parent(self, mock_run):
+        mock_run.side_effect = [
+            self._mock_git("/home/user/myrepo/.bare\n"),
+            self._mock_git("true\n"),
+        ]
+        assert _resolve_project_name("/home/user/myrepo/main", _cfg()) == "myrepo"
+
+    @patch("lib.bank.subprocess.run")
+    def test_standalone_bare_keeps_common_directory_name(self, mock_run):
+        mock_run.return_value = self._mock_git("/srv/repos/myproject.git\n")
+        assert _resolve_project_name("/srv/repos/myproject.git", _cfg()) == "myproject.git"
+
+    @patch("lib.bank.subprocess.run")
     def test_disabled_falls_back_to_basename(self, mock_run):
         cfg = _cfg(resolveWorktrees=False)
         assert _resolve_project_name("/home/user/myproject-wt1", cfg) == "myproject-wt1"
@@ -176,6 +188,29 @@ class TestDirectoryBankMap:
         cfg = _cfg(directoryBankMap={"/home/user/myproject/": "custom-bank"})
         result = derive_bank_id(_hook(cwd="/home/user/myproject"), cfg)
         assert result == "custom-bank"
+
+    def test_windows_drive_letter_case_insensitive_match(self):
+        # On Windows, the cwd's drive-letter (and path) case depends on the
+        # launcher: PowerShell and git-bash hand children an UPPERCASE drive
+        # while the VS Code extension spawn reports lowercase. The map match
+        # must not depend on which launcher started the session. normcase is
+        # a no-op on POSIX, so this test only exercises the Windows behavior
+        # when run there; the POSIX-case-sensitivity test below pins the
+        # complementary guarantee.
+        import os as _os
+
+        if _os.path.normcase("A") == _os.path.normcase("a"):  # case-insensitive FS semantics
+            cfg = _cfg(directoryBankMap={r"c:\Users\dev\proj": "custom-bank"})
+            result = derive_bank_id(_hook(cwd=r"C:\Users\dev\proj"), cfg)
+            assert result == "custom-bank"
+
+    def test_posix_paths_stay_case_sensitive(self):
+        import os as _os
+
+        if _os.path.normcase("A") != _os.path.normcase("a"):  # POSIX semantics
+            cfg = _cfg(directoryBankMap={"/home/User/myproject": "custom-bank"}, bankId="default-bank")
+            result = derive_bank_id(_hook(cwd="/home/user/myproject"), cfg)
+            assert result == "default-bank"
 
     def test_no_match_falls_through_to_static(self):
         cfg = _cfg(directoryBankMap={"/home/user/other": "other-bank"}, bankId="default-bank")
@@ -273,3 +308,14 @@ class TestEnsureBankMission:
         ensure_bank_mission(client, "bank-x", cfg)
         ensure_bank_mission(client, "bank-y", cfg)
         assert client.set_bank_mission.call_count == 2
+
+    @pytest.mark.skipif(not hasattr(__import__("os"), "symlink"), reason="symlinks not supported")
+    def test_directorybankmap_matches_symlinked_cwd(self, tmp_path):
+        import os
+        real = os.path.realpath(tmp_path / "proj")
+        os.makedirs(real)
+        link = str(tmp_path / "proj-link")
+        os.symlink(real, link)
+        cfg = _cfg(directoryBankMap={real: "myproj"}, bankId="fallback")
+        assert derive_bank_id({"cwd": real, "session_id": "s"}, cfg) == "myproj"
+        assert derive_bank_id({"cwd": link, "session_id": "s"}, cfg) == "myproj"

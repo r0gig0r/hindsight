@@ -107,10 +107,12 @@ class TestSchemaIsolation:
             await conn.close()
 
         # Configure tenant extension that provisions schemas via run_migrations
-        tenant_ext = MultiSchemaTestTenantExtension({
-            "db_url": pg0_db_url,
-            "valid_schemas": set(schemas),
-        })
+        tenant_ext = MultiSchemaTestTenantExtension(
+            {
+                "db_url": pg0_db_url,
+                "valid_schemas": set(schemas),
+            }
+        )
         memory._tenant_extension = tenant_ext
 
         # Define concurrent insert tasks for each tenant
@@ -129,7 +131,7 @@ class TestSchemaIsolation:
                 for i in range(3):
                     await conn.execute(
                         f"""
-                        INSERT INTO {fq_table('memory_units')} (bank_id, text, event_date, fact_type)
+                        INSERT INTO {fq_table("memory_units")} (bank_id, text, event_date, fact_type)
                         VALUES ($1, $2, now(), 'world')
                         """,
                         bank_id,
@@ -155,9 +157,7 @@ class TestSchemaIsolation:
 
                 # All texts should contain the schema's marker
                 for text in texts:
-                    assert f"MARKER_{prefix}" in text, (
-                        f"Memory in {schema} missing its marker: {text}"
-                    )
+                    assert f"MARKER_{prefix}" in text, f"Memory in {schema} missing its marker: {text}"
 
                 # Should NOT contain other tenants' markers
                 other_prefixes = ["ALPHA", "BETA", "GAMMA"]
@@ -226,6 +226,7 @@ class TestSchemaIsolation:
         assert not errors, f"Schema context isolation errors: {errors}"
 
     @pytest.mark.asyncio
+    @pytest.mark.memory_backend_incompatible
     async def test_list_memories_respects_schema(self, memory, pg0_db_url):
         """
         list_memory_units should only return memories from the current schema.
@@ -253,6 +254,17 @@ class TestSchemaIsolation:
         conn = await asyncpg.connect(pg0_db_url)
         try:
             for schema in schemas:
+                # The bank row goes in per schema too: list_memory_units 404s for a bank
+                # nobody created (#4175), and "created" is per tenant schema — which is
+                # part of what this test is about.
+                await conn.execute(
+                    f"""
+                    INSERT INTO "{schema}".banks (bank_id, name, disposition, mission, internal_id)
+                    VALUES ($1, $1, '{{"skepticism": 3, "literalism": 3, "empathy": 3}}'::jsonb, '', gen_random_uuid())
+                    ON CONFLICT (bank_id) DO NOTHING
+                    """,
+                    bank_id,
+                )
                 await conn.execute(
                     f"""
                     INSERT INTO "{schema}".memory_units (bank_id, text, event_date, fact_type)
@@ -265,10 +277,12 @@ class TestSchemaIsolation:
             await conn.close()
 
         # Configure tenant extension
-        tenant_ext = MultiSchemaTestTenantExtension({
-            "db_url": pg0_db_url,
-            "valid_schemas": set(schemas),
-        })
+        tenant_ext = MultiSchemaTestTenantExtension(
+            {
+                "db_url": pg0_db_url,
+                "valid_schemas": set(schemas),
+            }
+        )
         memory._tenant_extension = tenant_ext
 
         try:
@@ -333,10 +347,12 @@ class TestSchemaIsolation:
             run_migrations(pg0_db_url, schema=schema)
 
         # Configure tenant extension (schemas already provisioned)
-        tenant_ext = MultiSchemaTestTenantExtension({
-            "db_url": pg0_db_url,
-            "valid_schemas": set(schemas),
-        })
+        tenant_ext = MultiSchemaTestTenantExtension(
+            {
+                "db_url": pg0_db_url,
+                "valid_schemas": set(schemas),
+            }
+        )
         # Mark schemas as already provisioned so extension doesn't re-run migrations
         tenant_ext._provisioned = set(schemas)
         memory._tenant_extension = tenant_ext
@@ -357,7 +373,7 @@ class TestSchemaIsolation:
                 async with acquire_with_retry(pool) as conn:
                     await conn.execute(
                         f"""
-                        INSERT INTO {fq_table('memory_units')} (bank_id, text, event_date, fact_type)
+                        INSERT INTO {fq_table("memory_units")} (bank_id, text, event_date, fact_type)
                         VALUES ($1, $2, now(), 'world')
                         """,
                         bank_id,

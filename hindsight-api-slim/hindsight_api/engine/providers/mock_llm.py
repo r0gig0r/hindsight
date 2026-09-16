@@ -7,12 +7,26 @@ without making actual API calls to external LLM services.
 
 import logging
 from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from typing import Any
 
-from ..llm_interface import LLMInterface
-from ..response_models import LLMToolCall, LLMToolCallResult, TokenUsage
+from ..llm_interface import LLM_TOOL_CHOICE_AUTO, LLMInterface, LLMToolChoice, LLMToolChoiceMode
+from ..response_models import LLMCallResult, LLMToolCall, LLMToolCallResult, TokenUsage
 
 logger = logging.getLogger(__name__)
+
+
+def _user_text_of(content: Any) -> str:
+    """The text of a user message, whether it is a string or content parts.
+
+    A multimodal retain hands the provider an interleaved list of text and image
+    parts. The mock has no vision, so it synthesizes from the text alone — the
+    tests that care about the image assert on the message the mock recorded, not
+    on what it invented from it.
+    """
+    if not isinstance(content, list):
+        return content
+    return " ".join(part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text")
 
 
 class MockLLM(LLMInterface):
@@ -30,10 +44,11 @@ class MockLLM(LLMInterface):
         mock_llm.set_mock_response({"answer": "test"})
 
         # Make calls
-        result = await mock_llm.call(
+        call_result = await mock_llm.call(
             messages=[{"role": "user", "content": "test"}],
             response_format=MyResponseModel
         )
+        result = call_result.content
 
         # Verify calls
         calls = mock_llm.get_mock_calls()
@@ -47,7 +62,7 @@ class MockLLM(LLMInterface):
         api_key: str,
         base_url: str,
         model: str,
-        reasoning_effort: str = "low",
+        reasoning_effort: str | None = None,
         **kwargs: Any,
     ):
         """
@@ -68,6 +83,14 @@ class MockLLM(LLMInterface):
         self._mock_response: Any = None
         self._mock_exception: Exception | None = None
         self._response_callback: Callable[[list[dict], str], Any] | None = None
+
+    def supports_vision(self) -> bool:
+        """True, so tests can drive the multimodal extraction path.
+
+        The mock records whatever message parts it is handed, which is exactly
+        what the prompt-assembly tests assert against.
+        """
+        return True
 
     async def verify_connection(self) -> None:
         """
@@ -90,8 +113,8 @@ class MockLLM(LLMInterface):
         max_backoff: float = 60.0,
         skip_validation: bool = False,
         strict_schema: bool = False,
-        return_usage: bool = False,
-    ) -> Any:
+        attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
+    ) -> LLMCallResult:
         """
         Make a mock LLM API call.
 
@@ -101,18 +124,15 @@ class MockLLM(LLMInterface):
             messages: List of message dicts with 'role' and 'content'.
             response_format: Optional Pydantic model for structured output.
             max_completion_tokens: Not used in mock.
-            temperature: Not used in mock.
+            temperature: Recorded on the call record for test assertions.
             scope: Scope identifier for tracking.
             max_retries: Not used in mock.
             initial_backoff: Not used in mock.
             max_backoff: Not used in mock.
             skip_validation: Return raw JSON without Pydantic validation.
             strict_schema: Not used in mock.
-            return_usage: If True, return tuple (result, TokenUsage) instead of just result.
 
         Returns:
-            If return_usage=False: Parsed response if response_format is provided, otherwise text content.
-            If return_usage=True: Tuple of (result, TokenUsage) with mock token counts.
         """
         # Record the call for test verification
         call_record = {
@@ -123,6 +143,9 @@ class MockLLM(LLMInterface):
             if response_format and hasattr(response_format, "__name__")
             else str(response_format),
             "scope": scope,
+            # Record the temperature so tests can assert per-operation temperature
+            # wiring (None means the parameter was omitted from the call).
+            "temperature": temperature,
         }
         self._mock_calls.append(call_record)
         logger.debug(f"Mock LLM call recorded: scope={scope}, model={self.model}")
@@ -153,20 +176,37 @@ class MockLLM(LLMInterface):
             result = self._response_callback(messages, scope)
         elif self._mock_response is not None:
             result = self._mock_response
+        elif scope == "retain_extract_facts" and skip_validation:
+            # Fact extraction: return canned facts derived from user message text.
+            # This allows tests using a mock LLM to get real facts into the DB
+            # so retain → recall → reflect pipelines work end-to-end.
+            result = self._build_mock_facts(messages)
+        elif scope == "consolidation" and response_format is not None:
+            # Consolidation: produce a single observation from the input facts
+            # so the full pipeline (retain → consolidation → observation → recall) works.
+            result = self._build_mock_consolidation(messages, response_format)
+        elif scope == "consolidation_dedup" and response_format is not None:
+            # Observation dedup adjudication. Default to "keep" so mock-LLM consolidation never
+            # spuriously merges observations — this preserves the pre-dedup behaviour that
+            # deterministic consolidation tests assert (the generic branch below can't construct
+            # the model because its "action" field is required and has no default).
+            result = response_format(action="keep", reason="mock")
+        elif scope == "memory_think":
+            # Reflect: return a plausible text answer
+            result = "Based on the available information, the answer is related to the context provided."
         elif response_format is not None:
-            # Try to create a minimal valid instance of the response format
+            # Structured output: try to return a valid empty instance of the model
+            # so that callers expecting e.g. response_format with defaults
+            # get a valid instance rather than a crash on {"mock": True}.
             try:
-                # For Pydantic models, try to create with minimal valid data
-                result = {"mock": True}
+                result = response_format()
             except Exception:
                 result = {"mock": True}
         else:
             result = "mock response"
 
-        if return_usage:
-            token_usage = TokenUsage(input_tokens=10, output_tokens=5, total_tokens=15)
-            return result, token_usage
-        return result
+        token_usage = TokenUsage(input_tokens=10, output_tokens=5, total_tokens=15)
+        return LLMCallResult(content=result, usage=token_usage)
 
     async def call_with_tools(
         self,
@@ -178,7 +218,8 @@ class MockLLM(LLMInterface):
         max_retries: int = 5,
         initial_backoff: float = 1.0,
         max_backoff: float = 30.0,
-        tool_choice: str | dict[str, Any] = "auto",
+        tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_AUTO,
+        attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> LLMToolCallResult:
         """
         Make a mock LLM API call with tool/function calling support.
@@ -189,7 +230,7 @@ class MockLLM(LLMInterface):
             messages: List of message dicts. Can include tool results with role='tool'.
             tools: List of tool definitions in OpenAI format.
             max_completion_tokens: Not used in mock.
-            temperature: Not used in mock.
+            temperature: Recorded on the call record for test assertions.
             scope: Scope identifier for tracking.
             max_retries: Not used in mock.
             initial_backoff: Not used in mock.
@@ -206,6 +247,9 @@ class MockLLM(LLMInterface):
             "messages": messages,
             "tools": [t.get("function", {}).get("name") for t in tools],
             "scope": scope,
+            # Record the temperature so tests can assert per-operation temperature
+            # wiring (None means the parameter was omitted from the call).
+            "temperature": temperature,
         }
         self._mock_calls.append(call_record)
 
@@ -241,7 +285,13 @@ class MockLLM(LLMInterface):
             else:
                 result = LLMToolCallResult(content="mock response", finish_reason="stop")
         else:
-            result = LLMToolCallResult(content="mock response", finish_reason="stop")
+            result = self._compliant_tool_call(tools, tool_choice, messages)
+
+        # Set mock token usage on result if not already set
+        if result.input_tokens == 0:
+            result.input_tokens = 10
+        if result.output_tokens == 0:
+            result.output_tokens = 5
 
         # Record span with mock values
         # Convert LLMToolCall objects to dicts for span recording
@@ -265,6 +315,147 @@ class MockLLM(LLMInterface):
         )
 
         return result
+
+    @staticmethod
+    def _compliant_tool_call(
+        tools: list[dict[str, Any]],
+        tool_choice: LLMToolChoice,
+        messages: list[dict[str, Any]],
+    ) -> LLMToolCallResult:
+        """Default tool response: simulate a compliant tool-calling model.
+
+        Real providers drive the reflect loop entirely through tool calls -- they
+        honor a forced tool choice, then finish via ``done`` -- and the reflect
+        agent now rejects a turn that yields no tool call at all (a transport that
+        can't tool-call raises ReflectToolCallError). So the mock must behave like a
+        working provider here rather than returning bare "mock response" prose,
+        which used to be salvaged as the answer. Only this default path is affected;
+        tests that script turns via ``_response_callback`` / ``_mock_response`` are not.
+        """
+        tool_names = {t.get("function", {}).get("name") for t in tools}
+
+        def _mock_query() -> str:
+            for message in reversed(messages):
+                content = message.get("content")
+                if message.get("role") == "user" and isinstance(content, str) and content.strip():
+                    return content[:200]
+            return "mock query"
+
+        # Honor a forced retrieval tool so the loop actually runs recall/search and
+        # gathers evidence (populates based_on for tests that assert on it).
+        if tool_choice.mode is LLMToolChoiceMode.NAMED and tool_choice.function_name in {
+            "search_mental_models",
+            "search_observations",
+            "recall",
+        }:
+            return LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(
+                        id="mock_forced",
+                        name=tool_choice.function_name,
+                        arguments={"reason": "mock", "query": _mock_query()},
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+
+        # Auto turn: finish via the done tool, mirroring a model that has gathered
+        # enough. The reflect evidence guardrail handles the empty-bank case (no
+        # evidence -> forced text synthesis on the final iteration).
+        if "done" in tool_names:
+            return LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="mock_done", name="done", arguments={"answer": "mock response"})],
+                finish_reason="tool_calls",
+            )
+
+        # No done tool offered (non-reflect tool call): fall back to plain text.
+        return LLMToolCallResult(content="mock response", finish_reason="stop")
+
+    @staticmethod
+    def _build_mock_facts(messages: list[dict]) -> dict:
+        """Build a canned fact extraction response from the user message text.
+
+        Splits the input into sentence-like chunks and returns each as a separate
+        world fact with a simple entity extracted from the first noun-like word.
+        This is intentionally simplistic — it just needs to produce structurally
+        valid facts so the rest of the pipeline (embedding, storage, recall) works.
+        """
+        import re
+
+        user_text = ""
+        for m in messages:
+            if m.get("role") == "user":
+                user_text = _user_text_of(m.get("content", ""))
+                break
+
+        # Split on sentence boundaries: period followed by space/EOL (not mid-number), or newlines
+        sentences = [s.strip() for s in re.split(r"(?<=\.)\s+|\n+", user_text) if s.strip() and len(s.strip()) > 10]
+
+        if not sentences:
+            sentences = [user_text[:200] if user_text else "mock fact"]
+
+        facts = []
+        for sentence in sentences[:10]:  # Cap at 10 facts per chunk
+            # Extract simple entities: capitalized words that aren't common words
+            words = re.findall(r"\b[A-Z][a-z]+\b", sentence)
+            entities = [{"text": w} for w in dict.fromkeys(words)][:5]  # Dedupe, cap at 5
+
+            facts.append(
+                {
+                    "what": sentence,
+                    "when": "N/A",
+                    "where": "N/A",
+                    "who": "N/A",
+                    "why": "N/A",
+                    "fact_kind": "conversation",
+                    "fact_type": "world",
+                    "entities": entities,
+                }
+            )
+
+        return {"facts": facts}
+
+    @staticmethod
+    def _build_mock_consolidation(messages: list[dict], response_format: Any) -> Any:
+        """Build a mock consolidation response that creates one observation per fact.
+
+        Parses fact IDs from the consolidation prompt and creates one observation
+        per fact, each referencing its source fact ID. This mimics real LLM behavior
+        where distinct facts produce separate observations, preserving entity
+        separation so pipeline tests (graph filtering, entity linking) work correctly.
+        """
+        import re
+
+        user_text = ""
+        for m in messages:
+            if m.get("role") == "user":
+                user_text = _user_text_of(m.get("content", ""))
+                break
+
+        # Extract fact UUIDs from the prompt (format: "[<uuid>] <text>")
+        fact_entries = re.findall(r"\[([0-9a-f-]{36})\]\s*(.+?)(?:\n|$)", user_text)
+
+        if not fact_entries:
+            # No facts to consolidate — return empty response
+            try:
+                return response_format()
+            except Exception:
+                return {"creates": [], "updates": [], "deletes": []}
+
+        # Create one observation per fact to preserve entity separation
+        creates = []
+        for fact_id, fact_text in fact_entries:
+            creates.append({"text": fact_text.strip(), "source_fact_ids": [fact_id]})
+
+        try:
+            return response_format(
+                creates=creates,
+                updates=[],
+                deletes=[],
+            )
+        except Exception:
+            # Fallback if response_format constructor doesn't accept these args
+            return {"creates": creates, "updates": [], "deletes": []}
 
     async def cleanup(self) -> None:
         """Clean up resources (no-op for mock provider)."""
@@ -318,6 +509,8 @@ class MockLLM(LLMInterface):
         return self._mock_calls
 
     def clear_mock_calls(self) -> None:
-        """Clear the recorded mock calls and any set exception."""
+        """Clear all recorded calls and any configured response/exception state."""
         self._mock_calls = []
         self._mock_exception = None
+        self._mock_response = None
+        self._response_callback = None

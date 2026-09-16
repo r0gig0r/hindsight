@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { hindsightClient, sdk, lowLevelClient } from "@/lib/hindsight-client";
+import { localizeApiErrorPayload } from "@/lib/i18n/api-errors";
+import { hindsightClient } from "@/lib/hindsight-client";
 
 export async function GET(request: NextRequest) {
   try {
@@ -7,7 +8,13 @@ export async function GET(request: NextRequest) {
     const bankId = searchParams.get("bank_id") || searchParams.get("agent_id");
 
     if (!bankId) {
-      return NextResponse.json({ error: "bank_id is required" }, { status: 400 });
+      return NextResponse.json(
+        localizeApiErrorPayload(request, {
+          error: "bank_id is required",
+          errorKey: "api.errors.validation.bankIdRequired",
+        }),
+        { status: 400 }
+      );
     }
 
     const limit = searchParams.get("limit") ? Number(searchParams.get("limit")) : undefined;
@@ -22,6 +29,10 @@ export async function GET(request: NextRequest) {
       consolidationStateParam === "done"
         ? consolidationStateParam
         : undefined;
+    const stateParam = searchParams.get("state");
+    const state = stateParam === "valid" || stateParam === "invalidated" ? stateParam : undefined;
+    const documentId = searchParams.get("document_id") || undefined;
+    const entityId = searchParams.get("entity_id") || undefined;
 
     const response = await hindsightClient.listMemories(bankId, {
       limit,
@@ -29,12 +40,21 @@ export async function GET(request: NextRequest) {
       type,
       q,
       consolidationState,
+      state,
+      documentId,
+      entityId,
     });
 
     return NextResponse.json(response, { status: 200 });
   } catch (error) {
     console.error("Error listing memory units:", error);
-    return NextResponse.json({ error: "Failed to list memory units" }, { status: 500 });
+    return NextResponse.json(
+      localizeApiErrorPayload(request, {
+        error: "Failed to list memory units",
+        errorKey: "api.errors.memories.list",
+      }),
+      { status: 500 }
+    );
   }
 }
 
@@ -42,10 +62,11 @@ export async function GET(request: NextRequest) {
 // Use clearBankMemories to delete all memories for a bank instead
 export async function DELETE(request: NextRequest) {
   return NextResponse.json(
-    {
+    localizeApiErrorPayload(request, {
       error:
         "Individual memory unit deletion is not yet supported. Use clear all memories instead.",
-    },
+      errorKey: "api.errors.generic.unsupportedIndividualMemoryDelete",
+    }),
     { status: 501 } // Not Implemented
   );
 }

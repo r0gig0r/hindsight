@@ -150,6 +150,7 @@ async def test_graph_q_and_tags_filter_combined(api_client, test_bank_id):
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_graph_document_filter_includes_observations_via_source_memories(
     memory, api_client, test_bank_id, request_context
 ):
@@ -186,8 +187,8 @@ async def test_graph_document_filter_includes_observations_via_source_memories(
         # World fact tied to the document.
         await conn.execute(
             """
-            INSERT INTO memory_units (id, bank_id, text, fact_type, document_id, history)
-            VALUES ($1, $2, $3, 'world', $4, '[]'::jsonb)
+            INSERT INTO memory_units (id, bank_id, text, fact_type, document_id)
+            VALUES ($1, $2, $3, 'world', $4)
             """,
             fact_id,
             bank_id,
@@ -198,8 +199,8 @@ async def test_graph_document_filter_includes_observations_via_source_memories(
         # Unrelated fact NOT tied to the document.
         await conn.execute(
             """
-            INSERT INTO memory_units (id, bank_id, text, fact_type, history)
-            VALUES ($1, $2, $3, 'world', '[]'::jsonb)
+            INSERT INTO memory_units (id, bank_id, text, fact_type)
+            VALUES ($1, $2, $3, 'world')
             """,
             other_fact_id,
             bank_id,
@@ -210,9 +211,9 @@ async def test_graph_document_filter_includes_observations_via_source_memories(
         await conn.execute(
             """
             INSERT INTO memory_units (
-                id, bank_id, text, fact_type, source_memory_ids, history, proof_count
+                id, bank_id, text, fact_type, source_memory_ids, proof_count
             )
-            VALUES ($1, $2, $3, 'observation', $4::uuid[], '[]'::jsonb, 1)
+            VALUES ($1, $2, $3, 'observation', $4::uuid[], 1)
             """,
             observation_id,
             bank_id,
@@ -224,9 +225,9 @@ async def test_graph_document_filter_includes_observations_via_source_memories(
         await conn.execute(
             """
             INSERT INTO memory_units (
-                id, bank_id, text, fact_type, source_memory_ids, history, proof_count
+                id, bank_id, text, fact_type, source_memory_ids, proof_count
             )
-            VALUES ($1, $2, $3, 'observation', $4::uuid[], '[]'::jsonb, 1)
+            VALUES ($1, $2, $3, 'observation', $4::uuid[], 1)
             """,
             unrelated_observation_id,
             bank_id,
@@ -269,3 +270,126 @@ async def test_graph_q_filter_empty_results(api_client, test_bank_id):
     assert response.status_code == 200
     data = response.json()
     assert data["table_rows"] == []
+
+
+async def _seed_scoped_observations(memory, bank_id, request_context):
+    """Seed observations under scopes [a], [b], [a,b] (x2) and the global scope."""
+    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+    rows = [
+        (uuid.uuid4(), "obs scope a", ["a"]),
+        (uuid.uuid4(), "obs scope b", ["b"]),
+        (uuid.uuid4(), "obs scope ab one", ["a", "b"]),
+        (uuid.uuid4(), "obs scope ab two", ["b", "a"]),  # same scope as above, different order
+        (uuid.uuid4(), "obs global", []),
+    ]
+    async with memory._pool.acquire() as conn:
+        for obs_id, text, tags in rows:
+            await conn.execute(
+                """
+                INSERT INTO memory_units (id, bank_id, text, fact_type, tags, proof_count)
+                VALUES ($1, $2, $3, 'observation', $4::text[], 1)
+                """,
+                obs_id,
+                bank_id,
+                text,
+                tags,
+            )
+    return rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_observation_scopes_enumeration(memory, api_client, test_bank_id, request_context):
+    """The scopes endpoint enumerates distinct tag sets (order-normalized) with counts."""
+    await _seed_scoped_observations(memory, test_bank_id, request_context)
+
+    response = await api_client.get(f"/v1/default/banks/{test_bank_id}/observations/scopes")
+    assert response.status_code == 200
+    scopes = response.json()["scopes"]
+
+    # [a,b] and [b,a] collapse into one scope with count 2; global scope is [].
+    as_map = {tuple(s["tags"]): s["count"] for s in scopes}
+    assert as_map == {("a",): 1, ("b",): 1, ("a", "b"): 2, (): 1}
+    # Most populous scope is first.
+    assert scopes[0]["tags"] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_observation_scopes_pagination(memory, api_client, test_bank_id, request_context):
+    """The scopes endpoint pages: each page is capped, total counts every scope."""
+    await _seed_scoped_observations(memory, test_bank_id, request_context)
+
+    first = await api_client.get(
+        f"/v1/default/banks/{test_bank_id}/observations/scopes",
+        params={"limit": 2, "offset": 0},
+    )
+    assert first.status_code == 200
+    first_data = first.json()
+    assert first_data["total"] == 4
+    assert first_data["limit"] == 2
+    assert first_data["offset"] == 0
+    assert len(first_data["scopes"]) == 2
+
+    second = await api_client.get(
+        f"/v1/default/banks/{test_bank_id}/observations/scopes",
+        params={"limit": 2, "offset": 2},
+    )
+    assert second.status_code == 200
+    second_data = second.json()
+    assert second_data["total"] == 4
+    assert second_data["offset"] == 2
+    assert len(second_data["scopes"]) == 2
+
+    # The two pages are disjoint and together enumerate every scope, in one stable order.
+    paged = [tuple(scope["tags"]) for scope in first_data["scopes"] + second_data["scopes"]]
+    assert len(set(paged)) == 4
+
+    # Past the end: no scopes, but total still reports the whole histogram.
+    beyond = await api_client.get(
+        f"/v1/default/banks/{test_bank_id}/observations/scopes",
+        params={"limit": 2, "offset": 10},
+    )
+    assert beyond.status_code == 200
+    assert beyond.json()["scopes"] == []
+    assert beyond.json()["total"] == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_graph_exact_scope_filter(memory, api_client, test_bank_id, request_context):
+    """tags_match=exact filters observations to exactly one scope, not supersets."""
+    await _seed_scoped_observations(memory, test_bank_id, request_context)
+
+    # Exact scope [a] returns only the [a] observation, NOT the [a,b] ones.
+    response = await api_client.get(
+        f"/v1/default/banks/{test_bank_id}/graph",
+        params={"type": "observation", "tags": ["a"], "tags_match": "exact"},
+    )
+    assert response.status_code == 200
+    texts = {row["text"] for row in response.json()["table_rows"]}
+    assert texts == {"obs scope a"}
+
+    # Exact scope [a,b] returns both [a,b] observations regardless of stored order.
+    response = await api_client.get(
+        f"/v1/default/banks/{test_bank_id}/graph",
+        params={"type": "observation", "tags": ["a", "b"], "tags_match": "exact"},
+    )
+    assert response.status_code == 200
+    texts = {row["text"] for row in response.json()["table_rows"]}
+    assert texts == {"obs scope ab one", "obs scope ab two"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_graph_exact_global_scope_filter(memory, api_client, test_bank_id, request_context):
+    """tags_match=exact with no tags is the global scope: untagged observations only."""
+    await _seed_scoped_observations(memory, test_bank_id, request_context)
+
+    response = await api_client.get(
+        f"/v1/default/banks/{test_bank_id}/graph",
+        params={"type": "observation", "tags_match": "exact"},
+    )
+    assert response.status_code == 200
+    texts = {row["text"] for row in response.json()["table_rows"]}
+    assert texts == {"obs global"}

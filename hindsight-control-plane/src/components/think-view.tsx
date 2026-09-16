@@ -1,10 +1,13 @@
 "use client";
 
 import { useState } from "react";
+import { useTranslations } from "next-intl";
 import { client } from "@/lib/api";
 import { useBank } from "@/lib/bank-context";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
+import { DisclosureButton, Hint, Row, Section, Segmented } from "@/components/form-layout";
 import {
   Select,
   SelectContent,
@@ -12,7 +15,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Checkbox } from "@/components/ui/checkbox";
 import { FactType, FactTypeFilter } from "@/components/fact-type-filter";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -23,24 +25,26 @@ import {
   Database,
   Brain,
   MessageSquare,
-  Shield,
   X,
   Check,
   Play,
 } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import JsonView from "react18-json-view";
 import "react18-json-view/src/style.css";
 import { MemoryDetailModal } from "./memory-detail-modal";
 import { MentalModelDetailModal } from "./mental-model-detail-modal";
+import { ResponseSchemaField } from "./response-schema-field";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-type TagsMatch = "any" | "all" | "any_strict" | "all_strict";
+type TagsMatch = "any" | "all" | "any_strict" | "all_strict" | "exact";
 type ViewMode = "answer" | "trace" | "json";
 type BasedOnTab = "directives" | "mental_models" | "observations" | "world" | "experience";
 
 export function ThinkView() {
+  const t = useTranslations("thinkView");
   const { currentBank } = useBank();
   const [query, setQuery] = useState("");
   const [budget, setBudget] = useState<"low" | "mid" | "high">("mid");
@@ -55,13 +59,12 @@ export function ThinkView() {
   const [factTypes, setFactTypes] = useState<FactType[]>([]);
   const [excludeMentalModels, setExcludeMentalModels] = useState(false);
   const [excludeMentalModelIds, setExcludeMentalModelIds] = useState("");
+  const [responseSchema, setResponseSchema] = useState("");
+  const [optionsOpen, setOptionsOpen] = useState(false);
   const [feedback, setFeedback] = useState("");
   const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
   const [feedbackSubmitted, setFeedbackSubmitted] = useState(false);
   const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null);
-  const [selectedDirective, setSelectedDirective] = useState<any | null>(null);
-  const [fullDirective, setFullDirective] = useState<any | null>(null);
-  const [loadingDirective, setLoadingDirective] = useState(false);
   const [selectedObservation, setSelectedObservation] = useState<any | null>(null);
   const [fullObservation, setFullObservation] = useState<any | null>(null);
   const [loadingObservation, setLoadingObservation] = useState(false);
@@ -70,24 +73,17 @@ export function ThinkView() {
 
   const FEEDBACK_DIRECTIVE_NAME = "General Feedback";
 
-  // Load full directive data when one is selected
-  const handleSelectDirective = async (directive: any) => {
-    setSelectedDirective(directive);
-    setFullDirective(null);
-    if (!currentBank || !directive?.id) return;
-
-    setLoadingDirective(true);
-    try {
-      const directives = await client.listDirectives(currentBank);
-      const fullDir = directives.items?.find((d: any) => d.id === directive.id);
-      setFullDirective(fullDir || directive);
-    } catch (error) {
-      console.error("Failed to load directive:", error);
-      setFullDirective(directive); // Fall back to partial data
-    } finally {
-      setLoadingDirective(false);
-    }
-  };
+  // How many collapsed options differ from their defaults, so a hidden setting
+  // still shows on the Options toggle.
+  const activeOptions = [
+    maxTokens !== 4096,
+    !includeFacts,
+    !includeToolCalls,
+    Boolean(tags.trim()),
+    excludeMentalModels,
+    Boolean(excludeMentalModelIds.trim()),
+    Boolean(responseSchema.trim()),
+  ].filter(Boolean).length;
 
   // Load full observation data when one is selected
   const handleSelectObservation = async (observation: any) => {
@@ -114,8 +110,8 @@ export function ThinkView() {
     setFeedbackSubmitting(true);
     try {
       // Find existing "General Feedback" directive
-      const directives = await client.listDirectives(currentBank);
-      const existingDirective = directives.items?.find((d) => d.name === FEEDBACK_DIRECTIVE_NAME);
+      const directives = await client.listAllDirectives(currentBank);
+      const existingDirective = directives.find((d) => d.name === FEEDBACK_DIRECTIVE_NAME);
 
       if (existingDirective) {
         // Append to existing directive content
@@ -160,6 +156,11 @@ export function ThinkView() {
         .map((s) => s.trim())
         .filter((s) => s.length > 0);
 
+      // response_schema is only ever set through the schema builder, which
+      // guarantees valid, usable JSON — so parse it directly.
+      const schemaText = responseSchema.trim();
+      const parsedSchema = schemaText ? JSON.parse(schemaText) : undefined;
+
       const data: any = await client.reflect({
         bank_id: currentBank,
         query,
@@ -171,6 +172,7 @@ export function ThinkView() {
         ...(factTypes.length > 0 && { fact_types: factTypes }),
         ...(excludeMentalModels && { exclude_mental_models: true }),
         ...(excludeIds.length > 0 && { exclude_mental_model_ids: excludeIds }),
+        ...(parsedSchema && { response_schema: parsedSchema }),
       });
       setResult(data);
     } catch (error) {
@@ -185,8 +187,8 @@ export function ThinkView() {
       <Card className="border-dashed">
         <CardContent className="flex flex-col items-center justify-center py-16">
           <Database className="h-12 w-12 text-muted-foreground mb-4" />
-          <h3 className="text-xl font-semibold mb-2">No Bank Selected</h3>
-          <p className="text-muted-foreground">Select a memory bank to start reflecting.</p>
+          <h3 className="text-xl font-semibold mb-2">{t("noBankSelected")}</h3>
+          <p className="text-muted-foreground">{t("noBankSelectedDescription")}</p>
         </CardContent>
       </Card>
     );
@@ -204,112 +206,146 @@ export function ThinkView() {
                 type="text"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="What would you like to reflect on?"
+                placeholder={t("queryPlaceholder")}
                 className="pl-10 h-12 text-lg"
                 onKeyDown={(e) => e.key === "Enter" && runReflect()}
               />
             </div>
             <Button onClick={runReflect} disabled={loading || !query} className="h-12 px-8">
-              {loading ? "Reflecting..." : "Reflect"}
+              {loading ? t("reflecting") : t("reflect")}
             </Button>
           </div>
 
-          {/* Filters */}
-          <div className="flex flex-wrap items-center gap-6 mt-4 pt-4 border-t">
-            {/* Budget */}
+          {/* Everyday options inline; everything else behind Options. */}
+          <div className="mt-4 flex flex-wrap items-center gap-x-6 gap-y-3">
             <div className="flex items-center gap-2">
-              <span className="text-sm font-medium text-muted-foreground">Budget:</span>
-              <Select value={budget} onValueChange={(value: any) => setBudget(value)}>
-                <SelectTrigger className="w-24 h-8">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="low">Low</SelectItem>
-                  <SelectItem value="mid">Mid</SelectItem>
-                  <SelectItem value="high">High</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-
-            {/* Max Tokens */}
-            <div className="flex items-center gap-2">
-              <span className="text-sm text-muted-foreground">Tokens:</span>
-              <Input
-                type="number"
-                value={maxTokens}
-                onChange={(e) => setMaxTokens(parseInt(e.target.value) || 4096)}
-                className="w-24 h-8"
+              <span className="text-sm text-muted-foreground">{t("budget")}</span>
+              <Hint text={t("helpBudget")} />
+              <Segmented
+                value={budget}
+                onChange={setBudget}
+                ariaLabel={t("budget")}
+                options={[
+                  { value: "low", label: t("budgetLow") },
+                  { value: "mid", label: t("budgetMid") },
+                  { value: "high", label: t("budgetHigh") },
+                ]}
               />
             </div>
-
-            <div className="h-6 w-px bg-border" />
-
-            {/* Include options */}
-            <div className="flex items-center gap-4">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <Checkbox
-                  checked={includeFacts}
-                  onCheckedChange={(c) => setIncludeFacts(c as boolean)}
-                />
-                <span className="text-sm">Include Source</span>
-              </label>
-              <label className="flex items-center gap-2 cursor-pointer">
-                <Checkbox
-                  checked={includeToolCalls}
-                  onCheckedChange={(c) => setIncludeToolCalls(c as boolean)}
-                />
-                <span className="text-sm">Include Tools</span>
-              </label>
+            <div className="flex items-center gap-1.5">
+              <FactTypeFilter value={factTypes} onChange={setFactTypes} />
+              <Hint text={t("helpFactTypes")} />
+            </div>
+            <div className="ml-auto">
+              <DisclosureButton
+                open={optionsOpen}
+                onToggle={() => setOptionsOpen((open) => !open)}
+                label={t("optionsLabel")}
+                badge={activeOptions}
+              />
             </div>
           </div>
 
-          {/* Tags Filter */}
-          <div className="flex items-center gap-4 mt-4 pt-4 border-t">
-            <Tag className="h-4 w-4 text-muted-foreground" />
-            <div className="flex-1 max-w-md">
-              <Input
-                type="text"
-                value={tags}
-                onChange={(e) => setTags(e.target.value)}
-                placeholder="Filter by tags (comma-separated)"
-                className="h-8"
-              />
-            </div>
-            <Select value={tagsMatch} onValueChange={(v) => setTagsMatch(v as TagsMatch)}>
-              <SelectTrigger className="w-40 h-8">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="any">Any (incl. untagged)</SelectItem>
-                <SelectItem value="all">All (incl. untagged)</SelectItem>
-                <SelectItem value="any_strict">Any (strict)</SelectItem>
-                <SelectItem value="all_strict">All (strict)</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
+          {optionsOpen && (
+            <div className="mt-5 grid gap-8 md:grid-cols-2">
+              <Section title={t("sectionAnswer")}>
+                <Row
+                  label={t("maxTokensLabel")}
+                  description={t("helpMaxTokens")}
+                  htmlFor="reflect-max-tokens"
+                >
+                  <Input
+                    id="reflect-max-tokens"
+                    type="number"
+                    value={maxTokens}
+                    onChange={(e) => setMaxTokens(parseInt(e.target.value) || 4096)}
+                    className="h-8"
+                  />
+                </Row>
+                <Row
+                  label={t("includeSource")}
+                  description={t("helpIncludeSource")}
+                  htmlFor="reflect-include-source"
+                >
+                  <div className="flex sm:justify-end">
+                    <Switch
+                      id="reflect-include-source"
+                      checked={includeFacts}
+                      onCheckedChange={setIncludeFacts}
+                    />
+                  </div>
+                </Row>
+                <Row
+                  label={t("includeTools")}
+                  description={t("helpIncludeTools")}
+                  htmlFor="reflect-include-tools"
+                >
+                  <div className="flex sm:justify-end">
+                    <Switch
+                      id="reflect-include-tools"
+                      checked={includeToolCalls}
+                      onCheckedChange={setIncludeToolCalls}
+                    />
+                  </div>
+                </Row>
+                <ResponseSchemaField value={responseSchema} onChange={setResponseSchema} />
+              </Section>
 
-          {/* Fact Types & Mental Model Filters */}
-          <div className="flex flex-wrap items-center gap-6 mt-4 pt-4 border-t">
-            <FactTypeFilter value={factTypes} onChange={setFactTypes} />
-            <div className="h-6 w-px bg-border" />
-            <label className="flex items-center gap-2 cursor-pointer">
-              <Checkbox
-                checked={excludeMentalModels}
-                onCheckedChange={(c) => setExcludeMentalModels(c as boolean)}
-              />
-              <span className="text-sm">Exclude mental models</span>
-            </label>
-            <div className="flex items-center gap-2">
-              <span className="text-sm text-muted-foreground">Exclude IDs:</span>
-              <Input
-                type="text"
-                value={excludeMentalModelIds}
-                onChange={(e) => setExcludeMentalModelIds(e.target.value)}
-                placeholder="model-a, model-b"
-                className="h-8 w-48"
-              />
+              <Section title={t("sectionScope")}>
+                <Row label={t("tagsLabel")} description={t("helpTags")} htmlFor="reflect-tags">
+                  <Input
+                    id="reflect-tags"
+                    type="text"
+                    value={tags}
+                    onChange={(e) => setTags(e.target.value)}
+                    placeholder={t("tagsPlaceholder")}
+                    className="h-8"
+                  />
+                </Row>
+                <Row label={t("tagsMatchLabel")} description={t("helpTagsMatch")}>
+                  <Select value={tagsMatch} onValueChange={(v) => setTagsMatch(v as TagsMatch)}>
+                    <SelectTrigger className="h-8">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="any">{t("tagsMatchAny")}</SelectItem>
+                      <SelectItem value="all">{t("tagsMatchAll")}</SelectItem>
+                      <SelectItem value="any_strict">{t("tagsMatchAnyStrict")}</SelectItem>
+                      <SelectItem value="all_strict">{t("tagsMatchAllStrict")}</SelectItem>
+                      <SelectItem value="exact">{t("tagsMatchExact")}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </Row>
+                <Row
+                  label={t("excludeMentalModels")}
+                  description={t("helpExcludeMentalModels")}
+                  htmlFor="reflect-exclude-models"
+                >
+                  <div className="flex sm:justify-end">
+                    <Switch
+                      id="reflect-exclude-models"
+                      checked={excludeMentalModels}
+                      onCheckedChange={setExcludeMentalModels}
+                    />
+                  </div>
+                </Row>
+                <Row
+                  label={t("excludeIdsRowLabel")}
+                  description={t("helpExcludeIds")}
+                  htmlFor="reflect-exclude-ids"
+                >
+                  <Input
+                    id="reflect-exclude-ids"
+                    type="text"
+                    value={excludeMentalModelIds}
+                    onChange={(e) => setExcludeMentalModelIds(e.target.value)}
+                    placeholder={t("excludeIdsPlaceholder")}
+                    className="h-8"
+                  />
+                </Row>
+              </Section>
             </div>
-          </div>
+          )}
         </CardContent>
       </Card>
 
@@ -317,8 +353,8 @@ export function ThinkView() {
       {loading && (
         <Card>
           <CardContent className="flex flex-col items-center justify-center py-16">
-            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary mb-4" />
-            <p className="text-muted-foreground">Reflecting on memories...</p>
+            <Spinner size="lg" variant="jump" className="mb-4" />
+            <p className="text-muted-foreground">{t("reflectingOnMemories")}</p>
           </CardContent>
         </Card>
       )}
@@ -331,13 +367,13 @@ export function ThinkView() {
             {result.usage && (
               <>
                 <div className="flex items-center gap-2">
-                  <span className="text-muted-foreground">Input tokens:</span>
+                  <span className="text-muted-foreground">{t("inputTokensLabel")}</span>
                   <span className="font-semibold">
                     {result.usage.input_tokens?.toLocaleString()}
                   </span>
                 </div>
                 <div className="flex items-center gap-2">
-                  <span className="text-muted-foreground">Output tokens:</span>
+                  <span className="text-muted-foreground">{t("outputTokensLabel")}</span>
                   <span className="font-semibold">
                     {result.usage.output_tokens?.toLocaleString()}
                   </span>
@@ -346,7 +382,7 @@ export function ThinkView() {
             )}
             {result.trace?.tool_calls && (
               <div className="flex items-center gap-2">
-                <span className="text-muted-foreground">Tool calls:</span>
+                <span className="text-muted-foreground">{t("toolCallsLabel")}</span>
                 <span className="font-semibold">{result.trace.tool_calls.length}</span>
                 <span className="text-muted-foreground">
                   (
@@ -360,7 +396,7 @@ export function ThinkView() {
             )}
             {result.trace?.llm_calls && (
               <div className="flex items-center gap-2">
-                <span className="text-muted-foreground">LLM calls:</span>
+                <span className="text-muted-foreground">{t("llmCallsLabel")}</span>
                 <span className="font-semibold">{result.trace.llm_calls.length}</span>
                 <span className="text-muted-foreground">
                   (
@@ -384,7 +420,11 @@ export function ThinkView() {
                       : "text-muted-foreground hover:text-foreground"
                   }`}
                 >
-                  {mode === "answer" ? "Answer" : mode === "trace" ? "Trace" : "JSON"}
+                  {mode === "answer"
+                    ? t("viewAnswer")
+                    : mode === "trace"
+                      ? t("viewTrace")
+                      : t("viewJson")}
                 </button>
               ))}
             </div>
@@ -396,7 +436,7 @@ export function ThinkView() {
               {/* Main Answer */}
               <Card>
                 <CardHeader>
-                  <CardTitle>Answer</CardTitle>
+                  <CardTitle>{t("answerTitle")}</CardTitle>
                 </CardHeader>
                 <CardContent>
                   <div className="prose prose-sm max-w-none dark:prose-invert">
@@ -405,15 +445,29 @@ export function ThinkView() {
                 </CardContent>
               </Card>
 
+              {/* Structured Output */}
+              {result.structured_output && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-base">{t("structuredOutputTitle")}</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="bg-muted p-4 rounded-lg overflow-auto max-h-[400px]">
+                      <JsonView src={result.structured_output} collapsed={2} theme="default" />
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
+
               {/* Directive */}
               <Card className="border-blue-200 dark:border-blue-800">
                 <CardHeader className="py-4">
                   <CardTitle className="flex items-center gap-2 text-base">
                     <MessageSquare className="w-4 h-4" />
-                    Add Directive
+                    {t("addDirectiveTitle")}
                   </CardTitle>
                   <CardDescription className="text-xs">
-                    Hard rules injected into prompts that the agent must follow
+                    {t("addDirectiveDescription")}
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="pt-0">
@@ -421,7 +475,7 @@ export function ThinkView() {
                     <div className="flex items-center gap-2 text-green-600 dark:text-green-400">
                       <span className="text-lg">&#10003;</span>
                       <span className="text-sm font-medium">
-                        Directive saved to {FEEDBACK_DIRECTIVE_NAME}
+                        {t("directiveSaved", { name: FEEDBACK_DIRECTIVE_NAME })}
                       </span>
                     </div>
                   ) : (
@@ -429,7 +483,7 @@ export function ThinkView() {
                       <Textarea
                         value={feedback}
                         onChange={(e) => setFeedback(e.target.value)}
-                        placeholder="e.g., Always respond in formal English..."
+                        placeholder={t("directivePlaceholder")}
                         className="flex-1 min-h-[60px] resize-none"
                         onKeyDown={(e) => {
                           if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
@@ -442,7 +496,7 @@ export function ThinkView() {
                         disabled={feedbackSubmitting || !feedback.trim()}
                         className="self-end"
                       >
-                        {feedbackSubmitting ? "Saving..." : "Save"}
+                        {feedbackSubmitting ? t("savingDirective") : t("saveDirective")}
                       </Button>
                     </div>
                   )}
@@ -460,10 +514,10 @@ export function ThinkView() {
                   <CardHeader className="bg-emerald-50 dark:bg-emerald-950 py-3">
                     <CardTitle className="flex items-center gap-2 text-base">
                       <Brain className="w-4 h-4 text-emerald-600" />
-                      Observations Created ({result.observations_created.length})
+                      {t("observationsCreatedTitle", { count: result.observations_created.length })}
                     </CardTitle>
                     <CardDescription className="text-xs">
-                      New observations learned during this reflection
+                      {t("observationsCreatedDescription")}
                     </CardDescription>
                   </CardHeader>
                   <CardContent className="pt-4">
@@ -493,19 +547,21 @@ export function ThinkView() {
                 {/* Left: Execution Trace (LLM + Tool Calls) */}
                 <Card className="h-fit">
                   <CardHeader className="pb-3">
-                    <CardTitle className="text-base">Execution Trace</CardTitle>
+                    <CardTitle className="text-base">{t("executionTraceTitle")}</CardTitle>
                     <CardDescription className="text-xs">
-                      {result.iterations || 0} iteration
-                      {(result.iterations || 0) !== 1 ? "s" : ""} •{" "}
-                      {(result.trace?.llm_calls?.reduce(
-                        (sum: number, lc: any) => sum + lc.duration_ms,
-                        0
-                      ) || 0) +
-                        (result.trace?.tool_calls?.reduce(
-                          (sum: number, tc: any) => sum + tc.duration_ms,
-                          0
-                        ) || 0)}
-                      ms total
+                      {t("executionTraceDescription", {
+                        iterations: result.iterations || 0,
+                        iterationsPlural: (result.iterations || 0) !== 1 ? "s" : "",
+                        totalMs:
+                          (result.trace?.llm_calls?.reduce(
+                            (sum: number, lc: any) => sum + lc.duration_ms,
+                            0
+                          ) || 0) +
+                          (result.trace?.tool_calls?.reduce(
+                            (sum: number, tc: any) => sum + tc.duration_ms,
+                            0
+                          ) || 0),
+                      })}
                     </CardDescription>
                   </CardHeader>
                   <CardContent>
@@ -513,9 +569,9 @@ export function ThinkView() {
                       <div className="flex items-start gap-3 p-3 bg-muted border border-border rounded-lg">
                         <Info className="w-4 h-4 text-muted-foreground mt-0.5 flex-shrink-0" />
                         <div>
-                          <p className="font-medium text-sm text-foreground">Not included</p>
+                          <p className="font-medium text-sm text-foreground">{t("notIncluded")}</p>
                           <p className="text-xs text-muted-foreground mt-0.5">
-                            Enable "Include Tool Calls" to see trace.
+                            {t("enableIncludeTools")}
                           </p>
                         </div>
                       </div>
@@ -595,7 +651,7 @@ export function ThinkView() {
                                   <div className="flex-1 min-w-0">
                                     <div className="flex items-center justify-between">
                                       <span className="font-medium text-sm">
-                                        {item.isFinal ? "Response generated" : "Agent decided"}
+                                        {item.isFinal ? t("responseGenerated") : t("agentDecided")}
                                       </span>
                                       <span className="text-xs text-muted-foreground flex items-center gap-1">
                                         <Clock className="w-3 h-3" />
@@ -603,7 +659,7 @@ export function ThinkView() {
                                       </span>
                                     </div>
                                     <span className="text-xs text-muted-foreground">
-                                      {item.isFinal ? "Final answer" : "Called tools below"}
+                                      {item.isFinal ? t("finalAnswer") : t("calledToolsBelow")}
                                     </span>
                                   </div>
                                 </div>
@@ -615,8 +671,11 @@ export function ThinkView() {
                                   </div>
                                   <div className="flex-1 min-w-0 space-y-2">
                                     <div className="text-xs text-muted-foreground">
-                                      Executing {item.tools?.length} tool
-                                      {item.tools?.length !== 1 ? "s" : ""}
+                                      {(item.tools?.length ?? 0) !== 1
+                                        ? t("executingToolsPlural", {
+                                            count: item.tools?.length ?? 0,
+                                          })
+                                        : t("executingTools", { count: item.tools?.length ?? 0 })}
                                     </div>
                                     {item.tools?.map((tc: any, tcIdx: number) => (
                                       <div
@@ -635,7 +694,7 @@ export function ThinkView() {
                                         <div className="p-2 space-y-2">
                                           <div>
                                             <p className="text-[10px] font-semibold text-muted-foreground mb-1">
-                                              Input:
+                                              {t("toolInputLabel")}
                                             </p>
                                             <div className="bg-muted p-1.5 rounded text-xs overflow-auto max-h-32">
                                               <JsonView
@@ -648,7 +707,7 @@ export function ThinkView() {
                                           {tc.output && (
                                             <div>
                                               <p className="text-[10px] font-semibold text-muted-foreground mb-1">
-                                                Output:
+                                                {t("toolOutputLabel")}
                                               </p>
                                               <div className="bg-muted p-1.5 rounded text-xs overflow-auto max-h-32">
                                                 <JsonView
@@ -673,9 +732,9 @@ export function ThinkView() {
                       <div className="flex items-start gap-3 p-3 bg-muted border border-border rounded-lg">
                         <Info className="w-4 h-4 text-muted-foreground mt-0.5 flex-shrink-0" />
                         <div>
-                          <p className="font-medium text-sm text-foreground">No operations</p>
+                          <p className="font-medium text-sm text-foreground">{t("noOperations")}</p>
                           <p className="text-xs text-muted-foreground mt-0.5">
-                            No LLM or tool calls were made during this reflection.
+                            {t("noOperationsDescription")}
                           </p>
                         </div>
                       </div>
@@ -686,14 +745,16 @@ export function ThinkView() {
                 {/* Right: Based On Facts */}
                 <Card className="h-fit">
                   <CardHeader className="pb-3">
-                    <CardTitle className="text-base">Based On</CardTitle>
+                    <CardTitle className="text-base">{t("basedOnTitle")}</CardTitle>
                     <CardDescription className="text-xs">
-                      {(result.based_on?.memories?.length || 0) +
-                        (result.based_on?.observations?.filter(
-                          (o: any) => o.subtype !== "directive"
-                        )?.length || 0) +
-                        (result.based_on?.directives?.length || 0)}{" "}
-                      items used
+                      {t("basedOnDescription", {
+                        count:
+                          (result.based_on?.memories?.length || 0) +
+                          (result.based_on?.observations?.filter(
+                            (o: any) => o.subtype !== "directive"
+                          )?.length || 0) +
+                          (result.based_on?.directives?.length || 0),
+                      })}
                     </CardDescription>
                   </CardHeader>
                   <CardContent>
@@ -701,9 +762,11 @@ export function ThinkView() {
                       <div className="flex items-start gap-3 p-3 bg-muted border border-border rounded-lg">
                         <Info className="w-4 h-4 text-muted-foreground mt-0.5 flex-shrink-0" />
                         <div>
-                          <p className="font-medium text-sm text-foreground">Not included</p>
+                          <p className="font-medium text-sm text-foreground">
+                            {t("notIncludedBasedOn")}
+                          </p>
                           <p className="text-xs text-muted-foreground mt-0.5">
-                            Enable "Include Source" to see memories.
+                            {t("enableIncludeSource")}
                           </p>
                         </div>
                       </div>
@@ -728,15 +791,23 @@ export function ThinkView() {
 
                         // Build tabs array with all categories
                         const tabs: { id: BasedOnTab; label: string; count: number }[] = [
-                          { id: "directives", label: "Directives", count: directives.length },
+                          { id: "directives", label: t("tabDirectives"), count: directives.length },
                           {
                             id: "mental_models",
-                            label: "Mental Models",
+                            label: t("tabMentalModels"),
                             count: mentalModelFacts.length,
                           },
-                          { id: "observations", label: "Observations", count: observations.length },
-                          { id: "world", label: "World", count: worldFacts.length },
-                          { id: "experience", label: "Experience", count: experienceFacts.length },
+                          {
+                            id: "observations",
+                            label: t("tabObservations"),
+                            count: observations.length,
+                          },
+                          { id: "world", label: t("tabWorld"), count: worldFacts.length },
+                          {
+                            id: "experience",
+                            label: t("tabExperience"),
+                            count: experienceFacts.length,
+                          },
                         ];
 
                         const currentTab = activeBasedOnTab;
@@ -841,7 +912,7 @@ export function ThinkView() {
                               </div>
                             ) : (
                               <p className="text-sm text-muted-foreground text-center py-4">
-                                No {currentTab} items
+                                {t("noTabItems", { tab: currentTab })}
                               </p>
                             )}
                           </div>
@@ -852,10 +923,10 @@ export function ThinkView() {
                         <Info className="w-4 h-4 text-amber-600 dark:text-amber-400 mt-0.5 flex-shrink-0" />
                         <div>
                           <p className="font-medium text-sm text-amber-900 dark:text-amber-100">
-                            No facts found
+                            {t("noFactsFound")}
                           </p>
                           <p className="text-xs text-amber-700 dark:text-amber-300 mt-0.5">
-                            No memories were used to generate this answer.
+                            {t("noFactsFoundDescription")}
                           </p>
                         </div>
                       </div>
@@ -870,7 +941,7 @@ export function ThinkView() {
           {viewMode === "json" && (
             <Card>
               <CardHeader>
-                <CardTitle className="text-lg">Raw Response</CardTitle>
+                <CardTitle className="text-lg">{t("rawResponseTitle")}</CardTitle>
               </CardHeader>
               <CardContent>
                 <div className="bg-muted p-4 rounded-lg overflow-auto max-h-[600px]">
@@ -887,10 +958,9 @@ export function ThinkView() {
         <Card className="border-dashed">
           <CardContent className="flex flex-col items-center justify-center py-16">
             <Sparkles className="h-12 w-12 text-muted-foreground mb-4" />
-            <h3 className="text-lg font-semibold mb-2">Ready to Reflect</h3>
+            <h3 className="text-lg font-semibold mb-2">{t("readyToReflect")}</h3>
             <p className="text-muted-foreground text-center max-w-md">
-              Enter a question above to query the memory bank and generate a disposition-aware
-              response.
+              {t("readyToReflectDescription")}
             </p>
           </CardContent>
         </Card>
@@ -899,83 +969,6 @@ export function ThinkView() {
       {/* Memory Detail Modal */}
       <MemoryDetailModal memoryId={selectedMemoryId} onClose={() => setSelectedMemoryId(null)} />
 
-      {/* Directive Detail Panel */}
-      {selectedDirective && (
-        <div className="fixed right-0 top-0 h-screen w-[420px] bg-card border-l shadow-2xl z-50 overflow-y-auto">
-          <div className="p-6">
-            <div className="flex items-center justify-between mb-6">
-              <div className="flex items-center gap-2">
-                <Shield className="w-5 h-5" />
-                <h2 className="text-lg font-semibold">Directive</h2>
-              </div>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={() => {
-                  setSelectedDirective(null);
-                  setFullDirective(null);
-                }}
-              >
-                <X className="w-4 h-4" />
-              </Button>
-            </div>
-            {loadingDirective ? (
-              <div className="flex items-center justify-center py-8">
-                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
-              </div>
-            ) : (
-              <div className="space-y-4">
-                <div>
-                  <h3 className="text-sm font-medium text-muted-foreground">Name</h3>
-                  <p className="mt-1 font-medium">
-                    {fullDirective?.name || selectedDirective.name}
-                  </p>
-                </div>
-                {fullDirective?.description && (
-                  <div>
-                    <h3 className="text-sm font-medium text-muted-foreground">Description</h3>
-                    <p className="mt-1 text-sm">{fullDirective.description}</p>
-                  </div>
-                )}
-                {fullDirective?.tags && fullDirective.tags.length > 0 && (
-                  <div>
-                    <h3 className="text-sm font-medium text-muted-foreground mb-1">Tags</h3>
-                    <div className="flex flex-wrap gap-1">
-                      {fullDirective.tags.map((tag: string) => (
-                        <span
-                          key={tag}
-                          className="text-xs px-2 py-0.5 rounded bg-muted text-muted-foreground flex items-center gap-1"
-                        >
-                          <Tag className="w-2.5 h-2.5" />
-                          {tag}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                )}
-                {/* Show content from directive */}
-                {(fullDirective?.content || selectedDirective.content) && (
-                  <div>
-                    <h3 className="text-sm font-medium text-muted-foreground mb-2">Content</h3>
-                    <div className="p-3 bg-muted rounded-lg">
-                      <div className="text-sm text-muted-foreground whitespace-pre-wrap">
-                        {fullDirective?.content || selectedDirective.content}
-                      </div>
-                    </div>
-                  </div>
-                )}
-                <div className="pt-2 border-t">
-                  <h3 className="text-sm font-medium text-muted-foreground">ID</h3>
-                  <p className="mt-1 font-mono text-xs text-muted-foreground">
-                    {selectedDirective.id}
-                  </p>
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
       {/* Observation Detail Panel */}
       {selectedObservation && (
         <div className="fixed right-0 top-0 h-screen w-[420px] bg-card border-l shadow-2xl z-50 overflow-y-auto">
@@ -983,7 +976,7 @@ export function ThinkView() {
             <div className="flex items-center justify-between mb-6">
               <div className="flex items-center gap-2">
                 <Brain className="w-5 h-5" />
-                <h2 className="text-lg font-semibold">Observation</h2>
+                <h2 className="text-lg font-semibold">{t("observationPanelTitle")}</h2>
               </div>
               <Button
                 variant="ghost"
@@ -998,12 +991,14 @@ export function ThinkView() {
             </div>
             {loadingObservation ? (
               <div className="flex items-center justify-center py-8">
-                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
+                <Spinner size="lg" variant="jump" />
               </div>
             ) : (
               <div className="space-y-4">
                 <div>
-                  <h3 className="text-sm font-medium text-muted-foreground">Text</h3>
+                  <h3 className="text-sm font-medium text-muted-foreground">
+                    {t("observationTextField")}
+                  </h3>
                   <div className="mt-1 prose prose-sm max-w-none dark:prose-invert">
                     <ReactMarkdown remarkPlugins={[remarkGfm]}>
                       {fullObservation?.text || selectedObservation.text}
@@ -1012,7 +1007,9 @@ export function ThinkView() {
                 </div>
                 {fullObservation?.tags && fullObservation.tags.length > 0 && (
                   <div>
-                    <h3 className="text-sm font-medium text-muted-foreground mb-1">Tags</h3>
+                    <h3 className="text-sm font-medium text-muted-foreground mb-1">
+                      {t("observationTagsField")}
+                    </h3>
                     <div className="flex flex-wrap gap-1">
                       {fullObservation.tags.map((tag: string) => (
                         <span
@@ -1029,7 +1026,9 @@ export function ThinkView() {
                 {fullObservation?.source_memories && fullObservation.source_memories.length > 0 && (
                   <div>
                     <h3 className="text-sm font-medium text-muted-foreground mb-2">
-                      Source Memories ({fullObservation.source_memories.length})
+                      {t("observationSourceMemoriesField", {
+                        count: fullObservation.source_memories.length,
+                      })}
                     </h3>
                     <div className="space-y-2">
                       {fullObservation.source_memories.map((mem: any, i: number) => (
@@ -1043,7 +1042,9 @@ export function ThinkView() {
                   </div>
                 )}
                 <div className="pt-2 border-t">
-                  <h3 className="text-sm font-medium text-muted-foreground">ID</h3>
+                  <h3 className="text-sm font-medium text-muted-foreground">
+                    {t("observationIdField")}
+                  </h3>
                   <p className="mt-1 font-mono text-xs text-muted-foreground">
                     {selectedObservation.id}
                   </p>

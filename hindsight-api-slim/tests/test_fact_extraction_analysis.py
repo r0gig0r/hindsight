@@ -1,6 +1,7 @@
 """
 Test to analyze fact extraction token usage and identify optimization opportunities.
 """
+
 import asyncio
 import logging
 import time
@@ -26,6 +27,13 @@ def llm_config():
         api_key=config.retain_llm_api_key or config.llm_api_key,
         model=config.retain_llm_model or config.llm_model,
         base_url=config.retain_llm_base_url or config.llm_base_url,
+        # LLMConfig uses these as-passed and no longer reads them from global config,
+        # so the caller must forward the Vertex AI settings (mirrors MemoryEngine's
+        # own LLMConfig construction). Without this, provider=vertexai raises
+        # "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID is required" even when it is set.
+        vertexai_project_id=config.llm_vertexai_project_id,
+        vertexai_region=config.llm_vertexai_region,
+        vertexai_service_account_key=config.llm_vertexai_service_account_key,
     )
 
 
@@ -63,9 +71,9 @@ async def test_fact_extraction_basic_analysis(llm_config):
 
     duration = time.time() - start_time
 
-    logger.info(f"\n{'='*60}")
+    logger.info(f"\n{'=' * 60}")
     logger.info(f"EXTRACTION RESULTS")
-    logger.info(f"{'='*60}")
+    logger.info(f"{'=' * 60}")
     logger.info(f"Duration: {duration:.2f}s")
     logger.info(f"Chunks: {len(chunks)}")
     logger.info(f"Facts extracted: {len(facts)}")
@@ -86,13 +94,13 @@ async def test_fact_extraction_basic_analysis(llm_config):
     # Show sample facts
     logger.info(f"\nSample facts (first 10):")
     for i, fact in enumerate(facts[:10]):
-        logger.info(f"\n  [{i+1}] {fact.fact_type}: {fact.fact[:150]}...")
+        logger.info(f"\n  [{i + 1}] {fact.fact_type}: {fact.fact[:150]}...")
 
     # Show facts containing key terms
     key_terms = ["kubernetes", "k8s", "CKA", "certification", "Alice"]
-    logger.info(f"\n{'='*60}")
+    logger.info(f"\n{'=' * 60}")
     logger.info(f"FACTS CONTAINING KEY TERMS")
-    logger.info(f"{'='*60}")
+    logger.info(f"{'=' * 60}")
 
     for term in key_terms:
         matching = [f for f in facts if term.lower() in f.fact.lower()]

@@ -12,12 +12,19 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import Any, NoReturn
 
 import pytest
 import pytest_asyncio
 
 from hindsight_api import MemoryEngine, RequestContext
+from hindsight_api.engine.db import DatabaseConnection
 from hindsight_api.engine.memory_engine import Budget
+from tests import consolidation_actions
+from tests.test_bank_config_atomicity import (
+    assert_one_sided_budget_update_sees_stored_state,
+    assert_recall_budget_race_is_serialized,
+)
 
 pytestmark = pytest.mark.oracle
 
@@ -28,8 +35,21 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _bank_id(prefix: str = "oracle") -> str:
     return f"test-{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Attach UTC to a timestamp oracledb handed back naive.
+
+    Values are written as UTC-aware, but the driver reads some timestamp columns back
+    without a tzinfo, and a naive/aware comparison is silently False rather than an error.
+    Normalise before comparing instants.
+    """
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=timezone.utc)
 
 
 async def _safe_cleanup(memory: MemoryEngine, bank_id: str, request_context: RequestContext) -> None:
@@ -136,21 +156,25 @@ class TestCoreCRUD:
         try:
             await oracle_memory.retain_batch_async(
                 bank_id=bank_id,
-                contents=[{
-                    "content": "Dan is an expert in distributed systems.",
-                    "context": "engineering",
-                    "event_date": datetime(2024, 5, 1, tzinfo=timezone.utc),
-                }],
+                contents=[
+                    {
+                        "content": "Dan is an expert in distributed systems.",
+                        "context": "engineering",
+                        "event_date": datetime(2024, 5, 1, tzinfo=timezone.utc),
+                    }
+                ],
                 document_tags=["backend"],
                 request_context=request_context,
             )
             await oracle_memory.retain_batch_async(
                 bank_id=bank_id,
-                contents=[{
-                    "content": "Eve designs beautiful user interfaces.",
-                    "context": "design",
-                    "event_date": datetime(2024, 5, 2, tzinfo=timezone.utc),
-                }],
+                contents=[
+                    {
+                        "content": "Eve designs beautiful user interfaces.",
+                        "context": "design",
+                        "event_date": datetime(2024, 5, 2, tzinfo=timezone.utc),
+                    }
+                ],
                 document_tags=["frontend"],
                 request_context=request_context,
             )
@@ -236,9 +260,7 @@ class TestCoreCRUD:
             memory_id = unit_ids[0]
 
             # Delete the memory
-            await oracle_memory.delete_memory_unit(
-                str(memory_id), request_context=request_context
-            )
+            await oracle_memory.delete_memory_unit(str(memory_id), request_context=request_context)
 
             # Verify deletion
             mem = await oracle_memory.get_memory_unit(
@@ -282,7 +304,10 @@ class TestCoreCRUD:
             profile = await oracle_memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
             assert profile["bank_id"] == bank_id
 
-            # Update
+            # Update. mission is an Oracle CLOB; regression guard for ORA-00932 —
+            # update_bank must not COALESCE a VARCHAR2 bind against the CLOB column
+            # (that evaluates the CLOB in a CHAR context and fails). Assert both the
+            # name and the mission round-trip.
             await oracle_memory.update_bank(
                 bank_id=bank_id,
                 name="Test Oracle Bank",
@@ -291,6 +316,17 @@ class TestCoreCRUD:
             )
             updated = await oracle_memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
             assert updated["name"] == "Test Oracle Bank"
+            assert updated["mission"] == "Testing Oracle integration"
+
+            # Update only the mission — exercises the single-column SET path.
+            await oracle_memory.update_bank(
+                bank_id=bank_id,
+                mission="Revised Oracle mission",
+                request_context=request_context,
+            )
+            remissioned = await oracle_memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+            assert remissioned["mission"] == "Revised Oracle mission"
+            assert remissioned["name"] == "Test Oracle Bank"
         finally:
             await _safe_cleanup(oracle_memory, bank_id, request_context)
 
@@ -306,9 +342,7 @@ class TestCoreCRUD:
                     event_date=datetime(2024, 6, i + 1, tzinfo=timezone.utc),
                     request_context=request_context,
                 )
-            memories = await oracle_memory.list_memory_units(
-                bank_id=bank_id, request_context=request_context
-            )
+            memories = await oracle_memory.list_memory_units(bank_id=bank_id, request_context=request_context)
             # Each retain may extract multiple facts
             assert len(memories) >= 3
         finally:
@@ -338,6 +372,44 @@ class TestCoreCRUD:
 
 
 # ===================================================================
+# Tier 1b — Bank Config Atomicity (#3037)
+# ===================================================================
+#
+# Deliberately early in the file: the run is sequential (-n0), and the Oracle
+# Free container has a standing habit of dropping every connection partway
+# through the Tier 6 edge cases (DPY-4011), which would leave these tests
+# reporting a dead database instead of a verdict.
+
+
+class TestBankConfigAtomicity:
+    """Config writes serialize on the bank row under Oracle too.
+
+    The scenarios live in ``test_bank_config_atomicity`` so both dialects run
+    exactly the same interleavings; only the fixture differs.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_updates_cannot_persist_invalid_recall_budget_bounds(
+        self, oracle_memory: MemoryEngine, request_context: RequestContext
+    ):
+        await assert_recall_budget_race_is_serialized(oracle_memory, request_context)
+
+    # The retain-chunking scenario from that module is deliberately PG-only. It
+    # wedges the config by *replacing* retain_strategies so a nested chunk-size
+    # pin disappears, and only PostgreSQL does that: `config || $1::jsonb`
+    # concatenates at the top level, while the Oracle rewrite of the same
+    # statement (JSON_MERGEPATCH, RFC 7396) merges into the nested object and
+    # keeps the pin. The recall-budget scenarios here cover the same atomicity
+    # property with top-level scalars, which both dialects store identically.
+
+    @pytest.mark.asyncio
+    async def test_one_sided_recall_budget_update_is_validated_against_stored_state(
+        self, oracle_memory: MemoryEngine, request_context: RequestContext
+    ):
+        await assert_one_sided_budget_update_sees_stored_state(oracle_memory, request_context)
+
+
+# ===================================================================
 # Tier 2 — Retain Pipeline
 # ===================================================================
 
@@ -361,7 +433,7 @@ class TestRetainPipeline:
                 "Leonardo da Vinci painted the Mona Lisa between 1503 and 1519, and it now hangs in the Louvre Museum in Paris.",
                 "The International Space Station orbits Earth at an altitude of approximately 250 miles at a speed of 17,500 mph.",
             ]
-            long_content = " ".join(f"Section {i+1}: {fact} " * 3 for i, fact in enumerate(facts))
+            long_content = " ".join(f"Section {i + 1}: {fact} " * 3 for i, fact in enumerate(facts))
             unit_ids = await oracle_memory.retain_async(
                 bank_id=bank_id,
                 content=long_content,
@@ -514,11 +586,13 @@ class TestRetainPipeline:
         try:
             await oracle_memory.retain_batch_async(
                 bank_id=bank_id,
-                contents=[{
-                    "content": "Tagged memory about machine learning models.",
-                    "context": "ml",
-                    "event_date": datetime(2024, 6, 1, tzinfo=timezone.utc),
-                }],
+                contents=[
+                    {
+                        "content": "Tagged memory about machine learning models.",
+                        "context": "ml",
+                        "event_date": datetime(2024, 6, 1, tzinfo=timezone.utc),
+                    }
+                ],
                 document_tags=["ml", "models"],
                 request_context=request_context,
             )
@@ -654,7 +728,7 @@ class TestSearchRetrieval:
             for i in range(5):
                 await oracle_memory.retain_async(
                     bank_id=bank_id,
-                    content=f"Fact {i}: Machine learning model {i} achieved {90+i}% accuracy.",
+                    content=f"Fact {i}: Machine learning model {i} achieved {90 + i}% accuracy.",
                     context="ml",
                     event_date=datetime(2024, 1, i + 1, tzinfo=timezone.utc),
                     request_context=request_context,
@@ -818,10 +892,9 @@ class TestAdvancedFeatures:
             assert model["id"] is not None
 
             # List
-            models = await oracle_memory.list_mental_models(
-                bank_id=bank_id, request_context=request_context
-            )
-            assert len(models) > 0
+            models = await oracle_memory.list_mental_models(bank_id=bank_id, request_context=request_context)
+            assert models.total > 0
+            assert len(models.items) > 0
 
             # Get
             fetched = await oracle_memory.get_mental_model(
@@ -858,6 +931,36 @@ class TestAdvancedFeatures:
                 request_context=request_context,
             )
             assert deleted is None
+        finally:
+            await _safe_cleanup(oracle_memory, bank_id, request_context)
+
+    @pytest.mark.asyncio
+    async def test_knowledge_page_failure_rolls_back_mental_model(
+        self, oracle_memory: MemoryEngine, request_context: RequestContext, monkeypatch
+    ):
+        bank_id = _bank_id("kb-rollback")
+        mental_model_id = f"mm-{uuid.uuid4().hex}"
+        insert_mental_model = oracle_memory._insert_pinned_mental_model
+
+        async def insert_then_fail(conn: DatabaseConnection, **kwargs: Any) -> NoReturn:
+            await insert_mental_model(conn, **kwargs)
+            raise RuntimeError("page write failed")
+
+        monkeypatch.setattr(oracle_memory, "_insert_pinned_mental_model", insert_then_fail)
+        try:
+            with pytest.raises(RuntimeError, match="page write failed"):
+                await oracle_memory.create_knowledge_page(
+                    bank_id,
+                    "Rolled back",
+                    "What is rolled back?",
+                    "seed",
+                    mental_model_id=mental_model_id,
+                    request_context=request_context,
+                )
+
+            assert (
+                await oracle_memory.get_mental_model(bank_id, mental_model_id, request_context=request_context) is None
+            )
         finally:
             await _safe_cleanup(oracle_memory, bank_id, request_context)
 
@@ -899,16 +1002,12 @@ class TestAdvancedFeatures:
                 )
             # Verify facts were stored (consolidation is async and may run inline
             # via SyncTaskBackend, but the key assertion is that all 5 retains persisted)
-            memories = await oracle_memory.list_memory_units(
-                bank_id=bank_id, request_context=request_context
-            )
+            memories = await oracle_memory.list_memory_units(bank_id=bank_id, request_context=request_context)
             items = memories.get("items", memories) if isinstance(memories, dict) else memories
             assert len(items) >= 5, f"Expected at least 5 stored memories, got {len(items)}"
             # Verify facts contain expected content
             texts = [item.get("text", "") for item in items]
-            assert any("dark mode" in t for t in texts), (
-                f"Expected 'dark mode' in stored facts, got: {texts[:3]}"
-            )
+            assert any("dark mode" in t for t in texts), f"Expected 'dark mode' in stored facts, got: {texts[:3]}"
         finally:
             await _safe_cleanup(oracle_memory, bank_id, request_context)
 
@@ -923,9 +1022,7 @@ class TestAdvancedFeatures:
                 event_date=datetime(2024, 6, 1, tzinfo=timezone.utc),
                 request_context=request_context,
             )
-            ops = await oracle_memory.list_operations(
-                bank_id=bank_id, request_context=request_context
-            )
+            ops = await oracle_memory.list_operations(bank_id=bank_id, request_context=request_context)
             # Retain creates async operations (consolidation at minimum)
             assert ops is not None
             items = ops.get("items", ops) if isinstance(ops, dict) else ops
@@ -948,10 +1045,9 @@ class TestAdvancedFeatures:
             )
             assert directive is not None
 
-            directives = await oracle_memory.list_directives(
-                bank_id=bank_id, request_context=request_context
-            )
-            assert len(directives) > 0
+            directives = await oracle_memory.list_directives(bank_id=bank_id, request_context=request_context)
+            assert directives.total > 0
+            assert len(directives.items) > 0
 
             await oracle_memory.delete_directive(
                 bank_id=bank_id,
@@ -967,17 +1063,17 @@ class TestAdvancedFeatures:
         try:
             await oracle_memory.retain_batch_async(
                 bank_id=bank_id,
-                contents=[{
-                    "content": "Tag listing test.",
-                    "context": "test",
-                    "event_date": datetime(2024, 6, 1, tzinfo=timezone.utc),
-                }],
+                contents=[
+                    {
+                        "content": "Tag listing test.",
+                        "context": "test",
+                        "event_date": datetime(2024, 6, 1, tzinfo=timezone.utc),
+                    }
+                ],
                 document_tags=["alpha", "beta"],
                 request_context=request_context,
             )
-            tags = await oracle_memory.list_tags(
-                bank_id=bank_id, request_context=request_context
-            )
+            tags = await oracle_memory.list_tags(bank_id=bank_id, request_context=request_context)
             assert len(tags) > 0
         finally:
             await _safe_cleanup(oracle_memory, bank_id, request_context)
@@ -994,9 +1090,7 @@ class TestAdvancedFeatures:
                 event_date=datetime(2024, 6, 1, tzinfo=timezone.utc),
                 request_context=request_context,
             )
-            ops = await oracle_memory.list_operations(
-                bank_id=bank_id, request_context=request_context
-            )
+            ops = await oracle_memory.list_operations(bank_id=bank_id, request_context=request_context)
             assert ops is not None
             items = ops.get("items", ops) if isinstance(ops, dict) else ops
             assert len(items) > 0, "Retain should enqueue at least one task"
@@ -1098,9 +1192,7 @@ class TestOracleSpecific:
                 mission="Test JSON CLOB storage",
                 request_context=request_context,
             )
-            profile = await oracle_memory.get_bank_profile(
-                bank_id=bank_id, request_context=request_context
-            )
+            profile = await oracle_memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
             assert profile is not None
             assert profile["name"] == "JSON Test Bank"
             assert profile["mission"] == "Test JSON CLOB storage"
@@ -1116,6 +1208,95 @@ class TestOracleSpecific:
         # version row, subsequent runs become a no-op walk).
         run_migrations(oracle_db_url)
         run_migrations(oracle_db_url)
+
+    @pytest.mark.asyncio
+    async def test_observation_update_widens_null_bounds(
+        self, oracle_memory: MemoryEngine, request_context: RequestContext
+    ):
+        """#3477 on Oracle: an observation with NO occurred interval must inherit its source's.
+
+        Oracle's LEAST/GREATEST return NULL as soon as any argument is NULL, where PostgreSQL
+        ignores NULL arguments. A plain ``LEAST(occurred_start, COALESCE(:n, occurred_start))``
+        therefore evaluates to NULL for an observation that has no interval yet — silently
+        dropping the very dates it was told to inherit — while the identical statement is
+        correct on PostgreSQL. The PG-side coverage lives in test_consolidation_temporal_merge.py;
+        only this test can catch the dialect difference.
+        """
+        from hindsight_api.config import _get_raw_config
+        from hindsight_api.engine.consolidation.consolidator import (
+            _TemporalBounds,
+        )
+        from hindsight_api.engine.response_models import MemoryFact
+
+        early = datetime(2020, 3, 1, tzinfo=timezone.utc)
+        late = datetime(2021, 7, 4, 12, 30, tzinfo=timezone.utc)
+        bank_id = _bank_id("obsbounds")
+        config = _get_raw_config()
+        previous_observations = config.enable_observations
+        config.enable_observations = False  # the test drives consolidation itself
+        try:
+            await oracle_memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+            await oracle_memory.retain_async(
+                bank_id=bank_id,
+                content="Dana learned to sail.",
+                request_context=request_context,
+            )
+
+            backend = await oracle_memory._get_backend()
+            async with backend.acquire() as conn:
+                source_id = await conn.fetchval(
+                    "SELECT id FROM memory_units WHERE bank_id = $1 AND fact_type <> 'observation'",
+                    bank_id,
+                )
+            assert source_id is not None, "retain produced no fact to build an observation from"
+
+            # An observation built from an undated fact: event_date/mentioned_at are stamped at
+            # creation time, occurred_start/occurred_end stay NULL.
+            action = await consolidation_actions.execute_create_action(
+                pool=backend,
+                memory_engine=oracle_memory,
+                bank_id=bank_id,
+                source_memory_ids=[source_id],
+                text="Dana learned to sail.",
+            )
+            assert action == "created"
+            async with backend.acquire() as conn:
+                seeded = await conn.fetchrow(
+                    "SELECT id, occurred_start, occurred_end FROM memory_units "
+                    "WHERE bank_id = $1 AND fact_type = 'observation'",
+                    bank_id,
+                )
+            assert seeded["occurred_start"] is None and seeded["occurred_end"] is None
+
+            await consolidation_actions.execute_update_action(
+                pool=backend,
+                memory_engine=oracle_memory,
+                bank_id=bank_id,
+                source_memory_ids=[source_id],
+                observation_id=str(seeded["id"]),
+                new_text="Dana learned to sail on the Adriatic.",
+                observations=[
+                    MemoryFact(
+                        id=str(seeded["id"]),
+                        text="Dana learned to sail.",
+                        fact_type="observation",
+                        source_fact_ids=[str(source_id)],
+                        tags=[],
+                    )
+                ],
+                source_bounds=_TemporalBounds(occurred_start=early, occurred_end=late),
+            )
+
+            async with backend.acquire() as conn:
+                updated = await conn.fetchrow(
+                    "SELECT occurred_start, occurred_end FROM memory_units WHERE id = $1",
+                    seeded["id"],
+                )
+            assert _as_utc(updated["occurred_start"]) == early, "a NULL occurred_start must take the source's date"
+            assert _as_utc(updated["occurred_end"]) == late, "a NULL occurred_end must take the source's date"
+        finally:
+            config.enable_observations = previous_observations
+            await _safe_cleanup(oracle_memory, bank_id, request_context)
 
 
 # ===================================================================
@@ -1167,9 +1348,7 @@ class TestEdgeCases:
                 event_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
                 request_context=request_context,
             )
-            memories = await oracle_memory.list_memory_units(
-                bank_id=bank_id, request_context=request_context
-            )
+            memories = await oracle_memory.list_memory_units(bank_id=bank_id, request_context=request_context)
             items = memories.get("items", memories) if isinstance(memories, dict) else memories
             assert len(items) >= 1
         finally:
@@ -1197,19 +1376,13 @@ class TestEdgeCases:
                 event_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
                 request_context=request_context,
             )
-            memories = await oracle_memory.list_memory_units(
-                bank_id=bank_id, request_context=request_context
-            )
+            memories = await oracle_memory.list_memory_units(bank_id=bank_id, request_context=request_context)
             items = memories.get("items", memories) if isinstance(memories, dict) else memories
             # Large content (~10KB, 50 paragraphs) should produce multiple memory units
             # from LLM fact extraction. At minimum we expect several facts.
-            assert len(items) >= 3, (
-                f"Expected large content to produce at least 3 memory units, got {len(items)}"
-            )
+            assert len(items) >= 3, f"Expected large content to produce at least 3 memory units, got {len(items)}"
             # Verify operations completed without errors (catches background datetime issues etc.)
-            ops = await oracle_memory.list_operations(
-                bank_id=bank_id, request_context=request_context
-            )
+            ops = await oracle_memory.list_operations(bank_id=bank_id, request_context=request_context)
             if ops:
                 op_list = ops.get("items", ops) if isinstance(ops, dict) else ops
                 failed = [o for o in op_list if isinstance(o, dict) and o.get("status") == "failed"]
@@ -1272,19 +1445,13 @@ class TestEdgeCases:
             # not a code bug. Allow up to 1 deadlock failure.
             deadlocks = [r for r in results if isinstance(r, Exception) and "ORA-00060" in str(r)]
             other_failures = [r for r in results if isinstance(r, Exception) and "ORA-00060" not in str(r)]
-            assert len(other_failures) == 0, (
-                f"Non-deadlock failures: {[str(e)[:100] for e in other_failures]}"
-            )
+            assert len(other_failures) == 0, f"Non-deadlock failures: {[str(e)[:100] for e in other_failures]}"
             successes = len(results) - len(deadlocks)
             assert successes >= 2, f"Expected at least 2 successful retains, got {successes}"
 
-            memories = await oracle_memory.list_memory_units(
-                bank_id=bank_id, request_context=request_context
-            )
+            memories = await oracle_memory.list_memory_units(bank_id=bank_id, request_context=request_context)
             items = memories.get("items", memories) if isinstance(memories, dict) else memories
-            assert len(items) >= successes, (
-                f"Expected at least {successes} memories, got {len(items)}"
-            )
+            assert len(items) >= successes, f"Expected at least {successes} memories, got {len(items)}"
         finally:
             await _safe_cleanup(oracle_memory, bank_id, request_context)
 
@@ -1311,9 +1478,7 @@ class TestEdgeCases:
     async def test_delete_nonexistent_bank(self, oracle_memory: MemoryEngine, request_context: RequestContext):
         """Verify deleting a non-existent bank doesn't raise."""
         # Should not raise an exception
-        await oracle_memory.delete_bank(
-            f"nonexistent-{uuid.uuid4().hex[:8]}", request_context=request_context
-        )
+        await oracle_memory.delete_bank(f"nonexistent-{uuid.uuid4().hex[:8]}", request_context=request_context)
 
     @pytest.mark.asyncio
     async def test_retain_and_delete_cycle(self, oracle_memory: MemoryEngine, request_context: RequestContext):
@@ -1369,19 +1534,13 @@ class TestEdgeCases:
                     request_context=request_context,
                 )
 
-            docs = await oracle_memory.list_documents(
-                bank_id=bank_id, request_context=request_context
-            )
+            docs = await oracle_memory.list_documents(bank_id=bank_id, request_context=request_context)
             items = docs.get("items", docs.get("documents", []))
             assert len(items) >= 3
 
             # Delete one document, verify others remain
-            await oracle_memory.delete_document(
-                bank_id=bank_id, document_id="doc-1", request_context=request_context
-            )
-            docs_after = await oracle_memory.list_documents(
-                bank_id=bank_id, request_context=request_context
-            )
+            await oracle_memory.delete_document(bank_id=bank_id, document_id="doc-1", request_context=request_context)
+            docs_after = await oracle_memory.list_documents(bank_id=bank_id, request_context=request_context)
             items_after = docs_after.get("items", docs_after.get("documents", []))
             assert len(items_after) >= 2
         finally:

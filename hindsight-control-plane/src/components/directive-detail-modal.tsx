@@ -1,13 +1,15 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { useTranslations } from "next-intl";
 import { client } from "@/lib/api";
 import { useBank } from "@/lib/bank-context";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { VisuallyHidden } from "@radix-ui/react-visually-hidden";
-import { Loader2 } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { TagChip } from "@/components/ui/facet-chip";
 
 interface Directive {
   id: string;
@@ -39,6 +41,7 @@ const formatDateTime = (dateStr: string) => {
 };
 
 export function DirectiveDetailModal({ directiveId, onClose }: DirectiveDetailModalProps) {
+  const t = useTranslations("directiveDetailModal");
   const { currentBank } = useBank();
   const [directive, setDirective] = useState<Directive | null>(null);
   const [loading, setLoading] = useState(false);
@@ -72,16 +75,16 @@ export function DirectiveDetailModal({ directiveId, onClose }: DirectiveDetailMo
     <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="max-w-2xl max-h-[80vh] overflow-hidden flex flex-col p-6">
         <VisuallyHidden>
-          <DialogTitle>Directive Details</DialogTitle>
+          <DialogTitle>{t("title")}</DialogTitle>
         </VisuallyHidden>
         {loading ? (
           <div className="flex items-center justify-center py-20">
-            <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+            <Spinner size="lg" variant="jump" />
           </div>
         ) : error ? (
           <div className="flex items-center justify-center py-20">
             <div className="text-center text-destructive">
-              <div className="text-sm">Error: {error}</div>
+              <div className="text-sm">{t("errorPrefix", { error })}</div>
             </div>
           </div>
         ) : directive ? (
@@ -92,7 +95,7 @@ export function DirectiveDetailModal({ directiveId, onClose }: DirectiveDetailMo
                 <h3 className="text-xl font-bold text-foreground">{directive.name}</h3>
                 {!directive.is_active && (
                   <span className="px-2 py-0.5 rounded-full bg-red-500/10 text-red-600 dark:text-red-400 text-xs font-medium">
-                    Inactive
+                    {t("inactive")}
                   </span>
                 )}
               </div>
@@ -103,7 +106,7 @@ export function DirectiveDetailModal({ directiveId, onClose }: DirectiveDetailMo
             <div className="flex gap-8">
               <div>
                 <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-1">
-                  Created
+                  {t("created")}
                 </div>
                 <div className="text-sm text-foreground">
                   {formatDateTime(directive.created_at)}
@@ -111,7 +114,7 @@ export function DirectiveDetailModal({ directiveId, onClose }: DirectiveDetailMo
               </div>
               <div>
                 <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-1">
-                  Priority
+                  {t("priority")}
                 </div>
                 <div className="text-sm text-foreground">{directive.priority}</div>
               </div>
@@ -120,7 +123,7 @@ export function DirectiveDetailModal({ directiveId, onClose }: DirectiveDetailMo
             {/* Content */}
             <div>
               <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-3">
-                Content
+                {t("content")}
               </div>
               <div className="prose prose-base dark:prose-invert max-w-none">
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>{directive.content}</ReactMarkdown>
@@ -131,16 +134,11 @@ export function DirectiveDetailModal({ directiveId, onClose }: DirectiveDetailMo
             {directive.tags && directive.tags.length > 0 && (
               <div>
                 <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-3">
-                  Tags
+                  {t("tags")}
                 </div>
                 <div className="flex flex-wrap gap-1.5">
                   {directive.tags.map((tag: string, idx: number) => (
-                    <span
-                      key={idx}
-                      className="px-2 py-0.5 bg-purple-500/10 text-purple-600 dark:text-purple-400 rounded text-xs"
-                    >
-                      {tag}
-                    </span>
+                    <TagChip key={idx} tag={tag} />
                   ))}
                 </div>
               </div>

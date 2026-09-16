@@ -254,7 +254,7 @@ describe("before_prompt_build hook", () => {
     expect(result).toBeUndefined();
   });
 
-  it("returns { prependSystemContext } with <hindsight_memories> when recall returns results", async () => {
+  it("returns { prependContext } by default when recall returns results", async () => {
     if (!apiReachable) return;
     recallSpy.mockResolvedValue({
       results: [makeMemoryResult("User likes Python")],
@@ -267,20 +267,24 @@ describe("before_prompt_build hook", () => {
       "before_prompt_build",
       { rawMessage: "What programming language do I prefer?", prompt: "", messages: [] },
       { messageProvider: "telegram", senderId: "U003" }
-    )) as { prependSystemContext: string; prependContext?: string };
+    )) as { prependContext: string; prependSystemContext?: string; appendSystemContext?: string };
 
     expect(result).toBeDefined();
-    expect(result.prependContext).toBeUndefined();
-    expect(result.prependSystemContext).toContain("<hindsight_memories>");
-    expect(result.prependSystemContext).toContain("User likes Python");
-    expect(result.prependSystemContext).toContain("</hindsight_memories>");
+    expect(result.prependSystemContext).toBeUndefined();
+    expect(result.appendSystemContext).toBeUndefined();
+    expect(result.prependContext).toContain("<hindsight_memories>");
+    expect(result.prependContext).toContain("User likes Python");
+    expect(result.prependContext).toContain("</hindsight_memories>");
   });
 
-  it("injects all memory result fields in the prependSystemContext", async () => {
+  it("injects all memory result fields in the default prependContext", async () => {
     if (!apiReachable) return;
     const mem = makeMemoryResult("User prefers dark mode");
     mem.tags = ["preference"];
     mem.entities = ["dark_mode"];
+    mem.document_id = "openclaw:agent:main:tg:-1003825475854";
+    mem.occurred_start = "2026-01-14T09:00:00Z";
+    mem.occurred_end = "2026-01-14T11:00:00Z";
     recallSpy.mockResolvedValue({
       results: [mem],
       entities: null,
@@ -292,13 +296,17 @@ describe("before_prompt_build hook", () => {
       "before_prompt_build",
       { rawMessage: "Do I prefer dark or light mode?", prompt: "", messages: [] },
       { messageProvider: "telegram", senderId: "U004" }
-    )) as { prependSystemContext: string; prependContext?: string };
+    )) as { prependContext: string; prependSystemContext?: string };
 
     // formatMemories returns a bullet list, not JSON
-    expect(result.prependContext).toBeUndefined();
-    expect(result.prependSystemContext).toContain("- User prefers dark mode");
-    expect(result.prependSystemContext).toContain("<hindsight_memories>");
-    expect(result.prependSystemContext).toContain("</hindsight_memories>");
+    expect(result.prependSystemContext).toBeUndefined();
+    expect(result.prependContext).toContain("- User prefers dark mode");
+    expect(result.prependContext).toContain("<hindsight_memories>");
+    expect(result.prependContext).toContain("</hindsight_memories>");
+    expect(result.prependContext).toContain(
+      "[occurred: 2026-01-14T09:00:00Z → 2026-01-14T11:00:00Z]"
+    );
+    expect(result.prependContext).toContain("[doc:openclaw:agent:main:tg:-1003825475854]");
   });
 
   it("extracts the inner query from an envelope-formatted prompt when rawMessage is absent", async () => {
@@ -361,7 +369,7 @@ describe("before_prompt_build hook", () => {
     expect(options?.maxTokens).toBeGreaterThan(0);
   });
 
-  it("includes recalled memories in the prependSystemContext block", async () => {
+  it("includes recalled memories in the default prependContext block", async () => {
     if (!apiReachable) return;
     recallSpy.mockResolvedValue({
       results: [makeMemoryResult("User loves hiking")],
@@ -374,11 +382,11 @@ describe("before_prompt_build hook", () => {
       "before_prompt_build",
       { rawMessage: "What outdoor activities do I enjoy?", prompt: "", messages: [] },
       { messageProvider: "telegram", senderId: "U007" }
-    )) as { prependSystemContext: string; prependContext?: string };
+    )) as { prependContext: string; prependSystemContext?: string };
 
-    expect(result.prependContext).toBeUndefined();
-    expect(result.prependSystemContext).toContain("User loves hiking");
-    expect(result.prependSystemContext).toContain("<hindsight_memories>");
+    expect(result.prependSystemContext).toBeUndefined();
+    expect(result.prependContext).toContain("User loves hiking");
+    expect(result.prependContext).toContain("<hindsight_memories>");
   });
 
   it("uses identity cached in before_dispatch when later hooks lack sender metadata", async () => {
@@ -494,8 +502,9 @@ describe("agent_end hook", () => {
     // Default retainFormat is 'json' with Anthropic-shaped typed blocks.
     const [, content] = retainSpy.mock.calls[0];
     const parsed = JSON.parse(content);
+    // Routing metadata is no longer prepended as a system message in the
+    // transcript — it now travels via the retain API `context` field (#1968).
     expect(parsed).toEqual([
-      { role: "system", content: "[context]\nsender: U013\nprovider: telegram\n[/context]" },
       { role: "user", content: [{ type: "text", text: "I love TypeScript." }] },
       { role: "assistant", content: [{ type: "text", text: "TypeScript is great!" }] },
     ]);
@@ -543,7 +552,7 @@ describe("agent_end hook", () => {
     expect(options?.metadata?.channel_id).toBe("chat-999");
     expect(options?.metadata?.sender_id).toBe("U015");
     expect(options?.metadata?.retained_at).toBeDefined();
-    expect(options?.metadata?.message_count).toBe("2");
+    expect(options?.metadata?.message_count).toBe("1");
   });
 
   it("uses identity cached in before_dispatch for retain metadata when agent_end ctx is sparse", async () => {
@@ -695,11 +704,135 @@ describe("agent_end hook", () => {
     // Default retainFormat is 'json' with Anthropic-shaped typed blocks.
     const parsed = JSON.parse(content);
     expect(parsed).toEqual([
-      { role: "system", content: "[context]\nsender: U019\nprovider: telegram\n[/context]" },
       { role: "user", content: [{ type: "text", text: "I work as a data scientist." }] },
       { role: "assistant", content: [{ type: "text", text: "That's a fascinating career!" }] },
     ]);
     expect(content).not.toContain("My name is Carol.");
-    expect(options?.metadata?.message_count).toBe("3");
+    expect(options?.metadata?.message_count).toBe("2");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// session_end hook (#1726) — force-flush of un-retained turns on session close
+// ---------------------------------------------------------------------------
+
+describe("session_end hook (#1726)", () => {
+  // Separate handle so we can configure retainEveryNTurns > 1; the shared
+  // beforeAll uses retainEveryNTurns: 1 which never skips any turn.
+  let triggerSessionEnd: MockApiHandle["trigger"];
+
+  beforeAll(async () => {
+    if (!apiReachable) return;
+
+    const mod = await import("../src/index.js");
+    const handle = createMockApi({
+      hindsightApiUrl: HINDSIGHT_API_URL,
+      dynamicBankId: true,
+      retainEveryNTurns: 5,
+      retainOverlapTurns: 0,
+    });
+    triggerSessionEnd = handle.trigger;
+    mod.default(handle.api);
+    await handle.startServices();
+  }, 30_000);
+
+  it("flushes un-retained turns when session_end fires before the cadence boundary", async () => {
+    if (!apiReachable) return;
+    retainSpy.mockResolvedValue(OK_RETAIN);
+
+    // 2 agent_end ticks with retainEveryNTurns=5 — neither hits the cadence
+    // boundary, so retain should not yet have been called.
+    await triggerSessionEnd(
+      "agent_end",
+      {
+        success: true,
+        messages: [{ role: "user", content: "I just adopted a corgi named Pepper." }],
+      },
+      { messageProvider: "telegram", senderId: "U1726A", sessionKey: "sess-1726-short" }
+    );
+    await triggerSessionEnd(
+      "agent_end",
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "I just adopted a corgi named Pepper." },
+          { role: "assistant", content: "Pepper sounds adorable!" },
+          { role: "user", content: "She loves chasing tennis balls." },
+        ],
+      },
+      { messageProvider: "telegram", senderId: "U1726A", sessionKey: "sess-1726-short" }
+    );
+
+    expect(retainSpy).not.toHaveBeenCalled();
+
+    // session_end should force-flush the un-retained turns.
+    await triggerSessionEnd(
+      "session_end",
+      {
+        messages: [
+          { role: "user", content: "I just adopted a corgi named Pepper." },
+          { role: "assistant", content: "Pepper sounds adorable!" },
+          { role: "user", content: "She loves chasing tennis balls." },
+        ],
+      },
+      { messageProvider: "telegram", senderId: "U1726A", sessionKey: "sess-1726-short" }
+    );
+
+    expect(retainSpy).toHaveBeenCalledOnce();
+    const [, content] = retainSpy.mock.calls[0];
+    expect(content).toContain("Pepper");
+  });
+
+  it("is a no-op when session_end fires on a cadence boundary (already retained)", async () => {
+    if (!apiReachable) return;
+    retainSpy.mockResolvedValue(OK_RETAIN);
+
+    // 5 turns triggers cadence retain at turn 5.
+    for (let i = 1; i <= 5; i++) {
+      await triggerSessionEnd(
+        "agent_end",
+        {
+          success: true,
+          messages: Array.from({ length: i }, (_, j) => ({
+            role: j % 2 === 0 ? "user" : "assistant",
+            content: `turn ${j + 1} message about hiking`,
+          })),
+        },
+        { messageProvider: "telegram", senderId: "U1726B", sessionKey: "sess-1726-aligned" }
+      );
+    }
+
+    expect(retainSpy).toHaveBeenCalledOnce();
+    retainSpy.mockReset();
+    retainSpy.mockResolvedValue(OK_RETAIN);
+
+    // session_end after the boundary: nothing un-retained, must not duplicate.
+    await triggerSessionEnd(
+      "session_end",
+      {
+        messages: Array.from({ length: 5 }, (_, j) => ({
+          role: j % 2 === 0 ? "user" : "assistant",
+          content: `turn ${j + 1} message about hiking`,
+        })),
+      },
+      { messageProvider: "telegram", senderId: "U1726B", sessionKey: "sess-1726-aligned" }
+    );
+
+    expect(retainSpy).not.toHaveBeenCalled();
+  });
+
+  it("is a no-op when session_end fires for a session with no agent_end turns", async () => {
+    if (!apiReachable) return;
+    retainSpy.mockResolvedValue(OK_RETAIN);
+
+    await triggerSessionEnd(
+      "session_end",
+      {
+        messages: [{ role: "user", content: "ephemeral message that never reached agent_end" }],
+      },
+      { messageProvider: "telegram", senderId: "U1726C", sessionKey: "sess-1726-empty" }
+    );
+
+    expect(retainSpy).not.toHaveBeenCalled();
   });
 });

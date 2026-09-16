@@ -2,11 +2,14 @@
 
 import uuid
 
+import httpx
 import pytest
 import pytest_asyncio
-import httpx
+
 from hindsight_api.api import create_app
-from hindsight_api.engine.memory_engine import MemoryEngine
+from hindsight_api.engine.memory_engine import MemoryEngine, fq_table
+from hindsight_api.engine.retain import embedding_utils
+from tests.llm_judge import assert_meets_criteria
 
 
 @pytest_asyncio.fixture
@@ -47,7 +50,7 @@ class TestMentalModelsCRUD:
 
         assert mental_model["name"] == "Team Preferences"
         assert mental_model["source_query"] == "What are the team's communication preferences?"
-        assert mental_model["content"] == "The team prefers async communication via Slack"
+        assert mental_model["content"] == "The team prefers async communication via Slack\n"
         assert mental_model["tags"] == ["team"]
         assert "id" in mental_model
 
@@ -63,6 +66,58 @@ class TestMentalModelsCRUD:
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_create_mental_model_creates_missing_bank(self, memory: MemoryEngine, request_context):
+        """Creating the first mental model in a bank should lazily create the bank."""
+        bank_id = f"test-mental-model-missing-bank-{uuid.uuid4().hex[:8]}"
+
+        mental_model = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="First Model",
+            source_query="What should this bank remember?",
+            content="Initial content",
+            request_context=request_context,
+        )
+
+        assert mental_model["bank_id"] == bank_id
+
+        profile = await memory.get_bank_profile(
+            bank_id=bank_id,
+            request_context=request_context,
+            create_if_missing=False,
+        )
+        assert profile is not None
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_create_mental_model_insert_failure_rolls_back_bank(self, memory: MemoryEngine, request_context):
+        """The lazy bank-create shares the insert's transaction: if the insert
+        fails, the freshly-created bank must roll back with it (no orphan bank).
+
+        A non-JSON-serializable ``trigger`` makes building the INSERT arguments
+        raise inside the transaction, after the bank row has been created on the
+        same connection — a deterministic in-transaction failure.
+        """
+        bank_id = f"test-mental-model-rollback-{uuid.uuid4().hex[:8]}"
+
+        with pytest.raises(TypeError):
+            await memory.create_mental_model(
+                bank_id=bank_id,
+                name="Doomed Model",
+                source_query="never persisted",
+                content="never persisted",
+                trigger={"unserializable": {1, 2, 3}},  # a set is not JSON-serializable
+                request_context=request_context,
+            )
+
+        profile = await memory.get_bank_profile(
+            bank_id=bank_id,
+            request_context=request_context,
+            create_if_missing=False,
+        )
+        assert profile is None, "bank should have rolled back with the failed insert"
 
     @pytest.mark.asyncio
     async def test_list_mental_models(self, memory: MemoryEngine, request_context):
@@ -95,7 +150,8 @@ class TestMentalModelsCRUD:
             bank_id=bank_id,
             request_context=request_context,
         )
-        assert len(all_mental_models) == 2
+        assert len(all_mental_models.items) == 2
+        assert all_mental_models.total == 2
 
         # List with tag filter
         tag1_mental_models = await memory.list_mental_models(
@@ -103,7 +159,8 @@ class TestMentalModelsCRUD:
             tags=["tag1"],
             request_context=request_context,
         )
-        assert len(tag1_mental_models) == 1
+        assert len(tag1_mental_models.items) == 1
+        assert tag1_mental_models.total == 1
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -135,9 +192,78 @@ class TestMentalModelsCRUD:
         )
 
         assert updated["name"] == "Updated Name"
-        assert updated["content"] == "Updated Content"
+        assert updated["content"] == "Updated Content\n"
 
         # Cleanup
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_partial_update_embeds_the_whole_stored_document(
+        self, memory: MemoryEngine, request_context, monkeypatch
+    ):
+        """Regression for #3926.
+
+        A model's searchable document is ``name + content``. An update that supplies
+        only one of them must embed the stored other half, and a name-only update
+        must re-embed at all — otherwise the vector keeps describing text the model
+        no longer holds.
+        """
+        bank_id = f"test-mm-partial-embed-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+        mental_model = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Original Name",
+            source_query="Original Query",
+            content="Original Content",
+            request_context=request_context,
+        )
+
+        embedded: list[str] = []
+        original_generate = embedding_utils.generate_embeddings_batch
+
+        async def recording_generate(backend, texts, *args, **kwargs):
+            embedded.extend(texts)
+            return await original_generate(backend, texts, *args, **kwargs)
+
+        monkeypatch.setattr(embedding_utils, "generate_embeddings_batch", recording_generate)
+
+        # Read the raw vector: the engine API deliberately never exposes a model's
+        # embedding, and the whole point of the regression is that the column went
+        # stale, so there is no public read that can observe it.
+        async def stored_embedding() -> str:
+            async with memory._pool.acquire() as conn:
+                return await conn.fetchval(
+                    f"SELECT embedding::text FROM {fq_table('mental_models')} WHERE bank_id = $1 AND id = $2",
+                    bank_id,
+                    mental_model["id"],
+                )
+
+        before_content_edit = await stored_embedding()
+
+        # Content-only: the stored name has to be part of the embedded document.
+        updated = await memory.update_mental_model(
+            bank_id=bank_id,
+            mental_model_id=mental_model["id"],
+            content="Rewritten Content",
+            request_context=request_context,
+        )
+        assert embedded == [f"Original Name {updated['content']}"]
+        after_content_edit = await stored_embedding()
+        assert after_content_edit != before_content_edit
+
+        # Name-only: re-embedded, and against the content still stored.
+        embedded.clear()
+        renamed = await memory.update_mental_model(
+            bank_id=bank_id,
+            mental_model_id=mental_model["id"],
+            name="Renamed Model",
+            request_context=request_context,
+        )
+        assert renamed["name"] == "Renamed Model"
+        assert embedded == [f"Renamed Model {updated['content']}"]
+        assert await stored_embedding() != after_content_edit
+
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
@@ -238,6 +364,28 @@ class TestObservationsAPI:
 
 class TestMentalModelsAPI:
     """Test mental models API endpoints."""
+
+    @pytest.mark.asyncio
+    async def test_create_mental_model_api_creates_missing_bank(self, api_client, test_bank_id):
+        """POST /mental-models should not FK-fail when it is the bank's first write."""
+        response = await api_client.post(
+            f"/v1/default/banks/{test_bank_id}/mental-models",
+            json={
+                "name": "First API Mental Model",
+                "source_query": "What is known in this new bank?",
+                "tags": ["api-test"],
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["mental_model_id"]
+
+        response = await api_client.get("/v1/default/banks", params={"limit": 1000})
+        assert response.status_code == 200
+        bank_ids = {bank["bank_id"] for bank in response.json()["banks"]}
+        assert test_bank_id in bank_ids
+
+        await api_client.delete(f"/v1/default/banks/{test_bank_id}")
 
     @pytest.mark.asyncio
     async def test_mental_models_api_crud(self, api_client, test_bank_id):
@@ -401,6 +549,11 @@ class TestRecallWithObservationsAndMentalModels:
 class TestReflectUsesMentalModels:
     """Test that reflect searches and uses mental models when available."""
 
+    @pytest.fixture
+    def memory(self, memory_real_llm):
+        """Override to use real LLM — reflect tool-calling requires a real model."""
+        return memory_real_llm
+
     # Reflect doesn't pin a tool-call temperature, so weaker models in the
     # acceptance matrix (e.g. gemini-2.5-flash-lite) occasionally pick `recall`
     # or `search_observations` instead of `search_mental_models`. Rerun a
@@ -457,19 +610,25 @@ class TestReflectUsesMentalModels:
         for tc in search_mm_calls:
             assert tc.reason is not None, "Tool call should have a reason for debugging"
 
-        # The response should mention concepts from the mental model
-        response_text = result.text.lower()
-        has_relevant_content = any(
-            keyword in response_text
-            for keyword in ["slack", "async", "standup", "code review", "documentation", "communication"]
-        )
-        assert has_relevant_content, (
-            f"Expected response to reference mental model content. Got: {result.text[:500]}"
+        # The response should reference concepts from the mental model
+        await assert_meets_criteria(
+            response=result.text,
+            criteria=(
+                "The response references at least one concept from the team's collaboration practices: "
+                "async communication, Slack, daily standups, code reviews, documentation, or written communication."
+            ),
+            context=(
+                "Mental model content: The team uses async communication via Slack and holds daily "
+                "standups at 9am. Code reviews are required before merging. The team values "
+                "documentation and prefers written communication for complex decisions."
+            ),
+            msg=f"Expected response to reference mental model content. Got: {result.text[:500]}",
         )
 
         # Cleanup
         await memory.delete_bank(bank_id, request_context=request_context)
 
+    @pytest.mark.hs_llm_core
     @pytest.mark.asyncio
     async def test_reflect_tool_trace_includes_reason(self, memory: MemoryEngine, request_context):
         """Test that tool traces include the reason field for debugging."""
@@ -512,7 +671,9 @@ class TestMentalModelReflectOptions:
             request_context=request_context,
         )
 
-        fetched = await memory.get_mental_model(bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context)
+        fetched = await memory.get_mental_model(
+            bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
+        )
         assert fetched["trigger"]["fact_types"] == ["observation"]
         assert fetched["trigger"]["refresh_after_consolidation"] is False
 
@@ -533,7 +694,9 @@ class TestMentalModelReflectOptions:
             request_context=request_context,
         )
 
-        fetched = await memory.get_mental_model(bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context)
+        fetched = await memory.get_mental_model(
+            bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
+        )
         assert fetched["trigger"]["exclude_mental_models"] is True
 
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -554,7 +717,9 @@ class TestMentalModelReflectOptions:
             request_context=request_context,
         )
 
-        fetched = await memory.get_mental_model(bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context)
+        fetched = await memory.get_mental_model(
+            bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
+        )
         assert fetched["trigger"]["exclude_mental_model_ids"] == excluded_ids
 
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -598,9 +763,7 @@ class TestReflectFactTypeFiltering:
     """Tests for fact_types and exclude_mental_models filtering in reflect_async."""
 
     @pytest.mark.asyncio
-    async def test_exclude_mental_models_skips_search_mental_models_tool(
-        self, memory: MemoryEngine, request_context
-    ):
+    async def test_exclude_mental_models_skips_search_mental_models_tool(self, memory: MemoryEngine, request_context):
         """When exclude_mental_models=True, search_mental_models is never called."""
         bank_id = f"test-reflect-exmm-{uuid.uuid4().hex[:8]}"
         await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)

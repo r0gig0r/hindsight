@@ -1,30 +1,55 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { createRequire } from "module";
 import {
   stripMemoryTags,
   extractRecallQuery,
+  formatCurrentTimeForRecall,
   formatMemories,
   prepareRetentionTranscript,
-  countUserTurns,
-  getRetentionTurnIndex,
   sliceLastTurnsByUserBoundary,
   composeRecallQuery,
   truncateRecallQuery,
   buildRetainRequest,
+  getDocumentIdBootToken,
   meetsMinimumVersion,
+  parseHindsightApiCapabilities,
+  supportsAppendFromCapabilities,
+  supportsAsyncRetainOperationIdFromCapabilities,
+  createAsyncRetainOperationId,
+  refreshAsyncRetainOperationIdCapability,
   parseSessionKey,
   extractTelegramDirectSenderId,
   resolveSessionIdentity,
+  resolveAndCacheIdentity,
   getIdentitySkipReason,
   isEphemeralOperationalText,
   deriveBankId,
+  resolveBankIdForKnowledgeTools,
   normalizeRetainTags,
   extractInlineRetainTags,
   stripInlineRetainTags,
   stripInlineTimestampPrefix,
+  stripRuntimeEnvelope,
+  stripMetadataEnvelopes,
+  extractSenderIdFromText,
+  configureSenderPrefixStripping,
   getPluginConfig,
+  scopeClient,
   formatHookPerf,
+  DEFAULT_RETAIN_CONTEXT,
 } from "./index.js";
 import type { PluginConfig, MemoryResult, MoltbotPluginAPI } from "./types.js";
+
+const require = createRequire(import.meta.url);
+const openclawManifest = require("../openclaw.plugin.json") as {
+  configSchema?: {
+    properties?: {
+      retainContext?: {
+        default?: string;
+      };
+    };
+  };
+};
 
 // ---------------------------------------------------------------------------
 // stripMemoryTags
@@ -78,6 +103,32 @@ describe("stripMemoryTags", () => {
     expect(result).toContain("[role: user]");
     expect(result).toContain("How do I enable dark mode?");
     expect(result).toContain("[role: assistant]");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// stripRuntimeEnvelope
+// ---------------------------------------------------------------------------
+
+describe("stripRuntimeEnvelope", () => {
+  it("strips leading message id and opaque sender prefix while preserving text", () => {
+    const input =
+      "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\n" +
+      "ou_cb923a19782fe748cd9fff99454eee31: 我是只retain context的那次改动";
+
+    expect(stripRuntimeEnvelope(input)).toBe("我是只retain context的那次改动");
+  });
+
+  it("removes standalone opaque runtime ids", () => {
+    const input = "om_x100b6d3512c5ccb0c084ad240a38842\n真实内容\noc_abcdef123456";
+
+    expect(stripRuntimeEnvelope(input)).toBe("真实内容");
+  });
+
+  it("does not strip ordinary user text with a colon", () => {
+    const input = "计划: 今天修 retain 污染";
+
+    expect(stripRuntimeEnvelope(input)).toBe(input);
   });
 });
 
@@ -139,6 +190,16 @@ describe("extractRecallQuery", () => {
     const result = extractRecallQuery(undefined, prompt);
     expect(result).not.toContain("[from: Alice]");
     expect(result).toContain("What should I eat for lunch?");
+  });
+
+  it("strips Feishu runtime ids from recall query text", () => {
+    const rawMessage =
+      "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\n" +
+      "ou_cb923a19782fe748cd9fff99454eee31: 这个修复是否进入生产？";
+
+    const result = extractRecallQuery(rawMessage, undefined);
+
+    expect(result).toBe("这个修复是否进入生产？");
   });
 
   it("handles full envelope with System lines, channel header, and from footer", () => {
@@ -244,43 +305,144 @@ describe("formatMemories", () => {
     );
   });
 
+  it("appends a [doc:...] marker when document_id is present", () => {
+    const memories: MemoryResult[] = [
+      makeMemoryResult({
+        id: "1",
+        text: "ComfyUI flux tip",
+        type: "world",
+        mentioned_at: "2026-07-04T00:00:00Z",
+        document_id: "openclaw:agent:main:tg:-1003825475854",
+      }),
+    ];
+    expect(formatMemories(memories)).toBe(
+      "- ComfyUI flux tip [world] (2026-07-04T00:00:00Z) [doc:openclaw:agent:main:tg:-1003825475854]"
+    );
+  });
+
+  it("omits the [doc:...] marker when document_id is missing (e.g. observations)", () => {
+    const memories: MemoryResult[] = [
+      makeMemoryResult({
+        id: "1",
+        text: "User prefers dark mode",
+        type: "observation",
+        mentioned_at: "2026-01-01T00:00:00Z",
+        document_id: null,
+      }),
+    ];
+    const output = formatMemories(memories);
+    expect(output).toBe("- User prefers dark mode [observation] (2026-01-01T00:00:00Z)");
+    expect(output).not.toContain("[doc:");
+  });
+
+  it("omits the [doc:...] marker when document_id is an empty string", () => {
+    const memories: MemoryResult[] = [
+      makeMemoryResult({
+        id: "1",
+        text: "User likes tea",
+        type: "experience",
+        document_id: "",
+      }),
+    ];
+    const output = formatMemories(memories);
+    expect(output).toBe("- User likes tea [experience]");
+    expect(output).not.toContain("[doc:");
+  });
+
+  it("renders a collapsed occurred window when start and end match", () => {
+    const memories: MemoryResult[] = [
+      makeMemoryResult({
+        id: "1",
+        text: "Deployed the new indexer",
+        type: "experience",
+        mentioned_at: "2026-01-20T00:00:00Z",
+        occurred_start: "2026-01-15T10:30:00Z",
+        occurred_end: "2026-01-15T10:30:00Z",
+      }),
+    ];
+    expect(formatMemories(memories)).toBe(
+      "- Deployed the new indexer [experience] (2026-01-20T00:00:00Z) [occurred: 2026-01-15T10:30:00Z]"
+    );
+  });
+
+  it("renders a range when start and end differ", () => {
+    const memories: MemoryResult[] = [
+      makeMemoryResult({
+        id: "1",
+        text: "Visited Paris",
+        type: "experience",
+        occurred_start: "2026-03-01T00:00:00Z",
+        occurred_end: "2026-03-08T00:00:00Z",
+      }),
+    ];
+    expect(formatMemories(memories)).toBe(
+      "- Visited Paris [experience] [occurred: 2026-03-01T00:00:00Z → 2026-03-08T00:00:00Z]"
+    );
+  });
+
+  it("renders an open-ended window when only one bound is present", () => {
+    const startOnly = formatMemories([
+      makeMemoryResult({ text: "Started at Vectorize", occurred_start: "2026-02-01T00:00:00Z" }),
+    ]);
+    expect(startOnly).toBe("- Started at Vectorize [world] [occurred from: 2026-02-01T00:00:00Z]");
+
+    const endOnly = formatMemories([
+      makeMemoryResult({ text: "Left the old team", occurred_end: "2026-02-01T00:00:00Z" }),
+    ]);
+    expect(endOnly).toBe("- Left the old team [world] [occurred until: 2026-02-01T00:00:00Z]");
+  });
+
+  it("orders the occurred window before the [doc:...] marker", () => {
+    const memories: MemoryResult[] = [
+      makeMemoryResult({
+        id: "1",
+        text: "Fixed the LiteLLM port issue",
+        type: "experience",
+        mentioned_at: "2026-01-15T00:00:00Z",
+        occurred_start: "2026-01-14T09:00:00Z",
+        occurred_end: "2026-01-14T11:00:00Z",
+        document_id: "openclaw:agent:main:tg:-1003825475854",
+      }),
+    ];
+    expect(formatMemories(memories)).toBe(
+      "- Fixed the LiteLLM port issue [experience] (2026-01-15T00:00:00Z) " +
+        "[occurred: 2026-01-14T09:00:00Z → 2026-01-14T11:00:00Z] " +
+        "[doc:openclaw:agent:main:tg:-1003825475854]"
+    );
+  });
+
+  it("omits the occurred window when neither bound is present", () => {
+    const output = formatMemories([
+      makeMemoryResult({ text: "User likes tea", occurred_start: null, occurred_end: null }),
+    ]);
+    expect(output).toBe("- User likes tea [world]");
+    expect(output).not.toContain("[occurred");
+  });
+
   it("returns empty string for empty memories", () => {
     expect(formatMemories([])).toBe("");
   });
 });
 
 // ---------------------------------------------------------------------------
-// retention helpers
+// formatCurrentTimeForRecall — UTC label (#1789, mirrors #1568)
 // ---------------------------------------------------------------------------
 
-describe("countUserTurns", () => {
-  it("counts user messages across a resumed conversation history", () => {
-    expect(
-      countUserTurns([
-        { role: "user", content: "turn 1" },
-        { role: "assistant", content: "reply 1" },
-        { role: "system", content: "meta" },
-        { role: "user", content: "turn 2" },
-        { role: "assistant", content: "reply 2" },
-        { role: "user", content: "turn 3" },
-      ])
-    ).toBe(3);
+describe("formatCurrentTimeForRecall", () => {
+  it("renders the UTC suffix so the LLM doesn't misread it as local time", () => {
+    const fixed = new Date(Date.UTC(2026, 4, 27, 16, 25, 0)); // 2026-05-27 16:25 UTC
+    expect(formatCurrentTimeForRecall(fixed)).toBe("2026-05-27 16:25 UTC");
+  });
+
+  it("zero-pads month / day / hours / minutes", () => {
+    const fixed = new Date(Date.UTC(2026, 0, 3, 4, 5, 0));
+    expect(formatCurrentTimeForRecall(fixed)).toBe("2026-01-03 04:05 UTC");
   });
 });
 
-describe("getRetentionTurnIndex", () => {
-  it("uses the full conversation turn count for per-turn retention", () => {
-    expect(getRetentionTurnIndex(7, 1)).toBe(7);
-  });
-
-  it("derives a stable window sequence for chunked retention", () => {
-    expect(getRetentionTurnIndex(6, 3)).toBe(2);
-  });
-
-  it("returns null when a chunk boundary has not been reached", () => {
-    expect(getRetentionTurnIndex(5, 3)).toBeNull();
-  });
-});
+// ---------------------------------------------------------------------------
+// retention helpers
+// ---------------------------------------------------------------------------
 
 describe("normalizeRetainTags", () => {
   it("trims, deduplicates, and preserves order for string arrays", () => {
@@ -348,6 +510,7 @@ describe("buildRetainRequest", () => {
     expect(request).toEqual({
       content: "hello world",
       documentId: "openclaw:agent:main:main",
+      context: DEFAULT_RETAIN_CONTEXT,
       metadata: {
         retained_at: expect.any(String),
         message_count: "2",
@@ -367,6 +530,66 @@ describe("buildRetainRequest", () => {
     });
   });
 
+  it("includes the default retain context guidance", () => {
+    const request = buildRetainRequest("hello world", 1, {}, {}, 1700000000000, { turnIndex: 1 });
+
+    expect(request.context).toBe(DEFAULT_RETAIN_CONTEXT);
+  });
+
+  it("keeps sender/channel/provider in retain metadata", () => {
+    const request = buildRetainRequest(
+      "hello world",
+      1,
+      {
+        sessionKey: "agent:main:feishu:oc_abcdef123456",
+        messageProvider: "feishu",
+        channelId: "oc_abcdef123456",
+        senderId: "ou_cb923a19782fe748cd9fff99454eee31",
+      },
+      {},
+      1700000000000,
+      { turnIndex: 1 }
+    );
+
+    expect(request.metadata).toMatchObject({
+      provider: "feishu",
+      channel_id: "oc_abcdef123456",
+      sender_id: "ou_cb923a19782fe748cd9fff99454eee31",
+    });
+  });
+
+  it("describes routing metadata and assistant/user roles in the default retain context", () => {
+    expect(DEFAULT_RETAIN_CONTEXT).toContain("routing identifiers");
+    expect(DEFAULT_RETAIN_CONTEXT).toContain("operational routing identifiers");
+    expect(DEFAULT_RETAIN_CONTEXT).toContain("AI assistant");
+  });
+
+  it("uses a configured retain context when provided", () => {
+    const request = buildRetainRequest(
+      "hello world",
+      1,
+      {},
+      { retainContext: "Custom extraction guidance." },
+      1700000000000,
+      { turnIndex: 1 }
+    );
+
+    expect(request.context).toBe("Custom extraction guidance.");
+  });
+
+  it("trims configured retain context before sending it", () => {
+    const request = buildRetainRequest(
+      "hello world",
+      1,
+      {},
+      { retainContext: "  Custom extraction guidance. \n" },
+      1700000000000,
+      { turnIndex: 1 }
+    );
+
+    expect(request.context).toBe("Custom extraction guidance.");
+  });
+
   it("falls back to per-turn doc id when appendSupported is false (older API)", () => {
     const request = buildRetainRequest(
       "hello world",
@@ -380,7 +603,9 @@ describe("buildRetainRequest", () => {
       1700000000000,
       { turnIndex: 4, appendSupported: false }
     );
-    expect(request.documentId).toBe("openclaw:agent:main:main:turn:000004");
+    expect(request.documentId).toBe(
+      `openclaw:agent:main:main:turn:${getDocumentIdBootToken()}:000004`
+    );
     expect(request.updateMode).toBeUndefined();
   });
 
@@ -397,30 +622,29 @@ describe("buildRetainRequest", () => {
       1700000000000,
       { turnIndex: 6 }
     );
-    expect(request.documentId).toBe("openclaw:agent:main:main:turn:000006");
+    expect(request.documentId).toBe(
+      `openclaw:agent:main:main:turn:${getDocumentIdBootToken()}:000006`
+    );
     expect(request.updateMode).toBeUndefined();
   });
 
-  it("uses per-turn document ids when retainDocumentScope is 'turn'", () => {
-    const request = buildRetainRequest(
-      "hello world",
-      2,
-      {
-        agentId: "main",
-        sessionKey: "agent:main:main",
-        messageProvider: "discord",
-        channelId: "channel:123",
-        senderId: "user:456",
-      },
-      {
-        retainSource: "openclaw",
-        retainDocumentScope: "turn",
-      },
-      1700000000000,
-      { turnIndex: 7 }
-    );
+  it("stamps a stable per-process boot token into fallback doc ids (#3686)", () => {
+    // The turn counter lives in memory, so it restarts at 1 on every host
+    // restart. The boot token is what keeps the replayed counter from landing
+    // on the previous run's document, which retain would then *replace*.
+    const ctx = { agentId: "main", sessionKey: "agent:main:main" };
+    const first = buildRetainRequest("a", 1, ctx, {}, 1700000000000, { turnIndex: 1 });
+    const second = buildRetainRequest("b", 1, ctx, {}, 1700000000000, { turnIndex: 2 });
 
-    expect(request.documentId).toBe("openclaw:agent:main:main:turn:000007");
+    expect(getDocumentIdBootToken()).toMatch(/^[0-9a-f]{8}$/);
+    // Same process → same token, so ids stay comparable within a run.
+    expect(first.documentId).toBe(
+      `openclaw:agent:main:main:turn:${getDocumentIdBootToken()}:000001`
+    );
+    expect(second.documentId).toBe(
+      `openclaw:agent:main:main:turn:${getDocumentIdBootToken()}:000002`
+    );
+    expect(first.documentId).not.toBe(second.documentId);
   });
 
   it("uses window ids and metadata for chunked retention", () => {
@@ -435,7 +659,6 @@ describe("buildRetainRequest", () => {
       },
       {
         retainSource: "openclaw",
-        retainDocumentScope: "turn",
       },
       1700000000000,
       {
@@ -446,7 +669,7 @@ describe("buildRetainRequest", () => {
     );
 
     expect(request.documentId).toBe(
-      "openclaw:agent:agentname:discord:group:123:topic:456:window:000002"
+      `openclaw:agent:agentname:discord:group:123:topic:456:window:${getDocumentIdBootToken()}:000002`
     );
     expect(request.metadata).toMatchObject({
       source: "openclaw",
@@ -651,6 +874,73 @@ describe("prepareRetentionTranscript", () => {
     expect(result?.transcript).not.toContain("client:acme");
   });
 
+  it("strips OpenClaw metadata and Feishu runtime headers from retained structured content", () => {
+    const messages = [
+      {
+        role: "user",
+        content:
+          'Conversation info (untrusted metadata):\n```json\n{"message_id":"om_x100b6d3512c5ccb0c084ad240a38842","sender_id":"ou_cb923a19782fe748cd9fff99454eee31"}\n```\n' +
+          "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\n" +
+          "ou_cb923a19782fe748cd9fff99454eee31: 我是只retain context的那次改动",
+      },
+    ];
+
+    const result = prepareRetentionTranscript(messages, baseConfig);
+
+    expect(result).not.toBeNull();
+    expect(JSON.parse(result!.transcript)).toEqual([
+      {
+        role: "user",
+        content: [{ type: "text", text: "我是只retain context的那次改动" }],
+      },
+    ]);
+    expect(result!.transcript).not.toContain("Conversation info");
+    expect(result!.transcript).not.toContain("message_id");
+    expect(result!.transcript).not.toContain("om_x100b6d3512c5ccb0c084ad240a38842");
+    expect(result!.transcript).not.toContain("ou_cb923a19782fe748cd9fff99454eee31");
+  });
+
+  it("strips Feishu runtime headers from retained text-only content", () => {
+    const config: PluginConfig = { ...baseConfig, retainToolCalls: false };
+    const messages = [
+      {
+        role: "user",
+        content:
+          "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\n" +
+          "ou_cb923a19782fe748cd9fff99454eee31: 我是只retain context的那次改动",
+      },
+    ];
+
+    const result = prepareRetentionTranscript(messages, config);
+
+    expect(result).not.toBeNull();
+    expect(JSON.parse(result!.transcript)).toEqual([
+      { role: "user", content: "我是只retain context的那次改动" },
+    ]);
+  });
+
+  it("strips runtime headers that appear after an inline timestamp", () => {
+    const messages = [
+      {
+        role: "user",
+        content:
+          "[Wed 2026-06-03 19:54 GMT+8]\n" +
+          "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\n" +
+          "ou_cb923a19782fe748cd9fff99454eee31: 我是只retain context的那次改动",
+      },
+    ];
+
+    const result = prepareRetentionTranscript(messages, baseConfig);
+
+    expect(result).not.toBeNull();
+    expect(JSON.parse(result!.transcript)).toEqual([
+      {
+        role: "user",
+        content: [{ type: "text", text: "我是只retain context的那次改动" }],
+      },
+    ]);
+  });
+
   it("strips memory tags from user message when prependContext is prepended to it", () => {
     // Simulates the host prepending prependContext to the user message content
     const userContent = `<hindsight_memories>\nRelevant memories:\n- User prefers dark mode [world]\n\nUser message: What is dark mode?\n</hindsight_memories>\nWhat is dark mode?`;
@@ -802,65 +1092,30 @@ describe("prepareRetentionTranscript", () => {
     expect(result?.messageCount).toBe(2);
   });
 
-  it("prepends a session-context system message when sessionContext is provided (json)", () => {
+  it("does not wrap retained JSON content in a context header", () => {
     const config: PluginConfig = { ...baseConfig, retainToolCalls: false };
     const messages = [{ role: "user", content: "What's MIN-123 status?" }];
-    const result = prepareRetentionTranscript(messages, config, false, {
-      senderId: "U7JAF258R",
-      channelId: "C04L6E0H3SQ",
-      provider: "slack",
-    });
+    const result = prepareRetentionTranscript(messages, config);
     expect(result).not.toBeNull();
     const parsed = JSON.parse(result!.transcript);
-    expect(parsed[0]).toEqual({
-      role: "system",
-      content: "[context]\nsender: U7JAF258R\nchannel: C04L6E0H3SQ\nprovider: slack\n[/context]",
-    });
-    expect(parsed[1]).toEqual({ role: "user", content: "What's MIN-123 status?" });
-    expect(result?.messageCount).toBe(2);
+    expect(parsed).toEqual([{ role: "user", content: "What's MIN-123 status?" }]);
+    expect(result!.transcript).not.toContain("[context]");
+    expect(result!.transcript).not.toContain("sender:");
+    expect(result!.transcript).not.toContain("channel:");
+    expect(result!.transcript).not.toContain("provider:");
+    expect(result?.messageCount).toBe(1);
   });
 
-  it("prepends a session-context block when sessionContext is provided (text format)", () => {
+  it("does not wrap retained text content in a context header", () => {
     const config: PluginConfig = { ...baseConfig, retainFormat: "text" };
     const messages = [{ role: "user", content: "ping" }];
-    const result = prepareRetentionTranscript(messages, config, false, {
-      senderId: "U7JAF258R",
-    });
+    const result = prepareRetentionTranscript(messages, config);
     expect(result).not.toBeNull();
-    expect(result!.transcript.startsWith("[context]\nsender: U7JAF258R\n[/context]\n\n")).toBe(
-      true
-    );
+    expect(result!.transcript).not.toContain("[context]");
+    expect(result!.transcript).not.toContain("sender:");
+    expect(result!.transcript).not.toContain("channel:");
+    expect(result!.transcript).not.toContain("provider:");
     expect(result!.transcript).toContain("[role: user]\nping\n[user:end]");
-  });
-
-  it("omits the context header when includeSenderContext is explicitly disabled", () => {
-    const config: PluginConfig = {
-      ...baseConfig,
-      retainFormat: "text",
-      includeSenderContext: false,
-    };
-    const messages = [{ role: "user", content: "ping" }];
-    const result = prepareRetentionTranscript(messages, config, false, {
-      senderId: "U7JAF258R",
-    });
-    expect(result).not.toBeNull();
-    expect(result!.transcript).not.toContain("[context]");
-    expect(result!.transcript.startsWith("[role: user]")).toBe(true);
-  });
-
-  it("omits the context header when sessionContext has no usable fields", () => {
-    const config: PluginConfig = { ...baseConfig, retainFormat: "text" };
-    const messages = [{ role: "user", content: "ping" }];
-    const result = prepareRetentionTranscript(messages, config, false, {});
-    expect(result).not.toBeNull();
-    expect(result!.transcript).not.toContain("[context]");
-  });
-
-  it("falls back gracefully when sessionContext is omitted", () => {
-    const messages = [{ role: "user", content: "ping" }];
-    const result = prepareRetentionTranscript(messages, baseConfig);
-    expect(result).not.toBeNull();
-    expect(result!.transcript).not.toContain("[context]");
   });
 });
 
@@ -903,6 +1158,45 @@ describe("sliceLastTurnsByUserBoundary", () => {
     const messages = [{ role: "user", content: "Hello" }];
     expect(sliceLastTurnsByUserBoundary(messages, 0)).toEqual([]);
   });
+
+  it("skips synthetic user messages that contain only tool_result blocks", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "Real user input 1" }] },
+      { role: "assistant", content: [{ type: "text", text: "Assistant reply 1" }] },
+      {
+        role: "user",
+        content: [{ type: "tool_result", content: "Tool output for call 1" }],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", content: "Tool output for call 2" }],
+      },
+      { role: "assistant", content: [{ type: "text", text: "Assistant after tools" }] },
+      { role: "user", content: [{ type: "text", text: "Real user input 2" }] },
+      { role: "assistant", content: [{ type: "text", text: "Assistant reply 2" }] },
+    ];
+    // 3 user turns requested, but only 2 have real text content.
+    // Should fall back to returning all messages.
+    const result = sliceLastTurnsByUserBoundary(messages, 3);
+    expect(result).toEqual(messages);
+  });
+
+  it("uses real user turns when tool_result synthetic messages are present", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "Real user input 1" }] },
+      { role: "assistant", content: [{ type: "text", text: "Assistant reply 1" }] },
+      {
+        role: "user",
+        content: [{ type: "tool_result", content: "Tool output 1" }],
+      },
+      { role: "assistant", content: [{ type: "text", text: "Assistant after tool 1" }] },
+      { role: "user", content: [{ type: "text", text: "Real user input 2" }] },
+      { role: "assistant", content: [{ type: "text", text: "Assistant reply 2" }] },
+    ];
+    // 2 real user turns. Should start at message 0 (first real user).
+    const result = sliceLastTurnsByUserBoundary(messages, 2);
+    expect(result).toEqual(messages);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -932,6 +1226,26 @@ describe("composeRecallQuery", () => {
     expect(query).toContain("assistant: Got it, dark mode noted.");
     // latest message should appear after prior context
     expect(query.indexOf("Prior context:")).toBeLessThan(query.indexOf("What theme do I prefer?"));
+  });
+
+  it("strips Feishu runtime ids from prior recall context", () => {
+    const messages = [
+      {
+        role: "user",
+        content:
+          "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\n" +
+          "ou_cb923a19782fe748cd9fff99454eee31: 我在修 retain 污染",
+      },
+      { role: "assistant", content: "收到。" },
+      { role: "user", content: "现在状态呢？" },
+    ];
+
+    const query = composeRecallQuery("现在状态呢？", messages, 2);
+
+    expect(query).toContain("user: 我在修 retain 污染");
+    expect(query).not.toContain("message_id");
+    expect(query).not.toContain("om_x100b6d3512c5ccb0c084ad240a38842");
+    expect(query).not.toContain("ou_cb923a19782fe748cd9fff99454eee31");
   });
 
   it("respects recallRoles when building prior context", () => {
@@ -1006,6 +1320,12 @@ describe("session identity helpers", () => {
     });
   });
 
+  it("parses Control UI Dashboard sessions", () => {
+    expect(parseSessionKey("agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdef")).toEqual({
+      agentId: "main",
+    });
+  });
+
   it("extracts telegram direct sender ids from channel ids", () => {
     expect(extractTelegramDirectSenderId("direct:12345")).toBe("12345");
     expect(extractTelegramDirectSenderId("group:12345")).toBeUndefined();
@@ -1022,6 +1342,20 @@ describe("session identity helpers", () => {
       messageProvider: "telegram",
       channelId: "direct:12345",
       senderId: "12345",
+    });
+  });
+
+  it("resolves msteams direct identity from session key when senderId is missing", () => {
+    const resolved = resolveSessionIdentity({
+      agentId: "nemoclaw",
+      sessionKey: "agent:nemoclaw:msteams:direct:user-teams-42",
+    });
+
+    expect(resolved).toMatchObject({
+      agentId: "nemoclaw",
+      messageProvider: "msteams",
+      channelId: "direct:user-teams-42",
+      senderId: "user-teams-42",
     });
   });
 
@@ -1140,6 +1474,38 @@ describe("session identity helpers", () => {
     expect(result.resolvedCtx?.senderId).toBe("agent-user:main");
   });
 
+  it("allows Dashboard sessions through when a static bankId is configured", () => {
+    const result = resolveAndCacheIdentity({
+      sessionKey: "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdef",
+      ctx: { sessionKey: "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdef" },
+      dispatchChannel: "webchat",
+      pluginConfig: { dynamicBankId: false, bankId: "shared-bank" },
+    });
+
+    expect(result.skipReason).toBeUndefined();
+    expect(result.resolvedCtx).toEqual({
+      sessionKey: "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdef",
+      agentId: "main",
+      messageProvider: "webchat",
+      channelId: undefined,
+      senderId: "agent-user:main",
+    });
+  });
+
+  it("does not synthesize a Dashboard sender when agent and static banking are disabled", () => {
+    const result = resolveAndCacheIdentity({
+      sessionKey: "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdee",
+      ctx: { sessionKey: "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdee" },
+      dispatchChannel: "webchat",
+      pluginConfig: { dynamicBankGranularity: ["channel", "user"] },
+    });
+
+    expect(result.skipReason).toEqual({
+      kind: "retryable",
+      detail: "missing stable sender identity",
+    });
+  });
+
   it("allows agent:*:main when dynamicBankId is false but bankId is missing (default granularity includes 'agent')", () => {
     const result = getIdentitySkipReason(
       { sessionKey: "agent:main:main" },
@@ -1184,6 +1550,90 @@ describe("session identity helpers", () => {
       isEphemeralOperationalText("[role: user]\nA new session was started via /new.\n[user:end]")
     ).toBe(true);
     expect(isEphemeralOperationalText("Tell me what I said about dark mode.")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveAndCacheIdentity — dispatch-surface gate (#1541)
+// ---------------------------------------------------------------------------
+
+describe("resolveAndCacheIdentity dispatch-surface gate (#1541)", () => {
+  it("does not skip when session provider is synthetic 'main' (telegram dispatch)", () => {
+    const { resolvedCtx, skipReason } = resolveAndCacheIdentity({
+      sessionKey: "agent:bug1541-tg:main",
+      ctx: { sessionKey: "agent:bug1541-tg:main" },
+      dispatchChannel: "telegram",
+    });
+
+    expect(skipReason).toBeUndefined();
+    expect(resolvedCtx?.messageProvider).toBe("telegram");
+  });
+
+  it("does not skip when session provider is synthetic 'main' (webchat dispatch)", () => {
+    const { skipReason } = resolveAndCacheIdentity({
+      sessionKey: "agent:bug1541-wc:main",
+      ctx: { sessionKey: "agent:bug1541-wc:main" },
+      dispatchChannel: "webchat",
+    });
+
+    expect(skipReason).toBeUndefined();
+  });
+
+  it("does not skip when a static bankId is configured (feishu session via webchat)", () => {
+    const { skipReason } = resolveAndCacheIdentity({
+      sessionKey: "agent:main:feishu:direct:user-1541-static",
+      ctx: {
+        sessionKey: "agent:main:feishu:direct:user-1541-static",
+        senderId: "user-1541-static",
+      },
+      dispatchChannel: "webchat",
+      pluginConfig: { dynamicBankId: false, bankId: "shared-bank" },
+    });
+
+    expect(skipReason).toBeUndefined();
+  });
+
+  it("does not skip when granularity excludes channel and provider (qqbot via webchat)", () => {
+    const { skipReason } = resolveAndCacheIdentity({
+      sessionKey: "agent:main:qqbot:direct:user-1541-agentonly",
+      ctx: {
+        sessionKey: "agent:main:qqbot:direct:user-1541-agentonly",
+        senderId: "user-1541-agentonly",
+      },
+      dispatchChannel: "webchat",
+      pluginConfig: { dynamicBankGranularity: ["agent", "user"] },
+    });
+
+    expect(skipReason).toBeUndefined();
+  });
+
+  it("still skips real-provider mismatch with default granularity (qqbot via webchat)", () => {
+    const { skipReason } = resolveAndCacheIdentity({
+      sessionKey: "agent:main:qqbot:direct:user-1541-default",
+      ctx: {
+        sessionKey: "agent:main:qqbot:direct:user-1541-default",
+        senderId: "user-1541-default",
+      },
+      dispatchChannel: "webchat",
+    });
+
+    expect(skipReason).toEqual({
+      kind: "final",
+      detail: "dispatch surface webchat does not match session provider qqbot",
+    });
+  });
+
+  it("does not skip when dispatch surface matches session provider (qqbot via qqbot)", () => {
+    const { skipReason } = resolveAndCacheIdentity({
+      sessionKey: "agent:main:qqbot:direct:user-1541-match",
+      ctx: {
+        sessionKey: "agent:main:qqbot:direct:user-1541-match",
+        senderId: "user-1541-match",
+      },
+      dispatchChannel: "qqbot",
+    });
+
+    expect(skipReason).toBeUndefined();
   });
 });
 
@@ -1238,6 +1688,129 @@ describe("meetsMinimumVersion", () => {
   it("returns false for malformed versions instead of throwing", () => {
     expect(meetsMinimumVersion("garbage", "0.5.0")).toBe(false);
     expect(meetsMinimumVersion("", "0.5.0")).toBe(false);
+  });
+});
+
+describe("append capability helpers", () => {
+  it("supports append for legacy version payloads without a features block", () => {
+    const capabilities = parseHindsightApiCapabilities({ api_version: "0.8.4" });
+
+    expect(capabilities).toEqual({ version: "0.8.4", storeDocumentText: true });
+    expect(supportsAppendFromCapabilities(capabilities)).toBe(true);
+  });
+
+  it("supports append when the version is new enough and document text storage is enabled", () => {
+    const capabilities = parseHindsightApiCapabilities({
+      api_version: "0.8.4",
+      features: { store_document_text: true },
+    });
+
+    expect(capabilities).toEqual({ version: "0.8.4", storeDocumentText: true });
+    expect(supportsAppendFromCapabilities(capabilities)).toBe(true);
+  });
+
+  it("rejects append when features are present but document text storage is not enabled", () => {
+    expect(
+      supportsAppendFromCapabilities(
+        parseHindsightApiCapabilities({
+          api_version: "0.8.4",
+          features: { store_document_text: false },
+        })
+      )
+    ).toBe(false);
+    expect(
+      supportsAppendFromCapabilities(
+        parseHindsightApiCapabilities({
+          api_version: "0.8.4",
+          features: {},
+        })
+      )
+    ).toBe(false);
+  });
+
+  it("rejects append for old API versions even when document text storage is enabled", () => {
+    const capabilities = parseHindsightApiCapabilities({
+      api_version: "0.4.99",
+      features: { store_document_text: true },
+    });
+
+    expect(supportsAppendFromCapabilities(capabilities)).toBe(false);
+  });
+
+  it("returns null for malformed version payloads", () => {
+    expect(parseHindsightApiCapabilities({ features: { store_document_text: true } })).toBeNull();
+    expect(parseHindsightApiCapabilities(null)).toBeNull();
+  });
+});
+
+describe("async retain operation id capability", () => {
+  it("requires API 0.8.6 or newer", () => {
+    expect(
+      supportsAsyncRetainOperationIdFromCapabilities(
+        parseHindsightApiCapabilities({ api_version: "0.8.5" })
+      )
+    ).toBe(false);
+    expect(
+      supportsAsyncRetainOperationIdFromCapabilities(
+        parseHindsightApiCapabilities({ api_version: "0.8.6" })
+      )
+    ).toBe(true);
+    expect(
+      supportsAsyncRetainOperationIdFromCapabilities(
+        parseHindsightApiCapabilities({ api_version: "0.9.0" })
+      )
+    ).toBe(true);
+    expect(supportsAsyncRetainOperationIdFromCapabilities(null)).toBe(false);
+  });
+
+  it("rejects malformed and prerelease versions conservatively", () => {
+    for (const version of [
+      "0.8.6junk",
+      "0.8.6-beta.1",
+      "1.garbage",
+      "0.8",
+      "0.08.6",
+      "00.8.6",
+      "0.8.6\n",
+    ]) {
+      expect(
+        supportsAsyncRetainOperationIdFromCapabilities(
+          parseHindsightApiCapabilities({ api_version: version })
+        )
+      ).toBe(false);
+    }
+  });
+
+  it("refreshes supported, downgraded, and unknown live capability states", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ api_version: "0.8.6" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ api_version: "0.8.5" }) })
+      .mockRejectedValueOnce(new Error("version endpoint unavailable"));
+    globalThis.fetch = fetchMock as typeof fetch;
+    try {
+      await expect(refreshAsyncRetainOperationIdCapability("https://example.test")).resolves.toBe(
+        "supported"
+      );
+      await expect(refreshAsyncRetainOperationIdCapability("https://example.test")).resolves.toBe(
+        "unsupported"
+      );
+      await expect(refreshAsyncRetainOperationIdCapability("https://example.test")).resolves.toBe(
+        "unknown"
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("generates one valid, distinct UUID for each supported logical retain", () => {
+    const first = createAsyncRetainOperationId();
+    const second = createAsyncRetainOperationId();
+
+    expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(second).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(second).not.toBe(first);
   });
 });
 
@@ -1317,6 +1890,87 @@ describe("getPluginConfig — enableKnowledgeTools whitelist", () => {
   });
 });
 
+describe("getPluginConfig — preferObservations (#2977)", () => {
+  it("passes preferObservations=true through when set", () => {
+    expect(getPluginConfig(makeApi({ preferObservations: true })).preferObservations).toBe(true);
+  });
+
+  it("defaults to false when not set or set to a non-boolean truthy value", () => {
+    expect(getPluginConfig(makeApi({})).preferObservations).toBe(false);
+    expect(getPluginConfig(makeApi({ preferObservations: false })).preferObservations).toBe(false);
+    expect(getPluginConfig(makeApi({ preferObservations: "true" })).preferObservations).toBe(false);
+    expect(getPluginConfig(makeApi({ preferObservations: 1 })).preferObservations).toBe(false);
+  });
+});
+
+describe("recallMinScores (#4143)", () => {
+  it("passes configured score floors through plugin config", () => {
+    const recallMinScores = { semantic: 0.2, reranker: 0.3, final: null };
+    expect(getPluginConfig(makeApi({ recallMinScores })).recallMinScores).toEqual(recallMinScores);
+  });
+
+  it("passes score floors to the Hindsight client", async () => {
+    const recall = vi.fn().mockResolvedValue({ results: [] });
+    const scoped = scopeClient({ recall } as never, "test-bank");
+
+    await scoped.recall({ query: "test", minScores: { reranker: 0.3 } });
+
+    expect(recall).toHaveBeenCalledWith("test-bank", "test", {
+      maxTokens: undefined,
+      budget: undefined,
+      types: undefined,
+      preferObservations: undefined,
+      minScores: { reranker: 0.3 },
+    });
+  });
+});
+
+describe("recallExp direct HTTP fork route", () => {
+  it("posts the fork payload shape with diversity and score options", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ results: [] }),
+    });
+    globalThis.fetch = fetchMock as typeof fetch;
+    try {
+      const scoped = scopeClient({ recall: vi.fn() } as never, "bank/with/slash");
+
+      await scoped.recallExp(
+        {
+          query: "what changed",
+          maxTokens: 321,
+          budget: "low",
+          types: ["world", "experience"],
+          preferObservations: true,
+          minScores: { reranker: 0.3, final: 0.1 },
+          experimentalVariant: "entity_tools",
+          experimentalShadow: true,
+        },
+        1000
+      );
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe("/v1/default/banks/bank%2Fwith%2Fslash/memories/recall_exp");
+      expect(init.method).toBe("POST");
+      expect(init.headers).toEqual({ "Content-Type": "application/json" });
+      expect(JSON.parse(init.body as string)).toEqual({
+        query: "what changed",
+        max_tokens: 321,
+        budget: "low",
+        types: ["world", "experience"],
+        prefer_observations: true,
+        min_scores: { reranker: 0.3, final: 0.1 },
+        experimental_variant: "entity_tools",
+        experimental_shadow: true,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 describe("formatHookPerf (#1406)", () => {
   it("emits the hook name, total ms, and field key=value pairs", () => {
     const line = formatHookPerf("before_prompt_build", 4200, {
@@ -1364,6 +2018,21 @@ describe("getPluginConfig — debugPerfTiming flag (#1406)", () => {
   });
 });
 
+describe("getPluginConfig — recall injection position", () => {
+  it("defaults missing or invalid values to user context", () => {
+    expect(getPluginConfig(makeApi({})).recallInjectionPosition).toBe("user");
+    expect(
+      getPluginConfig(makeApi({ recallInjectionPosition: "invalid" })).recallInjectionPosition
+    ).toBe("user");
+  });
+
+  it.each(["prepend", "append", "user"] as const)("preserves an explicit %s value", (position) => {
+    expect(
+      getPluginConfig(makeApi({ recallInjectionPosition: position })).recallInjectionPosition
+    ).toBe(position);
+  });
+});
+
 describe("getPluginConfig — mission semantics (#1270, #1353)", () => {
   it("does not substitute a default mission when bankMission is unset", () => {
     const cfg = getPluginConfig(makeApi({}));
@@ -1395,5 +2064,335 @@ describe("getPluginConfig — mission semantics (#1270, #1353)", () => {
     const cfg = getPluginConfig(makeApi({ retainMission: "", observationsMission: "" }));
     expect(cfg.retainMission).toBeUndefined();
     expect(cfg.observationsMission).toBeUndefined();
+  });
+});
+
+describe("getPluginConfig — dynamic bank defaults", () => {
+  it("leaves bank default fields unset when not configured", () => {
+    const cfg = getPluginConfig(makeApi({}));
+    expect(cfg.retainExtractionMode).toBeUndefined();
+    expect(cfg.enableObservations).toBeUndefined();
+    expect(cfg.enableAutoConsolidation).toBeUndefined();
+    expect(cfg.dispositionSkepticism).toBeUndefined();
+    expect(cfg.entityLabels).toBeUndefined();
+  });
+
+  it("normalizes configured bank default fields", () => {
+    const labels = [{ name: "person", description: "Human" }];
+    const cfg = getPluginConfig(
+      makeApi({
+        retainExtractionMode: "VERBOSE",
+        enableObservations: true,
+        enableAutoConsolidation: false,
+        dispositionSkepticism: 4,
+        dispositionLiteralism: 2,
+        dispositionEmpathy: 5,
+        entityLabels: labels,
+      })
+    );
+    expect(cfg.retainExtractionMode).toBe("verbose");
+    expect(cfg.enableObservations).toBe(true);
+    expect(cfg.enableAutoConsolidation).toBe(false);
+    expect(cfg.dispositionSkepticism).toBe(4);
+    expect(cfg.entityLabels).toEqual(labels);
+  });
+
+  it("rejects invalid retainExtractionMode and disposition values", () => {
+    const cfg = getPluginConfig(
+      makeApi({
+        retainExtractionMode: "not-a-mode",
+        dispositionSkepticism: 9,
+      })
+    );
+    expect(cfg.retainExtractionMode).toBeUndefined();
+    expect(cfg.dispositionSkepticism).toBeUndefined();
+  });
+});
+
+describe("getPluginConfig — retainContext", () => {
+  it("defaults retainContext to the built-in OpenClaw transcript guidance", () => {
+    const cfg = getPluginConfig(makeApi({}));
+    expect(cfg.retainContext).toBe(DEFAULT_RETAIN_CONTEXT);
+  });
+
+  it("passes through an explicit non-empty retainContext", () => {
+    const cfg = getPluginConfig(makeApi({ retainContext: "Treat IDs as routing metadata." }));
+    expect(cfg.retainContext).toBe("Treat IDs as routing metadata.");
+  });
+
+  it("trims an explicit retainContext", () => {
+    const cfg = getPluginConfig(makeApi({ retainContext: " Treat IDs as routing metadata. \n" }));
+    expect(cfg.retainContext).toBe("Treat IDs as routing metadata.");
+  });
+
+  it("falls back to the default when retainContext is blank or non-string", () => {
+    expect(getPluginConfig(makeApi({ retainContext: "" })).retainContext).toBe(
+      DEFAULT_RETAIN_CONTEXT
+    );
+    expect(getPluginConfig(makeApi({ retainContext: 42 })).retainContext).toBe(
+      DEFAULT_RETAIN_CONTEXT
+    );
+  });
+
+  it("keeps the plugin manifest default in sync with the code default", () => {
+    expect(openclawManifest.configSchema?.properties?.retainContext?.default).toBe(
+      DEFAULT_RETAIN_CONTEXT
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveBankIdForKnowledgeTools — dynamic user-scoped banking (#2441)
+// ---------------------------------------------------------------------------
+
+describe("resolveBankIdForKnowledgeTools", () => {
+  const userScopedConfig: PluginConfig = {
+    dynamicBankGranularity: ["user"],
+    bankIdPrefix: "nemoclaw_intel",
+  };
+
+  it("routes msteams direct sessions to the per-user bank, not shared defaults", () => {
+    const userId = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+    const resolution = resolveBankIdForKnowledgeTools(
+      {
+        agentId: "nemoclaw",
+        sessionKey: `agent:nemoclaw:msteams:direct:${userId}`,
+      },
+      userScopedConfig
+    );
+
+    expect(resolution.identityError).toBeUndefined();
+    expect(resolution.bankId).toBe(`nemoclaw_intel-${userId}`);
+    expect(resolution.bankId).not.toBe("openclaw");
+    expect(resolution.bankId).not.toBe("nemoclaw_intel-openclaw");
+    expect(resolution.bankId).not.toBe("nemoclaw_intel-anonymous");
+  });
+
+  it("does not silently fall back to shared/default bank when user identity is missing", () => {
+    const resolution = resolveBankIdForKnowledgeTools(
+      {
+        agentId: "nemoclaw",
+        sessionKey: "agent:nemoclaw:msteams:group:19:general@thread.tacv2",
+      },
+      userScopedConfig
+    );
+
+    expect(resolution.identityError).toMatch(/missing stable sender identity/);
+    expect(resolution.bankId).not.toBe("openclaw");
+    expect(resolution.bankId).not.toBe("nemoclaw_intel-openclaw");
+    expect(resolution.bankId).toBe("nemoclaw_intel-anonymous");
+  });
+
+  it("uses static bankId when dynamicBankId is false", () => {
+    const resolution = resolveBankIdForKnowledgeTools(
+      { sessionKey: "agent:nemoclaw:main" },
+      { dynamicBankId: false, bankId: "shared-team-memory" }
+    );
+
+    expect(resolution.identityError).toBeUndefined();
+    expect(resolution.bankId).toBe("shared-team-memory");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// senderPrefixPattern — opt-in display-name stripping (#3070)
+// ---------------------------------------------------------------------------
+
+describe("senderPrefixPattern display-name stripping (#3070)", () => {
+  // The pattern is module-global; leaking it would change unrelated tests.
+  afterEach(() => configureSenderPrefixStripping(undefined));
+
+  const cases: Array<{ name: string; pattern?: string; input: string; expected: string }> = [
+    {
+      name: "strips a literal configured display name",
+      pattern: "UserName",
+      input: "UserName: today weather?",
+      expected: "today weather?",
+    },
+    {
+      name: "strips a name-class pattern with spaces",
+      pattern: "[A-Za-z ]{1,20}",
+      input: "Jane Doe: today weather?",
+      expected: "today weather?",
+    },
+    {
+      name: "strips the display name left after the runtime id line",
+      pattern: "UserName",
+      input: "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\nUserName: today weather?",
+      expected: "today weather?",
+    },
+    {
+      name: "still strips opaque sender ids while enabled",
+      pattern: "UserName",
+      input: "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\nou_cb923a19: 真实内容",
+      expected: "真实内容",
+    },
+    {
+      name: "leaves non-matching text alone while enabled",
+      pattern: "UserName",
+      input: "计划: 今天修 retain 污染",
+      expected: "计划: 今天修 retain 污染",
+    },
+    {
+      name: "keeps the prefix when unset (default behaviour)",
+      input: "UserName: today weather?",
+      expected: "UserName: today weather?",
+    },
+    {
+      name: "leaves non-matching text alone when unset",
+      input: "计划: 今天修 retain 污染",
+      expected: "计划: 今天修 retain 污染",
+    },
+    {
+      name: "fails closed on an invalid regex",
+      pattern: "([",
+      input: "UserName: today weather?",
+      expected: "UserName: today weather?",
+    },
+    {
+      name: "only strips at the head, not mid-text",
+      pattern: "UserName",
+      input: "weather please\nUserName: again",
+      expected: "weather please\nUserName: again",
+    },
+    {
+      // One call peels one prefix — same semantics the opaque-id regex already
+      // has. The recall path composes two passes (see the test below), so a
+      // doubled prefix still converges there.
+      name: "peels a single prefix per call on a doubled prefix",
+      pattern: "UserName",
+      input: "UserName: UserName: today weather?",
+      expected: "UserName: today weather?",
+    },
+  ];
+
+  for (const { name, pattern, input, expected } of cases) {
+    it(name, () => {
+      configureSenderPrefixStripping(pattern);
+      expect(stripRuntimeEnvelope(input)).toBe(expected);
+    });
+  }
+
+  it("strips the display name out of the recall query", () => {
+    configureSenderPrefixStripping("UserName");
+    expect(extractRecallQuery("UserName: today weather?", undefined)).toBe("today weather?");
+    configureSenderPrefixStripping(undefined);
+    expect(extractRecallQuery("UserName: today weather?", undefined)).toBe(
+      "UserName: today weather?"
+    );
+  });
+
+  it("strips the display name out of the reported #3070 Feishu DM shape", () => {
+    const raw = "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\nUserName: today weather?";
+
+    configureSenderPrefixStripping("UserName");
+    expect(extractRecallQuery(raw, undefined)).toBe("today weather?");
+
+    // Unset, the runtime id line still goes but the display name survives —
+    // the pre-fix behaviour this option exists to opt out of.
+    configureSenderPrefixStripping(undefined);
+    expect(extractRecallQuery(raw, undefined)).toBe("UserName: today weather?");
+  });
+
+  it("strips the display name out of the retained transcript", () => {
+    configureSenderPrefixStripping("UserName");
+    const messages = [
+      { role: "user", content: "UserName: today weather?" },
+      { role: "assistant", content: "Sunny all day." },
+    ];
+    const config: PluginConfig = {
+      dynamicBankId: true,
+      retainRoles: ["user", "assistant"],
+      retainToolCalls: false,
+    };
+    const result = prepareRetentionTranscript(messages, config);
+    expect(result).not.toBeNull();
+    expect(JSON.parse(result!.transcript)).toEqual([
+      { role: "user", content: "today weather?" },
+      { role: "assistant", content: "Sunny all day." },
+    ]);
+  });
+
+  it("is armed by getPluginConfig and ignores blank or invalid values", () => {
+    expect(
+      getPluginConfig(makeApi({ senderPrefixPattern: "  UserName  " })).senderPrefixPattern
+    ).toBe("UserName");
+    expect(stripRuntimeEnvelope("UserName: today weather?")).toBe("today weather?");
+
+    expect(
+      getPluginConfig(makeApi({ senderPrefixPattern: "   " })).senderPrefixPattern
+    ).toBeUndefined();
+    expect(stripRuntimeEnvelope("UserName: today weather?")).toBe("UserName: today weather?");
+
+    expect(() => getPluginConfig(makeApi({ senderPrefixPattern: "([" }))).not.toThrow();
+    expect(stripRuntimeEnvelope("UserName: today weather?")).toBe("UserName: today weather?");
+
+    expect(getPluginConfig(makeApi({})).senderPrefixPattern).toBeUndefined();
+  });
+});
+
+// OpenClaw 2026.8.1 replaced the "(untrusted metadata)" label on every injected
+// inbound context header with a `⟦openclaw:ctx⟧` provenance marker. Both forms
+// have to keep working: hosts on either side of that change are in the field.
+describe("inbound metadata blocks (marker and legacy forms)", () => {
+  const MARKER = "⟦openclaw:ctx⟧";
+  const markerBlock = (label: string, json: string) =>
+    `${label} ${MARKER}\n\`\`\`json\n${json}\n\`\`\``;
+  const legacyBlock = (label: string, json: string) =>
+    `${label} (untrusted metadata):\n\`\`\`json\n${json}\n\`\`\``;
+
+  it("extracts sender_id from a marker-form Conversation info block", () => {
+    const text = `${markerBlock("Conversation info:", '{"message_id":"om_abc","sender_id":"ou_xyz"}')}\n\nwhat did I say about postgres?`;
+    expect(extractSenderIdFromText(text)).toBe("ou_xyz");
+  });
+
+  it("extracts sender_id from a marker-form Sender block", () => {
+    const text = `${markerBlock("Sender:", '{"id":"ou_sender_only"}')}\n\nhello`;
+    expect(extractSenderIdFromText(text)).toBe("ou_sender_only");
+  });
+
+  it("still extracts sender_id from the legacy label", () => {
+    const text = `${legacyBlock("Conversation info", '{"sender_id":"ou_legacy"}')}\n\nhello`;
+    expect(extractSenderIdFromText(text)).toBe("ou_legacy");
+  });
+
+  it("strips a marker-form block from retained content", () => {
+    const text = `${markerBlock("Conversation info:", '{"sender_id":"ou_xyz"}')}\n\nremember I use pnpm`;
+    expect(stripMetadataEnvelopes(text)).toBe("remember I use pnpm");
+  });
+
+  it("strips a marker-form block that has no json fence", () => {
+    const text = `Chat history since last reply: ${MARKER}\nalice: hi\nbob: hey\n\nremember I use pnpm`;
+    expect(stripMetadataEnvelopes(text)).toBe("remember I use pnpm");
+  });
+
+  it("strips several marker-form blocks and keeps the user text", () => {
+    const text = [
+      markerBlock("Conversation info:", '{"sender_id":"ou_xyz"}'),
+      "",
+      markerBlock("Location:", '{"city":"Milan"}'),
+      "",
+      "what is the plan?",
+    ].join("\n");
+    expect(stripMetadataEnvelopes(text)).toBe("what is the plan?");
+  });
+
+  it("still strips the legacy label form", () => {
+    const text = `${legacyBlock("Conversation info", '{"sender_id":"ou_legacy"}')}\n\nremember I use pnpm`;
+    expect(stripMetadataEnvelopes(text)).toBe("remember I use pnpm");
+  });
+
+  it("leaves ordinary user text untouched", () => {
+    expect(stripMetadataEnvelopes("just a normal message")).toBe("just a normal message");
+  });
+
+  it("rejects a marker-only prompt as a recall query", () => {
+    const text = markerBlock("Conversation info:", '{"sender_id":"ou_xyz"}');
+    expect(extractRecallQuery(text, undefined)).toBeNull();
+  });
+
+  it("recovers the user query from a marker-wrapped prompt", () => {
+    const text = `${markerBlock("Conversation info:", '{"sender_id":"ou_xyz"}')}\n\nwhat did I say about postgres?`;
+    expect(extractRecallQuery(undefined, text)).toBe("what did I say about postgres?");
   });
 });

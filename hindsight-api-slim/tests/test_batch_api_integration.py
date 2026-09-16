@@ -10,6 +10,7 @@ To run:
 To skip in CI:
     Add @pytest.mark.skip at the test level
 """
+
 import pytest
 import os
 import asyncio
@@ -115,7 +116,9 @@ def integration_config():
     return config
 
 
-@pytest.mark.skip(reason="Real API test - takes minutes and costs money. Run manually with: pytest tests/test_batch_api_integration.py::test_real_openai_batch_api -v -s")
+@pytest.mark.skip(
+    reason="Real API test - takes minutes and costs money. Run manually with: pytest tests/test_batch_api_integration.py::test_real_openai_batch_api -v -s"
+)
 @pytest.mark.integration  # Mark as integration test
 @pytest.mark.slow  # Mark as slow test
 @pytest.mark.asyncio
@@ -157,15 +160,17 @@ async def test_real_openai_batch_api(real_llm_config, test_contents_real, integr
         # Call REAL batch API extraction
         logger.info("\n📤 Submitting batch to OpenAI...")
 
-        facts, chunks, usage = await extract_facts_from_contents_batch_api(
+        extraction = await extract_facts_from_contents_batch_api(
             contents=test_contents_real,
             llm_config=real_llm_config,
-            agent_name="test_agent",
             config=integration_config,
             pool=pool,
             operation_id=None,  # No crash recovery for this test
             schema=schema,
         )
+        facts = extraction.facts
+        chunks = extraction.chunks
+        usage = extraction.usage
 
         test_end_time = time.time()
         total_duration = test_end_time - test_start_time
@@ -174,17 +179,21 @@ async def test_real_openai_batch_api(real_llm_config, test_contents_real, integr
         logger.info("\n" + "=" * 80)
         logger.info("✅ BATCH COMPLETED SUCCESSFULLY")
         logger.info("=" * 80)
-        logger.info(f"Total duration: {total_duration:.1f} seconds ({total_duration/60:.1f} minutes)")
+        logger.info(f"Total duration: {total_duration:.1f} seconds ({total_duration / 60:.1f} minutes)")
         logger.info(f"Facts extracted: {len(facts)}")
         logger.info(f"Chunks processed: {len(chunks)}")
-        logger.info(f"Token usage: {usage.input_tokens} input + {usage.output_tokens} output = {usage.total_tokens} total")
-        logger.info(f"Estimated cost: ${(usage.input_tokens * 0.00015 / 1000 + usage.output_tokens * 0.0006 / 1000):.4f}")
+        logger.info(
+            f"Token usage: {usage.input_tokens} input + {usage.output_tokens} output = {usage.total_tokens} total"
+        )
+        logger.info(
+            f"Estimated cost: ${(usage.input_tokens * 0.00015 / 1000 + usage.output_tokens * 0.0006 / 1000):.4f}"
+        )
         logger.info("=" * 80)
 
         # Log sample facts
         logger.info("\n📋 Sample extracted facts:")
         for i, fact in enumerate(facts[:5]):  # Show first 5 facts
-            logger.info(f"\nFact {i+1}:")
+            logger.info(f"\nFact {i + 1}:")
             logger.info(f"  Type: {fact.fact_type}")
             logger.info(f"  Text: {fact.fact_text[:100]}...")
             logger.info(f"  Entities: {fact.entities}")
@@ -212,11 +221,13 @@ async def test_real_openai_batch_api(real_llm_config, test_contents_real, integr
             f.write(f"Contents: {len(test_contents_real)} items\n")
             f.write(f"Poll Interval: {integration_config.retain_batch_poll_interval_seconds}s\n\n")
             f.write(f"Results:\n")
-            f.write(f"  Total Duration: {total_duration:.1f}s ({total_duration/60:.1f} min)\n")
+            f.write(f"  Total Duration: {total_duration:.1f}s ({total_duration / 60:.1f} min)\n")
             f.write(f"  Facts Extracted: {len(facts)}\n")
             f.write(f"  Chunks Processed: {len(chunks)}\n")
             f.write(f"  Token Usage: {usage.total_tokens} ({usage.input_tokens} in + {usage.output_tokens} out)\n")
-            f.write(f"  Estimated Cost: ${(usage.input_tokens * 0.00015 / 1000 + usage.output_tokens * 0.0006 / 1000):.4f}\n")
+            f.write(
+                f"  Estimated Cost: ${(usage.input_tokens * 0.00015 / 1000 + usage.output_tokens * 0.0006 / 1000):.4f}\n"
+            )
 
         logger.info(f"\n📄 Timing report written to: {report_path}")
 

@@ -19,6 +19,14 @@ Usage (run from hindsight-api/):
     uv run python ../hindsight-dev/benchmarks/perf/recall_perf.py benchmark \\
         --bank-id recall-perf-small --query "database migration" --iterations 5
 
+    # Reproduce the slow temporal recall (PR #1958): generate a bank whose memories
+    # all cluster on one date, then force the temporal arm with a window on that date:
+    uv run python ../hindsight-dev/benchmarks/perf/recall_perf.py generate \\
+        --bank-id recall-perf-temporal --scale very-large --event-date 2025-01-15
+    uv run python ../hindsight-dev/benchmarks/perf/recall_perf.py benchmark \\
+        --bank-id recall-perf-temporal --query "database migration" \\
+        --temporal-date 2025-01-15 --iterations 5
+
     # Benchmark recall (HTTP, against Docker):
     uv run python ../hindsight-dev/benchmarks/perf/recall_perf.py benchmark \\
         --bank-id recall-perf-small --query "database migration" --iterations 5 \\
@@ -31,15 +39,11 @@ Usage (run from hindsight-api/):
 
 import argparse
 import asyncio
-import json
 import os
 import statistics
 import time
+from dataclasses import dataclass
 from typing import Any
-
-# Capture DB URL early before hindsight_api imports trigger dotenv override
-# (config.py uses load_dotenv(override=True) which stomps env vars)
-_EARLY_DB_URL = os.environ.get("HINDSIGHT_API_DATABASE_URL")
 
 from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
@@ -51,7 +55,9 @@ console = Console()
 # Fact corpus
 # ---------------------------------------------------------------------------
 
-# ~200 entity names spanning people, technologies, and places.
+# The head of the entity vocabulary: ~145 names spanning people, technologies,
+# and places. These are the recurring hubs; _build_vocabulary appends a long
+# tail sized to the corpus.
 ENTITIES = [
     # People
     "Alice Chen",
@@ -203,9 +209,9 @@ ENTITIES = [
     "SSO",
 ]
 
-# ~300 fact templates.  Placeholders {E0}..{E4} are filled with entity names
-# drawn from ENTITIES using a Zipf-like distribution so that ~20 entities
-# recur frequently across templates.
+# ~300 fact templates.  Placeholders {E0}..{E4} are filled from the entity
+# vocabulary using a Zipf-like distribution: a few hubs recur across most
+# templates, and the tail grows with the corpus (see _build_vocabulary).
 FACT_TEMPLATES = [
     "{E0} deployed a new version of {E1} to {E2} on {E3}.",
     "{E0} reported a performance regression in {E1} affecting {E2}.",
@@ -463,20 +469,207 @@ SCALES = {
 # ---------------------------------------------------------------------------
 
 
-def _make_entity_selector(seed: int = 42) -> "Callable[[int], list[str]]":
-    """Return a function that draws N entity names with Zipf-like distribution."""
+# The long tail of the entity vocabulary is spelled "<qualifier> <thing>" from two
+# disjoint word lists. Two such names share at most one word, which keeps their
+# pg_trgm similarity near 0.33 — under the 0.5 at which the entity resolver
+# fuzzy-merges names within a retain batch. That threshold is the constraint: a
+# tail built by appending a counter to a stem ("Ingest Worker 0014" /
+# "Ingest Worker 0024") scores 0.73, and the resolver collapses the whole tail
+# back into a handful of entities, which is the flat hub-only graph this
+# vocabulary exists to avoid. test_perf_fixture_shape.py guards that outcome.
+_TAIL_QUALIFIERS = [
+    "Copper",
+    "Basalt",
+    "Amber",
+    "Cobalt",
+    "Quartz",
+    "Saffron",
+    "Jade",
+    "Onyx",
+    "Ivory",
+    "Cedar",
+    "Flint",
+    "Garnet",
+    "Hazel",
+    "Indigo",
+    "Juniper",
+    "Krypton",
+    "Larch",
+    "Marble",
+    "Nickel",
+    "Opal",
+    "Pewter",
+    "Quill",
+    "Rowan",
+    "Sable",
+    "Topaz",
+    "Ultra",
+    "Verdant",
+    "Willow",
+    "Xenon",
+    "Yarrow",
+    "Zephyr",
+    "Alloy",
+    "Bronze",
+    "Cinder",
+    "Dune",
+    "Cinnabar",
+    "Frost",
+    "Granite",
+    "Harbor",
+    "Iron",
+    "Kelp",
+    "Lumen",
+    "Mica",
+    "Nimbus",
+    "Ochre",
+    "Pumice",
+    "Meadow",
+    "Ridge",
+    "Slate",
+    "Thistle",
+    "Vellum",
+    "Walnut",
+    "Cactus",
+    "Birch",
+    "Coral",
+    "Drift",
+    "Elm",
+    "Fjord",
+    "Gypsum",
+    "Heather",
+    "Isle",
+    "Jetty",
+    "Knoll",
+    "Loam",
+    "Moss",
+    "Nettle",
+    "Orchid",
+    "Prairie",
+    "Reef",
+    "Sorrel",
+    "Tundra",
+    "Vine",
+]
+_TAIL_THINGS = [
+    "Falcon",
+    "Kettle",
+    "Lantern",
+    "Anvil",
+    "Beacon",
+    "Compass",
+    "Dagger",
+    "Ferry",
+    "Gauntlet",
+    "Harrow",
+    "Igloo",
+    "Jigsaw",
+    "Kayak",
+    "Ledger",
+    "Mallet",
+    "Nomad",
+    "Obelisk",
+    "Pylon",
+    "Quiver",
+    "Rudder",
+    "Satchel",
+    "Trellis",
+    "Urchin",
+    "Vault",
+    "Wagon",
+    "Yoke",
+    "Zither",
+    "Abacus",
+    "Bellows",
+    "Chisel",
+    "Domino",
+    "Easel",
+    "Fulcrum",
+    "Gasket",
+    "Hammock",
+    "Inkwell",
+    "Jockey",
+    "Kiln",
+    "Lattice",
+    "Mosaic",
+    "Nozzle",
+    "Octave",
+    "Paddle",
+    "Quarto",
+    "Ratchet",
+    "Sundial",
+    "Turret",
+    "Ukulele",
+    "Vise",
+    "Whistle",
+    "Yurt",
+    "Bobbin",
+    "Armoire",
+    "Buckle",
+    "Cistern",
+    "Drawbridge",
+    "Effigy",
+    "Cauldron",
+    "Grommet",
+    "Hearth",
+    "Ingot",
+    "Javelin",
+    "Kestrel",
+    "Lintel",
+    "Mandrel",
+    "Nautilus",
+    "Ottoman",
+    "Placard",
+    "Quorum",
+    "Rivet",
+    "Spindle",
+    "Skillet",
+]
+
+
+def _tail_entity(index: int) -> str:
+    """Deterministic name for the *index*-th long-tail entity."""
+    qualifier = _TAIL_QUALIFIERS[index % len(_TAIL_QUALIFIERS)]
+    thing = _TAIL_THINGS[(index // len(_TAIL_QUALIFIERS)) % len(_TAIL_THINGS)]
+    return f"{qualifier} {thing}"
+
+
+def _build_vocabulary(corpus_size: int) -> list[str]:
+    """Entity vocabulary for a corpus of *corpus_size* facts.
+
+    The vocabulary has to grow with the corpus. Real banks are long-tailed: the
+    bank reported in #3510 held 8,872 entities over 11.5k facts — median degree 2,
+    a third of them mentioned exactly once, top entity on 8.7% of entity links.
+
+    This fixture drew from a fixed 145-name list at every scale, which inverts
+    that shape: degree grows with bank size instead of the entity count growing.
+    At 5k facts it produced 142 entities at a *median* degree of 40 with not one
+    entity mentioned once, so every observation seed reached the entire entity
+    graph. Together with a constant sources-per-observation (see
+    _insert_synthetic_observations) that kept the observation graph arm in a
+    regime real banks are never in, and #3510 went unseen here.
+    """
+    capacity = len(_TAIL_QUALIFIERS) * len(_TAIL_THINGS)
+    tail = min(max(0, corpus_size - len(ENTITIES)), capacity)
+    return [*ENTITIES, *(_tail_entity(i) for i in range(tail))]
+
+
+def _make_entity_selector(corpus_size: int, seed: int = 42) -> "Callable[[int], list[str]]":
+    """Return a function that draws N entity names with a Zipf-like distribution."""
     import random
 
     rng = random.Random(seed)
-    n = len(ENTITIES)
-    # Weights: entity i gets weight 1/(i+1)
-    weights = [1.0 / (i + 1) for i in range(n)]
+    vocabulary = _build_vocabulary(corpus_size)
+    # Weights: entity i gets weight 1/(i+1). Over a vocabulary that scales with
+    # the corpus this gives the shape above — a few hubs carrying ~10% of links
+    # each, and a majority of entities appearing once or twice.
+    weights = [1.0 / (i + 1) for i in range(len(vocabulary))]
 
     def pick(count: int) -> list[str]:
         seen = set()
         result = []
         while len(result) < count:
-            choice = rng.choices(ENTITIES, weights=weights, k=1)[0]
+            choice = rng.choices(vocabulary, weights=weights, k=1)[0]
             if choice not in seen:
                 seen.add(choice)
                 result.append(choice)
@@ -485,20 +678,42 @@ def _make_entity_selector(seed: int = 42) -> "Callable[[int], list[str]]":
     return pick
 
 
-_pick_entities = _make_entity_selector()
+# Sized to the hub head until a suite declares its corpus via
+# configure_entity_vocabulary(), which every bank-populating path does.
+_pick_entities = _make_entity_selector(len(ENTITIES))
 
 
-def _fill_template(template: str) -> str:
+def configure_entity_vocabulary(corpus_size: int, seed: int = 42) -> None:
+    """Size the entity vocabulary to the corpus a suite is about to generate.
+
+    Must be called before building fact contents; a suite that forgets silently
+    gets the 145-name head and the flat entity graph described in
+    _build_vocabulary. Re-seeding here also makes each suite's corpus
+    reproducible regardless of how many facts were generated before it.
+    """
+    global _pick_entities
+    _pick_entities = _make_entity_selector(corpus_size, seed)
+
+
+@dataclass(frozen=True)
+class FilledFact:
+    """A fact rendered from a template, with the entities that went into it."""
+
+    text: str
+    entities: list[str]
+
+
+def _fill_template(template: str) -> FilledFact:
     """Replace {E0}..{E4} placeholders in a template with entity names."""
     placeholders = [f"{{E{i}}}" for i in range(5)]
     needed = sum(1 for p in placeholders if p in template)
     if needed == 0:
-        return template
+        return FilledFact(text=template, entities=[])
     entities = _pick_entities(needed)
     result = template
     for i, entity in enumerate(entities):
         result = result.replace(f"{{E{i}}}", entity)
-    return result
+    return FilledFact(text=result, entities=entities)
 
 
 # ---------------------------------------------------------------------------
@@ -527,11 +742,13 @@ def _make_fact_callback() -> tuple[Callable[[list[dict], str], Any], list[int]]:
             fact_type = _FACT_TYPE_CYCLE[call_counter[0] % len(_FACT_TYPE_CYCLE)]
             call_counter[0] += 1
             template = FACT_TEMPLATES[idx]
-            fact_text = _fill_template(template)
-            # Extract a few entity names from the filled text to populate entities
-            # field (very rough — enough to drive entity link creation)
-            entity_names = [e for e in ENTITIES if e in fact_text][:3]
-            entities = [{"text": e} for e in entity_names]
+            filled = _fill_template(template)
+            fact_text = filled.text
+            # Take the entities the template was actually filled with. Scanning the
+            # vocabulary for substrings (what this did) is O(vocabulary) per fact and
+            # mis-attributes once the vocabulary is large enough to hold names that
+            # are substrings of one another.
+            entities = [{"text": e} for e in filled.entities[:3]]
             return {
                 "facts": [
                     {
@@ -560,7 +777,7 @@ def _build_engine(*, disable_observations: bool = False) -> "Any":
     """Create a MemoryEngine using mock LLM and DB from env."""
     from hindsight_api import MemoryEngine
 
-    db_url = _EARLY_DB_URL or os.getenv("HINDSIGHT_API_DATABASE_URL", "pg0")
+    db_url = os.getenv("HINDSIGHT_API_DATABASE_URL", "pg0")
     if disable_observations:
         os.environ["HINDSIGHT_API_ENABLE_OBSERVATIONS"] = "false"
     engine = MemoryEngine(
@@ -581,14 +798,36 @@ def _build_engine(*, disable_observations: bool = False) -> "Any":
 _BATCH_SIZE = 500
 
 
-async def _insert_synthetic_observations(pool: Any, bank_id: str) -> int:
+async def _insert_synthetic_observations(pool: Any, bank_id: str, sources_per_observation: int = 1) -> int:
     """
     For every non-observation memory unit in *bank_id*, insert one synthetic
     observation with the same text, embedding, and tags, pointing back to that
-    unit as its sole source fact.
+    unit as a source fact.
+
+    ``sources_per_observation`` is the *mean* number of source facts an
+    observation carries; the counts themselves are drawn long-tailed around it
+    (see ``_draw_source_count``).
+
+    Two dimensions of the observation graph arm hang off this. Array *length*
+    drives the scoring cost — ``expand_observations`` unnests
+    ``source_memory_ids`` for every seed and again for every candidate — and
+    consolidation grows those arrays without pruning (#1725), so an aged bank can
+    average ~113 (#3085). Array length also decides how much of the entity graph
+    a handful of seeds reaches, which is what the graph arm's plan turns on
+    (#3510).
+
+    This was a constant, which got both dimensions wrong at once: it erased the
+    tail that #3085 cares about and the low floor that #3510 cares about. A mean
+    of 2 with a long tail reproduces both — most observations carry a single
+    source, while the widest carry several hundred.
+
+    Sources are drawn from a window of neighbouring facts so that source sets
+    *overlap* between observations, which is what makes the `&&` candidate scan
+    and the shared-source scoring do real work.
 
     Returns the number of observations inserted.
     """
+    import random
     import uuid
 
     from hindsight_api.engine.task_backend import fq_table
@@ -609,6 +848,41 @@ async def _insert_synthetic_observations(pool: Any, bank_id: str) -> int:
     if not rows:
         return 0
 
+    fact_ids = [row["id"] for row in rows]
+    mean_sources = max(1, min(sources_per_observation, len(fact_ids)))
+    rng = random.Random(42)  # deterministic fixture
+
+    def _draw_source_count() -> int:
+        """How many source facts this observation carries.
+
+        Pinning every observation to one value was the wrong model. Consolidation
+        grows source_memory_ids one merge at a time, so real counts are
+        long-tailed: the bank in #3510 ran mean 1.7 / p95 4 / max 61, while the
+        aged bank in #3085 averaged 113. A constant erases both ends — with every
+        observation carrying the mean, a handful of seeds reaches almost the whole
+        entity graph, which is a regime real banks are never in and is why this
+        fixture measured 0.45s where a realistically-shaped bank measures 15s.
+
+        Pareto gives the right shape: most observations near 1, a thin tail of
+        wide ones, scaled so the sample mean lands on ``mean_sources``.
+        """
+        if mean_sources == 1:
+            return 1
+        # Pareto(a) has mean a/(a-1); rescale so the draw averages mean_sources.
+        shape = 1.6
+        draw = rng.paretovariate(shape) * mean_sources * (shape - 1) / shape
+        return max(1, min(int(draw), len(fact_ids)))
+
+    def _sources_for(index: int) -> list:
+        """Own fact plus neighbours, so adjacent observations share source ids."""
+        n_sources = _draw_source_count()
+        if n_sources == 1:
+            return [fact_ids[index]]
+        window_size = min(len(fact_ids), n_sources * 3)
+        start = min(max(0, index - window_size // 2), len(fact_ids) - window_size)
+        window = [fid for fid in fact_ids[start : start + window_size] if fid != fact_ids[index]]
+        return [fact_ids[index], *rng.sample(window, min(n_sources - 1, len(window)))]
+
     inserted = 0
     for offset in range(0, len(rows), _BATCH_SIZE):
         batch = rows[offset : offset + _BATCH_SIZE]
@@ -616,11 +890,11 @@ async def _insert_synthetic_observations(pool: Any, bank_id: str) -> int:
             f"""
             INSERT INTO {table} (
                 id, bank_id, text, fact_type, embedding,
-                proof_count, source_memory_ids, history,
+                proof_count, source_memory_ids,
                 tags, event_date, occurred_start, occurred_end, mentioned_at
             ) VALUES (
                 $1, $2, $3, 'observation', $4::vector,
-                1, ARRAY[$5::uuid], '[]'::jsonb,
+                1, $5::uuid[],
                 $6, $7, $8, $9, $10
             )
             ON CONFLICT DO NOTHING
@@ -631,14 +905,14 @@ async def _insert_synthetic_observations(pool: Any, bank_id: str) -> int:
                     bank_id,  # bank_id
                     row["text"],
                     row["embedding"],
-                    row["id"],  # source fact id
+                    _sources_for(offset + i),  # source facts
                     row["tags"] or [],
                     row["event_date"],
                     row["occurred_start"],
                     row["occurred_end"],
                     row["mentioned_at"],
                 )
-                for row in batch
+                for i, row in enumerate(batch)
             ],
         )
         inserted += len(batch)
@@ -699,8 +973,22 @@ async def _wait_for_operation(pool: Any, operation_id: str, timeout: float = 864
     raise TimeoutError(f"Operation {operation_id} did not complete within {timeout}s")
 
 
-async def cmd_generate(bank_id: str, scale: str, workers: int = 16, with_observations: bool = False) -> None:
-    """Submit all content as a single async batch and process with an in-process worker."""
+async def cmd_generate(
+    bank_id: str,
+    scale: str,
+    workers: int = 16,
+    with_observations: bool = False,
+    event_date: str | None = None,
+) -> None:
+    """Submit all content as a single async batch and process with an in-process worker.
+
+    When *event_date* (YYYY-MM-DD) is given, every content item is stamped with that
+    same event_date, so all memories cluster into one narrow time range. This mirrors
+    the production pathology where a retain pipeline stamps a large batch with a single
+    date — making any temporal recall that intersects the dense zone match (near-)all
+    rows. Without it, retain defaults event_date to the wall-clock time of generation,
+    which still clusters but only loosely (spread across the generation run).
+    """
     from hindsight_api.models import RequestContext
     from hindsight_api.worker.poller import WorkerPoller
 
@@ -708,7 +996,10 @@ async def cmd_generate(bank_id: str, scale: str, workers: int = 16, with_observa
     console.print(
         f"\n[bold cyan]Generate[/bold cyan] bank=[bold]{bank_id}[/bold] scale=[bold]{scale}[/bold] workers=[bold]{workers}[/bold]"
     )
-    console.print(f"  Total items : {total_items:,}\n")
+    console.print(f"  Total items : {total_items:,}")
+    if event_date:
+        console.print(f"  Event date  : {event_date}  (all memories stamped to this date — dense temporal zone)")
+    console.print("")
 
     engine = _build_engine(disable_observations=True)
     await engine.initialize()
@@ -719,7 +1010,15 @@ async def cmd_generate(bank_id: str, scale: str, workers: int = 16, with_observa
     engine._llm_config.set_response_callback(callback)
 
     # Build all content items upfront
-    all_contents = [{"content": _fill_template(FACT_TEMPLATES[i % len(FACT_TEMPLATES)])} for i in range(total_items)]
+    configure_entity_vocabulary(total_items)
+    all_contents: list[dict[str, Any]] = [
+        {"content": _fill_template(FACT_TEMPLATES[i % len(FACT_TEMPLATES)]).text} for i in range(total_items)
+    ]
+    if event_date:
+        # Stamp every item with the same event_date → mentioned_at clusters at one
+        # date, reproducing the dense/near-uniform date metadata regime.
+        for item in all_contents:
+            item["event_date"] = event_date
 
     # Submit the whole batch as a single async operation (auto-splits by token budget)
     console.print(f"  Submitting {total_items:,} items as async batch…")
@@ -857,6 +1156,23 @@ async def recall_via_http(
 # ---------------------------------------------------------------------------
 
 
+def _augment_query_with_temporal(query: str, temporal_date: str) -> str:
+    """Append an absolute date phrase so the recall path's temporal arm fires.
+
+    The query analyzer (dateparser) extracts a 1-day window from a phrase like
+    "on January 15, 2025". When the bank's memories all cluster in that window
+    (see ``generate --event-date``), the temporal entry-point query's date filter
+    matches (near-)all rows — the exact regime that degrades to a disk-spilling
+    sort in production (see PR #1958).
+    """
+    from datetime import datetime
+
+    parsed = datetime.strptime(temporal_date, "%Y-%m-%d")
+    # "%B %d, %Y" → e.g. "January 15, 2025" (strip a leading zero from the day).
+    phrase = parsed.strftime("%B %d, %Y").replace(" 0", " ")
+    return f"{query} on {phrase}"
+
+
 async def cmd_benchmark(
     bank_id: str,
     query: str,
@@ -865,17 +1181,24 @@ async def cmd_benchmark(
     reranker: str,
     fact_types: list[str] | None = None,
     api_url: str | None = None,
+    temporal_date: str | None = None,
 ) -> None:
     """Run recall in parallel and report p50/p95/p99 timings with per-step breakdown."""
+
+    effective_query = _augment_query_with_temporal(query, temporal_date) if temporal_date else query
 
     mode = f"HTTP ({api_url})" if api_url else "in-process"
     console.print(f"\n[bold cyan]Benchmark[/bold cyan] bank=[bold]{bank_id}[/bold]")
     console.print(f"  Mode        : {mode}")
-    console.print(f"  Query       : {query}")
+    console.print(f"  Query       : {effective_query}")
+    if temporal_date:
+        console.print(f"  Temporal    : ENABLED — forcing temporal arm with a 1-day window on {temporal_date}")
     console.print(f"  Iterations  : {iterations}  (total recall calls)")
     console.print(f"  Concurrency : {concurrency}")
     console.print(f"  Reranker    : {reranker}")
     console.print(f"  Fact types  : {', '.join(fact_types) if fact_types else 'all'}\n")
+
+    query = effective_query
 
     durations: list[float] = []
     all_phase_timings: dict[str, list[float]] = {}
@@ -1099,6 +1422,14 @@ def main() -> None:
         default=False,
         help="After retain, insert one synthetic observation per fact (same text, same embedding)",
     )
+    gen.add_argument(
+        "--event-date",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Stamp every memory with this event_date so all memories share one narrow time "
+        "range (dense temporal zone). Pair with `benchmark --temporal-date` to reproduce the "
+        "slow temporal recall from PR #1958.",
+    )
 
     # benchmark
     bm = sub.add_parser("benchmark", help="Run recall and report latency")
@@ -1127,6 +1458,15 @@ def main() -> None:
         help="HTTP mode: send recall requests to this Hindsight API URL (e.g., http://localhost:8080). "
         "If omitted, uses in-process MemoryEngine.",
     )
+    bm.add_argument(
+        "--temporal-date",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Force the temporal retrieval arm by appending a 1-day window on this date to the query "
+        "(e.g. 'database migration on January 15, 2025'). Use the same date passed to "
+        "`generate --event-date` so the date filter matches (near-)all rows — the regime that "
+        "causes the 30s+ temporal recall in PR #1958.",
+    )
 
     # stats
     st = sub.add_parser("stats", help="Print memory/entity/link counts for banks")
@@ -1140,7 +1480,13 @@ def main() -> None:
 
     if args.cmd == "generate":
         asyncio.run(
-            cmd_generate(args.bank_id, args.scale, workers=args.workers, with_observations=args.with_observations)
+            cmd_generate(
+                args.bank_id,
+                args.scale,
+                workers=args.workers,
+                with_observations=args.with_observations,
+                event_date=args.event_date,
+            )
         )
     elif args.cmd == "benchmark":
         asyncio.run(
@@ -1152,6 +1498,7 @@ def main() -> None:
                 args.reranker,
                 args.fact_types,
                 api_url=args.api_url,
+                temporal_date=args.temporal_date,
             )
         )
     elif args.cmd == "stats":

@@ -7,13 +7,21 @@ from fastapi import APIRouter
 from fastapi.testclient import TestClient
 
 from hindsight_api.extensions import (
-    ApiKeyTenantExtension,
     AuthenticationError,
+    BankReadContext,
+    BankReadOperation,
+    BankWriteContext,
+    BankWriteOperation,
+    # Consolidation operation
+    ConsolidateContext,
+    ConsolidateResult,
+    CreateBankContext,
     Extension,
     HttpExtension,
     OperationValidationError,
     OperationValidatorExtension,
     PrecheckContext,
+    PrecheckOperation,
     RecallContext,
     RecallResult,
     ReflectContext,
@@ -21,14 +29,10 @@ from hindsight_api.extensions import (
     RequestContext,
     RetainContext,
     RetainResult,
-    TenantContext,
-    TenantExtension,
     ValidationResult,
     load_extension,
-    # Consolidation operation
-    ConsolidateContext,
-    ConsolidateResult,
 )
+from hindsight_api.extensions.builtin.tenant import ApiKeyTenantExtension
 
 
 class TestExtensionLoader:
@@ -68,6 +72,36 @@ class TestExtensionLoader:
         await ext.on_shutdown()
         assert ext.stopped
 
+    def test_operation_enums_remain_string_compatible(self):
+        """Operation enums centralize names without breaking string comparisons."""
+        request_context = RequestContext(tenant_id="tenant-1")
+
+        precheck_ctx = PrecheckContext(
+            bank_id="bank-1",
+            operation=PrecheckOperation.RETAIN,
+            request_context=request_context,
+        )
+        read_ctx = BankReadContext(
+            bank_id="bank-1",
+            operation=BankReadOperation.GET_BANK_STATS,
+            request_context=request_context,
+        )
+        write_ctx = BankWriteContext(
+            bank_id="bank-1",
+            operation=BankWriteOperation.UPDATE_BANK_CONFIG,
+            request_context=request_context,
+        )
+
+        assert precheck_ctx.operation is PrecheckOperation.RETAIN
+        assert read_ctx.operation is BankReadOperation.GET_BANK_STATS
+        assert write_ctx.operation is BankWriteOperation.UPDATE_BANK_CONFIG
+        assert precheck_ctx.operation == "retain"
+        assert read_ctx.operation == "get_bank_stats"
+        assert write_ctx.operation == "update_bank_config"
+        assert isinstance(precheck_ctx.operation, str)
+        assert isinstance(read_ctx.operation, str)
+        assert isinstance(write_ctx.operation, str)
+
 
 class LifecycleTestExtension(Extension):
     """Test extension for config and lifecycle tests."""
@@ -101,25 +135,19 @@ class RateLimitingValidator(OperationValidatorExtension):
     async def validate_retain(self, ctx: RetainContext) -> ValidationResult:
         self.retain_counts[ctx.bank_id] += 1
         if self.retain_counts[ctx.bank_id] > self.max_attempts:
-            return ValidationResult.reject(
-                f"Retain limit exceeded for bank {ctx.bank_id}"
-            )
+            return ValidationResult.reject(f"Retain limit exceeded for bank {ctx.bank_id}")
         return ValidationResult.accept()
 
     async def validate_recall(self, ctx: RecallContext) -> ValidationResult:
         self.recall_counts[ctx.bank_id] += 1
         if self.recall_counts[ctx.bank_id] > self.max_attempts:
-            return ValidationResult.reject(
-                f"Recall limit exceeded for bank {ctx.bank_id}"
-            )
+            return ValidationResult.reject(f"Recall limit exceeded for bank {ctx.bank_id}")
         return ValidationResult.accept()
 
     async def validate_reflect(self, ctx: ReflectContext) -> ValidationResult:
         self.reflect_counts[ctx.bank_id] += 1
         if self.reflect_counts[ctx.bank_id] > self.max_attempts:
-            return ValidationResult.reject(
-                f"Reflect limit exceeded for bank {ctx.bank_id}"
-            )
+            return ValidationResult.reject(f"Reflect limit exceeded for bank {ctx.bank_id}")
         return ValidationResult.accept()
 
 
@@ -173,6 +201,30 @@ class TrackingValidator(OperationValidatorExtension):
 
     async def on_consolidate_complete(self, result: ConsolidateResult) -> None:
         self.post_consolidate_calls.append(result)
+
+
+class CreateBankRejectingValidator(OperationValidatorExtension):
+    """Validator that records create-bank checks and can reject them."""
+
+    def __init__(self, *, reject: bool = True):
+        super().__init__({})
+        self.reject = reject
+        self.create_bank_calls: list[CreateBankContext] = []
+
+    async def validate_retain(self, ctx: RetainContext) -> ValidationResult:
+        return ValidationResult.accept()
+
+    async def validate_recall(self, ctx: RecallContext) -> ValidationResult:
+        return ValidationResult.accept()
+
+    async def validate_reflect(self, ctx: ReflectContext) -> ValidationResult:
+        return ValidationResult.accept()
+
+    async def validate_create_bank(self, ctx: CreateBankContext) -> ValidationResult:
+        self.create_bank_calls.append(ctx)
+        if self.reject:
+            return ValidationResult.reject("bank creation not allowed", status_code=402)
+        return ValidationResult.accept()
 
 
 class TestMemoryEngineValidation:
@@ -270,6 +322,109 @@ class TestMemoryEngineValidation:
 
         assert "limit exceeded" in str(exc_info.value).lower()
 
+    @pytest.mark.asyncio
+    async def test_retain_validates_create_bank_for_missing_bank(self, memory):
+        """Retain may lazily create a bank, so missing-bank retain validates create_bank."""
+        bank_id = "test-retain-create-bank-validation"
+        ctx = RequestContext()
+        validator = CreateBankRejectingValidator()
+        memory._operation_validator = validator
+
+        with pytest.raises(OperationValidationError) as exc_info:
+            await memory.retain_batch_async(
+                bank_id=bank_id,
+                contents=[{"content": "Should not create a bank"}],
+                request_context=ctx,
+            )
+
+        assert "bank creation not allowed" in str(exc_info.value)
+        assert len(validator.create_bank_calls) == 1
+        assert validator.create_bank_calls[0].bank_id == bank_id
+        assert await memory.get_bank_profile(bank_id, request_context=ctx, create_if_missing=False) is None
+
+    @pytest.mark.asyncio
+    async def test_async_retain_validates_create_bank_for_missing_bank(self, memory):
+        """Async retain validates create_bank before creating its parent operation."""
+        bank_id = "test-async-retain-create-bank-validation"
+        ctx = RequestContext()
+        validator = CreateBankRejectingValidator()
+        memory._operation_validator = validator
+
+        with pytest.raises(OperationValidationError) as exc_info:
+            await memory.submit_async_retain(
+                bank_id=bank_id,
+                contents=[{"content": "Should not create a bank"}],
+                request_context=ctx,
+            )
+
+        assert "bank creation not allowed" in str(exc_info.value)
+        assert len(validator.create_bank_calls) == 1
+        assert validator.create_bank_calls[0].bank_id == bank_id
+        assert await memory.get_bank_profile(bank_id, request_context=ctx, create_if_missing=False) is None
+
+    @pytest.mark.asyncio
+    async def test_create_bank_validation_skips_existing_bank(self, memory):
+        """Existing banks do not require create_bank validation."""
+        bank_id = "test-create-bank-existing"
+        ctx = RequestContext()
+        await memory.get_bank_profile(bank_id, request_context=ctx)
+
+        validator = CreateBankRejectingValidator()
+        memory._operation_validator = validator
+
+        created = await memory._ensure_bank_exists(bank_id, ctx)
+
+        assert created is False
+        assert validator.create_bank_calls == []
+
+    @pytest.mark.asyncio
+    async def test_get_bank_profile_validates_create_bank_for_missing_bank(self, memory):
+        """The default auto-create profile path validates create_bank."""
+        bank_id = "test-profile-create-bank-validation"
+        ctx = RequestContext()
+        validator = CreateBankRejectingValidator()
+        memory._operation_validator = validator
+
+        with pytest.raises(OperationValidationError) as exc_info:
+            await memory.get_bank_profile(bank_id, request_context=ctx)
+
+        assert "bank creation not allowed" in str(exc_info.value)
+        assert len(validator.create_bank_calls) == 1
+        assert validator.create_bank_calls[0].bank_id == bank_id
+        assert await memory.get_bank_profile(bank_id, request_context=ctx, create_if_missing=False) is None
+
+    @pytest.mark.asyncio
+    async def test_http_create_or_update_validates_create_bank(self, api_client, memory):
+        bank_id = "test-http-put-create-bank-validation"
+        validator = CreateBankRejectingValidator()
+        memory._operation_validator = validator
+
+        resp = await api_client.put(
+            f"/v1/default/banks/{bank_id}",
+            json={"name": "Blocked Bank"},
+        )
+
+        assert resp.status_code == 402
+        assert resp.json()["detail"] == "bank creation not allowed"
+        assert len(validator.create_bank_calls) == 1
+        assert validator.create_bank_calls[0].bank_id == bank_id
+
+    @pytest.mark.asyncio
+    async def test_http_template_import_validates_create_bank(self, api_client, memory):
+        bank_id = "test-http-import-create-bank-validation"
+        validator = CreateBankRejectingValidator()
+        memory._operation_validator = validator
+
+        resp = await api_client.post(
+            f"/v1/default/banks/{bank_id}/import",
+            json={"version": "1"},
+        )
+
+        assert resp.status_code == 402
+        assert resp.json()["detail"] == "bank creation not allowed"
+        assert len(validator.create_bank_calls) == 1
+        assert validator.create_bank_calls[0].bank_id == bank_id
+
 
 @pytest.fixture
 def memory_with_validator(memory):
@@ -362,6 +517,7 @@ class TestOperationHooksParameters:
     async def test_recall_pre_hook_receives_all_parameters(self, memory_with_tracking_validator):
         """Pre-recall hook receives all user-provided parameters."""
         from datetime import datetime, timezone
+
         from hindsight_api.engine.memory_engine import Budget
 
         memory, validator = memory_with_tracking_validator
@@ -579,9 +735,7 @@ class TestMemoryEngineTenantAuth:
     """Tests for tenant authentication in MemoryEngine."""
 
     @pytest.mark.asyncio
-    async def test_retain_requires_tenant_request_when_extension_configured(
-        self, memory_with_tenant
-    ):
+    async def test_retain_requires_tenant_request_when_extension_configured(self, memory_with_tenant):
         """Retain fails without RequestContext when tenant extension is configured."""
         memory = memory_with_tenant
 
@@ -621,9 +775,7 @@ class TestMemoryEngineTenantAuth:
         assert "Invalid API key" in str(exc_info.value)
 
     @pytest.mark.asyncio
-    async def test_recall_requires_tenant_request_when_extension_configured(
-        self, memory_with_tenant
-    ):
+    async def test_recall_requires_tenant_request_when_extension_configured(self, memory_with_tenant):
         """Recall fails without RequestContext when tenant extension is configured."""
         memory = memory_with_tenant
 
@@ -633,6 +785,30 @@ class TestMemoryEngineTenantAuth:
                 query="test query",
                 fact_type=["world"],
                 request_context=None,
+            )
+
+    @pytest.mark.asyncio
+    async def test_list_audit_logs_fails_with_invalid_api_key(self, memory_with_tenant):
+        """Audit log listing goes through tenant auth like other ops."""
+        memory = memory_with_tenant
+
+        with pytest.raises(AuthenticationError) as exc_info:
+            await memory.list_audit_logs(
+                "test-bank",
+                request_context=RequestContext(api_key="wrong-key"),
+            )
+
+        assert "Invalid API key" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_audit_log_stats_fails_with_invalid_api_key(self, memory_with_tenant):
+        """Audit log stats goes through tenant auth like other ops."""
+        memory = memory_with_tenant
+
+        with pytest.raises(AuthenticationError):
+            await memory.audit_log_stats(
+                "test-bank",
+                request_context=RequestContext(api_key="wrong-key"),
             )
 
     @pytest.mark.asyncio
@@ -837,8 +1013,7 @@ class RecordingPrecheckValidator(OperationValidatorExtension):
     instantiable; the tests here only exercise precheck.
     """
 
-    def __init__(self, *, reject: bool = False, status_code: int = 402,
-                 reason: str = "rejected by precheck") -> None:
+    def __init__(self, *, reject: bool = False, status_code: int = 402, reason: str = "rejected by precheck") -> None:
         super().__init__(config={})
         self.reject = reject
         self.status_code = status_code
@@ -869,7 +1044,7 @@ class TestPrecheckDefault:
         validator = RecordingPrecheckValidator(reject=False)
         # Bypass our override by calling the base implementation directly.
         ctx = PrecheckContext(
-            operation="retain",
+            operation=PrecheckOperation.RETAIN,
             bank_id="bank-x",
             request_context=RequestContext(),
         )
@@ -898,10 +1073,10 @@ class TestPrecheckHttpWiring:
     def _build_app(validator):
         """Mirror the precheck wiring from ``hindsight_api.api.http`` in a
         standalone FastAPI app."""
-        from fastapi import Depends, FastAPI, HTTPException
+        from fastapi import Depends, FastAPI, HTTPException, Request
         from pydantic import BaseModel, model_validator
 
-        from hindsight_api.extensions import PrecheckContext
+        from hindsight_api.extensions import PrecheckContext, PrecheckOperation
         from hindsight_api.models import RequestContext
 
         body_parses: list[str] = []
@@ -936,15 +1111,26 @@ class TestPrecheckHttpWiring:
         async def _request_context() -> RequestContext:
             return RequestContext()
 
-        def _precheck_for(operation: str):
+        def _precheck_for(operation: PrecheckOperation):
             async def _dep(
                 bank_id: str,
+                request: Request,
                 request_context: RequestContext = Depends(_request_context),
             ) -> None:
+                cl_header = request.headers.get("content-length")
+                content_length: int | None = None
+                if cl_header is not None:
+                    try:
+                        parsed = int(cl_header)
+                    except ValueError:
+                        parsed = -1
+                    if parsed >= 0:
+                        content_length = parsed
                 ctx = PrecheckContext(
                     operation=operation,
                     bank_id=bank_id,
                     request_context=request_context,
+                    content_length=content_length,
                 )
                 result = await validator.precheck(ctx)
                 if not result.allowed:
@@ -961,7 +1147,7 @@ class TestPrecheckHttpWiring:
         async def retain(
             bank_id: str,
             body: _RetainBody,
-            _: None = Depends(_precheck_for("retain")),
+            _: None = Depends(_precheck_for(PrecheckOperation.RETAIN)),
         ):
             return {"ok": True, "bank_id": bank_id, "n": len(body.items)}
 
@@ -969,7 +1155,7 @@ class TestPrecheckHttpWiring:
         async def recall(
             bank_id: str,
             body: _RecallBody,
-            _: None = Depends(_precheck_for("recall")),
+            _: None = Depends(_precheck_for(PrecheckOperation.RECALL)),
         ):
             return {"ok": True}
 
@@ -977,7 +1163,7 @@ class TestPrecheckHttpWiring:
         async def reflect(
             bank_id: str,
             body: _ReflectBody,
-            _: None = Depends(_precheck_for("reflect")),
+            _: None = Depends(_precheck_for(PrecheckOperation.REFLECT)),
         ):
             return {"ok": True}
 
@@ -1003,9 +1189,7 @@ class TestPrecheckHttpWiring:
         assert body_parses == ["retain"]
 
     def test_precheck_rejection_returns_status_and_reason(self):
-        validator = RecordingPrecheckValidator(
-            reject=True, status_code=402, reason="Insufficient credits"
-        )
+        validator = RecordingPrecheckValidator(reject=True, status_code=402, reason="Insufficient credits")
         app, _ = self._build_app(validator)
         client = TestClient(app)
 
@@ -1021,9 +1205,7 @@ class TestPrecheckHttpWiring:
         deserialises the body. We send an oversized body and verify the
         body-parse counter never incremented.
         """
-        validator = RecordingPrecheckValidator(
-            reject=True, status_code=402, reason="rejected by precheck"
-        )
+        validator = RecordingPrecheckValidator(reject=True, status_code=402, reason="rejected by precheck")
         app, body_parses = self._build_app(validator)
         client = TestClient(app)
 
@@ -1039,9 +1221,7 @@ class TestPrecheckHttpWiring:
         )
 
     def test_precheck_rejection_skips_body_parse_for_recall(self):
-        validator = RecordingPrecheckValidator(
-            reject=True, status_code=402, reason="rejected"
-        )
+        validator = RecordingPrecheckValidator(reject=True, status_code=402, reason="rejected")
         app, body_parses = self._build_app(validator)
         client = TestClient(app)
 
@@ -1054,9 +1234,7 @@ class TestPrecheckHttpWiring:
         assert body_parses == []
 
     def test_precheck_rejection_skips_body_parse_for_reflect(self):
-        validator = RecordingPrecheckValidator(
-            reject=True, status_code=402, reason="rejected"
-        )
+        validator = RecordingPrecheckValidator(reject=True, status_code=402, reason="rejected")
         app, body_parses = self._build_app(validator)
         client = TestClient(app)
 
@@ -1076,3 +1254,86 @@ class TestPrecheckHttpWiring:
         resp = client.get("/v1/default/banks/precheck-bank/memories/list")
         assert resp.status_code == 200
         assert len(validator.precheck_calls) == 0
+
+    def test_precheck_context_carries_content_length(self):
+        """Content-Length header is exposed to the precheck so a validator
+        can make size-aware decisions (e.g. upper-bound cost estimate)
+        before the body is deserialised."""
+        validator = RecordingPrecheckValidator(reject=False)
+        app, _ = self._build_app(validator)
+        client = TestClient(app)
+
+        # Body must contain at least 500 'x' bytes; check the surfaced
+        # Content-Length is within a tight band around that floor (allows
+        # for JSON envelope + httpx's serialisation choices without
+        # depending on exact byte counts).
+        payload = {"items": [{"content": "x" * 500}]}
+        resp = client.post(
+            "/v1/default/banks/precheck-bank/memories",
+            json=payload,
+        )
+        assert resp.status_code == 200
+        assert len(validator.precheck_calls) == 1
+        ctx = validator.precheck_calls[0]
+        assert ctx.content_length is not None
+        assert 500 <= ctx.content_length <= 600
+
+    def test_precheck_context_content_length_zero_is_not_none(self):
+        """An empty POST body has Content-Length: 0. That should surface
+        as the int 0, not None — None means 'unknown', 0 means 'known to
+        be empty'."""
+        validator = RecordingPrecheckValidator(reject=False)
+        app, _ = self._build_app(validator)
+        client = TestClient(app)
+
+        # Empty body fails Pydantic parse (422), but precheck runs first
+        # and records the Content-Length.
+        client.post(
+            "/v1/default/banks/precheck-bank/memories",
+            content=b"",
+            headers={"content-type": "application/json"},
+        )
+        assert len(validator.precheck_calls) >= 1
+        ctx = validator.precheck_calls[-1]
+        assert ctx.content_length == 0
+
+    @pytest.mark.asyncio
+    async def test_precheck_context_content_length_none_when_header_missing(self):
+        """When the Content-Length header isn't set (e.g. chunked transfer
+        encoding) the validator sees None, not a crash and not a default 0."""
+        from starlette.requests import Request as _StarletteRequest
+
+        from hindsight_api.extensions import PrecheckContext
+        from hindsight_api.models import RequestContext
+
+        validator = RecordingPrecheckValidator(reject=False)
+
+        # Replicate the wiring's parse step inline so the test exercises
+        # the same code-path semantics introduced in
+        # ``hindsight_api.api.http._precheck_dep``.
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/default/banks/bank-x/memories",
+            "headers": [],  # no content-length
+            "query_string": b"",
+        }
+        req = _StarletteRequest(scope)
+        cl_header = req.headers.get("content-length")
+        content_length: int | None = None
+        if cl_header is not None:
+            try:
+                parsed = int(cl_header)
+            except ValueError:
+                parsed = -1
+            if parsed >= 0:
+                content_length = parsed
+
+        ctx = PrecheckContext(
+            operation=PrecheckOperation.RETAIN,
+            bank_id="bank-x",
+            request_context=RequestContext(),
+            content_length=content_length,
+        )
+        await validator.precheck(ctx)
+        assert validator.precheck_calls[-1].content_length is None

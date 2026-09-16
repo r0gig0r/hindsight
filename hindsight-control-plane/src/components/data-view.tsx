@@ -1,8 +1,15 @@
 "use client";
 
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import { useTranslations } from "next-intl";
 import { client } from "@/lib/api";
 import { useBank } from "@/lib/bank-context";
+import {
+  AppliedMemoryFilters,
+  hasActiveMemoryFilters,
+  shouldShowEmptyBankState,
+} from "@/lib/memory-filters";
+import { EntityChip, TagChip } from "@/components/ui/facet-chip";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -15,14 +22,14 @@ import {
   ChevronsRight,
   Settings2,
   Eye,
-  EyeOff,
   RefreshCw,
   CheckCircle,
   Clock,
-  Network,
   List,
   Search,
+  Layers,
 } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import {
   Table,
   TableBody,
@@ -31,8 +38,6 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { Label } from "@/components/ui/label";
-import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import {
   Select,
@@ -41,15 +46,36 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { MemoryDetailPanel } from "./memory-detail-panel";
 import { MemoryDetailModal } from "./memory-detail-modal";
-import { Graph2D, convertHindsightGraphData, GraphNode } from "./graph-2d";
+import { convertHindsightGraphData, GraphNode } from "./graph-data";
 import { Constellation } from "./constellation";
 import { TagFilterInput } from "./tag-filter-input";
+import { ObservationScopeFilter, ObservationScope } from "./observation-scope-filter";
 import { ScatterChart, Plus, FileText } from "lucide-react";
 
 type FactType = "world" | "experience" | "observation";
-type ViewMode = "graph" | "table" | "timeline" | "constellation";
+type ViewMode = "table" | "timeline" | "constellation";
+
+// Categorical palette for coloring observation scopes (exact tag sets) when
+// "Group by scope" clusters the constellation. Distinct, reasonably separable hues.
+const SCOPE_PALETTE = [
+  "#0074d9",
+  "#e11d48",
+  "#16a34a",
+  "#f59e0b",
+  "#8b5cf6",
+  "#06b6d4",
+  "#ec4899",
+  "#65a30d",
+  "#f97316",
+  "#6366f1",
+];
+
+// Stable key for a scope = its tag set, order-normalized (matches the backend's
+// normalized scope enumeration so colors are consistent regardless of tag order).
+function scopeKeyOf(tags: string[] | undefined): string {
+  return JSON.stringify([...(tags || [])].sort());
+}
 
 interface DataViewProps {
   factType: FactType;
@@ -66,6 +92,8 @@ export function DataView({
   compact = false,
   onExpandToggle,
 }: DataViewProps) {
+  const t = useTranslations("dataView");
+  const tAddDoc = useTranslations("addDocument");
   const { currentBank } = useBank();
   const [viewMode, setViewMode] = useState<ViewMode>("constellation");
   const [compactMode, setCompactMode] = useState(compact);
@@ -73,9 +101,23 @@ export function DataView({
   const [loading, setLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [tagFilters, setTagFilters] = useState<string[]>([]);
+  // The filters that actually produced the `data` currently on screen. This
+  // deliberately lags the live filter state: `searchQuery` only reaches the
+  // server on Enter, so deciding "is this bank empty?" from what the user has
+  // *typed* makes backspacing a zero-result search swap the results for the
+  // "no memories yet" screen — which unmounts the search box along with it
+  // (issue #3670).
+  const [appliedFilters, setAppliedFilters] = useState<AppliedMemoryFilters>({ q: "", tags: [] });
+  // Observation scope filtering: the distinct scopes available, and the selected
+  // one. `null` = all scopes; `[]` = the global (untagged) scope; otherwise an
+  // exact tag set. Mutually exclusive with the free-form tag filter above.
+  const [scopes, setScopes] = useState<ObservationScope[]>([]);
+  const [selectedScope, setSelectedScope] = useState<string[] | null>(null);
   const [currentPage, setCurrentPage] = useState(1);
-  const [selectedGraphNode, setSelectedGraphNode] = useState<any>(null);
   const [modalMemoryId, setModalMemoryId] = useState<string | null>(null);
+  // Table view: toggle between live facts (graph-fed) and invalidated facts (archive).
+  const [showInvalidated, setShowInvalidated] = useState(false);
+  const [invalidatedRows, setInvalidatedRows] = useState<any[]>([]);
   const itemsPerPage = 100;
 
   // Fetch limit state - how many memories to load from the API
@@ -84,11 +126,13 @@ export function DataView({
   // Which timestamp drives the constellation recency color
   type RecencyBasis = "mentioned_at" | "occurred_start" | "occurred_end";
   const RECENCY_BASIS_LABEL: Record<RecencyBasis, string> = {
-    mentioned_at: "mentioned",
-    occurred_start: "occurred (start)",
-    occurred_end: "occurred (end)",
+    mentioned_at: t("recencyBasisMentioned"),
+    occurred_start: t("recencyBasisOccurredStart"),
+    occurred_end: t("recencyBasisOccurredEnd"),
   };
   const [recencyBasis, setRecencyBasis] = useState<RecencyBasis>("mentioned_at");
+  // Constellation: group observations into per-scope clusters (with colored blobs).
+  const [groupByScope, setGroupByScope] = useState(false);
 
   // Consolidation status for mental models
   const [consolidationStatus, setConsolidationStatus] = useState<{
@@ -96,10 +140,7 @@ export function DataView({
     last_consolidated_at: string | null;
   } | null>(null);
 
-  // Graph controls state
-  const [showLabels, setShowLabels] = useState(true);
-  const [maxNodes, setMaxNodes] = useState<number | undefined>(undefined);
-  const [showControlPanel, setShowControlPanel] = useState(true);
+  // Constellation controls state
   const [visibleLinkTypes, setVisibleLinkTypes] = useState<Set<string>>(
     new Set(["semantic", "temporal", "entity", "causal"])
   );
@@ -116,21 +157,18 @@ export function DataView({
     });
   };
 
-  // Esc key handler to deselect graph node
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && selectedGraphNode) {
-        setSelectedGraphNode(null);
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [selectedGraphNode]);
-
-  const loadData = async (limit?: number, q?: string, tags?: string[]) => {
+  // `silent` skips the loading spinner — used by the background consolidation
+  // poll so the view refreshes in place without flashing.
+  const loadData = async (
+    limit?: number,
+    q?: string,
+    tags?: string[],
+    tagsMatch?: string,
+    silent = false
+  ) => {
     if (!currentBank) return;
 
-    setLoading(true);
+    if (!silent) setLoading(true);
     try {
       const graphData: any = await client.getGraph({
         bank_id: currentBank,
@@ -138,10 +176,12 @@ export function DataView({
         limit: limit ?? fetchLimit,
         q,
         tags,
+        tags_match: tagsMatch,
         document_id: documentId,
         chunk_id: chunkId,
       });
       setData(graphData);
+      setAppliedFilters({ q: q ?? "", tags: tags ?? [], tagsMatch });
 
       // Fetch consolidation status for observations
       if (factType === "observation") {
@@ -154,14 +194,40 @@ export function DataView({
     } catch (error) {
       // Error toast is shown automatically by the API client interceptor
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
-  // Table rows are already filtered server-side
+  // Invalidated facts live in a separate archive, not the graph — fetch them via list.
+  const loadInvalidated = useCallback(async () => {
+    if (!currentBank) return;
+    try {
+      const resp: any = await client.listMemories(currentBank, {
+        state: "invalidated",
+        type: factType,
+        limit: fetchLimit,
+      });
+      setInvalidatedRows(resp?.items ?? []);
+    } catch {
+      setInvalidatedRows([]);
+    }
+  }, [currentBank, factType, fetchLimit]);
+
+  useEffect(() => {
+    if (showInvalidated && viewMode === "table") {
+      loadInvalidated();
+    }
+  }, [showInvalidated, viewMode, loadInvalidated]);
+
+  // Table rows: live rows are graph-fed (filtered server-side); invalidated rows
+  // come from the archive via list.
   const filteredTableRows = useMemo(() => {
+    if (showInvalidated) return invalidatedRows;
     return data?.table_rows ?? [];
-  }, [data]);
+  }, [data, showInvalidated, invalidatedRows]);
+  // Read from the applied filters, not the live ones, so every "filtered vs.
+  // unfiltered" label describes the rows actually on screen.
+  const filtersActive = hasActiveMemoryFilters(appliedFilters);
 
   // Helper to get normalized link type
   const getLinkTypeCategory = (type: string | undefined): string => {
@@ -171,7 +237,7 @@ export function DataView({
     return "semantic";
   };
 
-  // Convert data for Graph2D (graph data is already filtered server-side)
+  // Convert data for the constellation (graph data is already filtered server-side)
   const graph2DData = useMemo(() => {
     if (!data) return { nodes: [], links: [] };
     const fullData = convertHindsightGraphData(data);
@@ -185,44 +251,11 @@ export function DataView({
     return { nodes: fullData.nodes, links };
   }, [data, visibleLinkTypes]);
 
-  // Calculate link stats for display
-  const linkStats = useMemo(() => {
-    let semantic = 0,
-      temporal = 0,
-      entity = 0,
-      causal = 0,
-      total = 0;
-    const otherTypes: Record<string, number> = {};
-    graph2DData.links.forEach((l) => {
-      total++;
-      const type = l.type || "unknown";
-      if (type === "semantic") semantic++;
-      else if (type === "temporal") temporal++;
-      else if (type === "entity") entity++;
-      else if (
-        type === "causes" ||
-        type === "caused_by" ||
-        type === "enables" ||
-        type === "prevents"
-      )
-        causal++;
-      else {
-        otherTypes[type] = (otherTypes[type] || 0) + 1;
-      }
-    });
-    return { semantic, temporal, entity, causal, total, otherTypes };
-  }, [graph2DData]);
-
   // Handle node click in graph - show in panel
-  const handleGraphNodeClick = useCallback(
-    (node: GraphNode) => {
-      const nodeData = data?.table_rows?.find((row: any) => row.id === node.id);
-      if (nodeData) {
-        setSelectedGraphNode(nodeData);
-      }
-    },
-    [data]
-  );
+  const handleGraphNodeClick = useCallback((node: GraphNode) => {
+    // Open the memory dialog for the clicked node (same dialog the table/timeline use).
+    setModalMemoryId(node.id);
+  }, []);
 
   // Memoized color functions to prevent graph re-initialization
   // Uses brand colors: primary blue (#0074d9), teal (#009296), amber for entity, purple for causal
@@ -281,6 +314,39 @@ export function DataView({
     [recencyLookup]
   );
 
+  // Assign each distinct observation scope (exact tag set) a stable color from
+  // the palette, in order of first appearance, for the "Group by scope" clusters.
+  const scopeColorLookup = useMemo(() => {
+    if (factType !== "observation" || !data?.table_rows) return null;
+    const map = new Map<string, string>();
+    let i = 0;
+    for (const row of data.table_rows as Array<{ tags?: string[] }>) {
+      const key = scopeKeyOf(row.tags);
+      if (!map.has(key)) map.set(key, SCOPE_PALETTE[i++ % SCOPE_PALETTE.length]);
+    }
+    return map;
+  }, [factType, data]);
+
+  const scopeClusterKeyFn = useCallback(
+    (node: GraphNode) => scopeKeyOf(node.metadata?.tags as string[] | undefined),
+    []
+  );
+  const scopeClusterColorFn = useCallback(
+    (key: string) => scopeColorLookup?.get(key) || "#0074d9",
+    [scopeColorLookup]
+  );
+  const scopeClusterLabelFn = useCallback(
+    (key: string) => {
+      try {
+        const tags = JSON.parse(key) as string[];
+        return tags.length ? tags.map((tag) => `#${tag}`).join(" ") : t("scopeGlobal");
+      } catch {
+        return key;
+      }
+    },
+    [t]
+  );
+
   const observationNodeSizeFn = useCallback(
     (node: GraphNode) => {
       if (!observationSizeLookup) return 3;
@@ -308,59 +374,130 @@ export function DataView({
   // Reset to first page when filters change
   useEffect(() => {
     setCurrentPage(1);
-  }, [tagFilters]);
+  }, [tagFilters, selectedScope]);
+
+  // Resolve the active tag filter into (tags, tags_match) for the graph query.
+  // A selected observation scope takes precedence and uses exact set-equality
+  // matching (so scope [a] excludes [a, b]); otherwise the free-form tag filter
+  // uses the default contains semantics. `null` scope means "no scope filter".
+  const resolveTagQuery = useCallback(
+    (scopeOverride?: string[] | null): { tags?: string[]; match?: string } => {
+      const scope = scopeOverride === undefined ? selectedScope : scopeOverride;
+      if (scope !== null) {
+        return { tags: scope, match: "exact" };
+      }
+      return { tags: tagFilters.length > 0 ? tagFilters : undefined };
+    },
+    [selectedScope, tagFilters]
+  );
 
   // Trigger text search on Enter key
   const executeSearch = () => {
     if (currentBank) {
       setCurrentPage(1);
-      loadData(undefined, searchQuery || undefined, tagFilters.length > 0 ? tagFilters : undefined);
+      const { tags, match } = resolveTagQuery();
+      loadData(undefined, searchQuery || undefined, tags, match);
     }
   };
 
-  // Trigger server-side reload immediately when tag filters change
+  // Single auto-loader for the graph data. This deliberately replaces what used
+  // to be two effects (mount/context + filter change) that BOTH fired on mount,
+  // doubling the initial /api/graph request (see issue #2158). When the context
+  // (factType/bank/document/chunk) changes we drop the now-meaningless scope
+  // filter and feed the cleared value straight into the same reload, so the
+  // scope reset never triggers a second fetch.
+  const contextKeyRef = useRef<string | null>(null);
+  const skipScopeResetReload = useRef(false);
+  const lastAutoLoadSig = useRef<string | null>(null);
   useEffect(() => {
-    if (currentBank) {
-      loadData(undefined, searchQuery || undefined, tagFilters.length > 0 ? tagFilters : undefined);
+    if (!currentBank) return;
+    // The previous run already issued the reload with scope=null; this run is
+    // only the echo of our own setSelectedScope(null), so skip it.
+    if (skipScopeResetReload.current) {
+      skipScopeResetReload.current = false;
+      return;
     }
-  }, [tagFilters]);
+    const contextKey = `${factType} ${currentBank} ${documentId ?? ""} ${chunkId ?? ""}`;
+    const contextChanged = contextKeyRef.current !== contextKey;
+    contextKeyRef.current = contextKey;
 
-  // Auto-load data when component mounts or factType/currentBank changes
-  useEffect(() => {
-    if (currentBank) {
-      loadData();
+    let scope = selectedScope;
+    if (contextChanged && selectedScope !== null) {
+      scope = null;
+      skipScopeResetReload.current = true;
+      setSelectedScope(null);
     }
-  }, [factType, currentBank, documentId, chunkId]);
+    const { tags, match } = resolveTagQuery(scope);
+    // Collapse identical consecutive auto-loads into a single request. This makes
+    // the effect idempotent, so React's mount-effect double-invoke (dev
+    // StrictMode, and any redundant re-render) can't re-issue the same /api/graph
+    // query. Manual reloads (search, load-more, consolidation poll) call loadData
+    // directly and intentionally bypass this guard.
+    const sig = JSON.stringify([contextKey, tags ?? null, match ?? null]);
+    if (sig === lastAutoLoadSig.current) return;
+    lastAutoLoadSig.current = sig;
+    loadData(undefined, searchQuery || undefined, tags, match);
+  }, [factType, currentBank, documentId, chunkId, tagFilters, selectedScope]);
 
-  // Enforce 50 node limit to prevent UI instability, default to 20 or max whichever is smaller
-  useEffect(() => {
-    if (data && maxNodes === undefined) {
-      if (graph2DData.nodes.length > 50) {
-        // Always set maxNodes to 20 when we have >50 nodes (never leave as undefined)
-        setMaxNodes(20);
-      } else if (graph2DData.nodes.length > 20) {
-        setMaxNodes(20);
-      }
-      // If ≤20 nodes, leave maxNodes undefined to show all
+  // Load the available observation scopes for the scope filter dropdown.
+  const loadScopes = useCallback(async () => {
+    if (!currentBank || factType !== "observation") {
+      setScopes([]);
+      return;
     }
-  }, [data, graph2DData.nodes.length, maxNodes]);
+    try {
+      const resp = await client.listObservationScopes(currentBank);
+      setScopes(resp.scopes ?? []);
+    } catch {
+      setScopes([]);
+    }
+  }, [currentBank, factType]);
+
+  useEffect(() => {
+    loadScopes();
+  }, [loadScopes]);
+
+  // While consolidation is in progress, poll so the observations + scopes (and
+  // the "In Sync" badge) refresh live instead of showing a stale, one-shot read
+  // (bank stats are also cached for up to 60s, so a single fetch can lag well
+  // behind reality). Silent reloads avoid flashing the spinner. The effect only
+  // restarts when consolidation starts/stops, not on every tick.
+  const isConsolidating =
+    factType === "observation" && (consolidationStatus?.pending_consolidation ?? 0) > 0;
+  // The tick goes through a ref so each fire sees the CURRENT filters; the
+  // interval itself still only restarts when consolidation starts/stops. Without
+  // this, the closure captures the filters from arming time, and a tag/scope
+  // selected mid-consolidation is clobbered ~4s later by a refetch using the
+  // stale (usually empty) filter — the same stale-closure guard as
+  // bank-profile-view's polling.
+  const pollTickRef = useRef<() => void>(() => {});
+  useEffect(() => {
+    pollTickRef.current = () => {
+      const { tags, match } = resolveTagQuery();
+      loadData(undefined, searchQuery || undefined, tags, match, true);
+      loadScopes();
+    };
+  });
+  useEffect(() => {
+    if (!isConsolidating || !currentBank) return;
+    const id = setInterval(() => pollTickRef.current(), 4000);
+    return () => clearInterval(id);
+  }, [isConsolidating, currentBank]);
 
   return (
     <div>
       {loading && !data ? (
         <div className="text-center py-12">
-          <RefreshCw className="w-8 h-8 mx-auto mb-3 text-muted-foreground animate-spin" />
-          <p className="text-muted-foreground">Loading memories...</p>
+          <Spinner size="lg" variant="jump" className="mx-auto mb-3" />
+          <p className="text-muted-foreground">{t("loadingMemories")}</p>
         </div>
-      ) : data && data.total_units === 0 ? (
+      ) : data && shouldShowEmptyBankState(data.total_units, appliedFilters) ? (
         <div className="text-center py-20">
           <FileText className="w-10 h-10 mx-auto mb-4 text-muted-foreground/50" />
-          <h3 className="text-base font-medium text-foreground mb-1">No memories</h3>
+          <h3 className="text-base font-medium text-foreground mb-1">{t("noMemoriesYet")}</h3>
           {!documentId && !chunkId && (
             <>
-              <p className="text-sm text-muted-foreground mb-6">
-                Add a document to start building this memory bank.
-              </p>
+              <p className="text-sm text-muted-foreground mb-6">{t("noMemoriesDescription")}</p>
               <Button
                 variant="default"
                 size="sm"
@@ -371,7 +508,7 @@ export function DataView({
                 }}
               >
                 <Plus className="w-4 h-4" />
-                Add Document
+                {tAddDoc("addDocumentButton")}
               </Button>
             </>
           )}
@@ -381,30 +518,64 @@ export function DataView({
           {/* Always visible filters */}
           {!compactMode && (
             <div className="mb-4 space-y-2">
-              <div className="flex items-center gap-2">
+              <div className="flex items-start gap-2">
                 {/* Text search */}
                 <div className="relative max-w-xs flex-1">
                   {loading ? (
-                    <RefreshCw className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none animate-spin" />
+                    <Spinner
+                      size="sm"
+                      className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none"
+                    />
                   ) : (
                     <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
                   )}
                   <Input
                     type="text"
                     value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
+                    onChange={(e) => {
+                      const next = e.target.value;
+                      setSearchQuery(next);
+                      // Emptying the box is the one edit that doesn't need an
+                      // Enter to be unambiguous: re-run the query unfiltered so
+                      // the full list (and its total) comes straight back.
+                      if (next === "" && appliedFilters.q !== "" && currentBank) {
+                        setCurrentPage(1);
+                        const { tags, match } = resolveTagQuery();
+                        loadData(undefined, undefined, tags, match);
+                      }
+                    }}
                     onKeyDown={(e) => {
                       if (e.key === "Enter") {
                         e.preventDefault();
                         executeSearch();
                       }
                     }}
-                    placeholder="Filter by text or context (press Enter)..."
+                    placeholder={t("filterByTextPlaceholder")}
                     className="pl-8 h-9"
                   />
                 </div>
-                {/* Tag input */}
-                <TagFilterInput value={tagFilters} onChange={setTagFilters} bankId={currentBank} />
+                {/* Tag input. Setting a tag filter clears any selected scope
+                    so the two filters never fight over the same query. */}
+                <TagFilterInput
+                  value={tagFilters}
+                  onChange={(next) => {
+                    if (next.length > 0) setSelectedScope(null);
+                    setTagFilters(next);
+                  }}
+                  bankId={currentBank}
+                />
+                {/* Observation scope filter. Selecting a scope clears the
+                    free-form tag filter (mutually exclusive). */}
+                {factType === "observation" && scopes.length > 0 && (
+                  <ObservationScopeFilter
+                    scopes={scopes}
+                    value={selectedScope}
+                    onChange={(scope) => {
+                      if (scope !== null) setTagFilters([]);
+                      setSelectedScope(scope);
+                    }}
+                  />
+                )}
               </div>
             </div>
           )}
@@ -449,28 +620,28 @@ export function DataView({
                   </Button>
                 )}
                 <div className="text-sm text-muted-foreground">
-                  {searchQuery || tagFilters.length > 0 ? (
-                    `${filteredTableRows.length} matching memories`
+                  {filtersActive ? (
+                    t("matchingMemories", { count: filteredTableRows.length })
                   ) : data.table_rows?.length < data.total_units ? (
                     <span>
-                      Showing {data.table_rows?.length ?? 0} of {data.total_units} total memories
+                      {t("showingMemories", {
+                        shown: data.table_rows?.length ?? 0,
+                        total: data.total_units,
+                      })}
                       <button
                         onClick={() => {
                           const newLimit = Math.min(data.total_units, fetchLimit + 1000);
                           setFetchLimit(newLimit);
-                          loadData(
-                            newLimit,
-                            searchQuery || undefined,
-                            tagFilters.length > 0 ? tagFilters : undefined
-                          );
+                          const { tags, match } = resolveTagQuery();
+                          loadData(newLimit, searchQuery || undefined, tags, match);
                         }}
                         className="ml-2 text-primary hover:underline"
                       >
-                        Load more
+                        {t("loadMore")}
                       </button>
                     </span>
                   ) : (
-                    `${data.total_units} total memories`
+                    t("totalMemories", { count: data.total_units })
                   )}
                 </div>
 
@@ -484,30 +655,37 @@ export function DataView({
                     }`}
                     title={
                       consolidationStatus.pending_consolidation === 0
-                        ? `All memories consolidated${consolidationStatus.last_consolidated_at ? ` (last: ${new Date(consolidationStatus.last_consolidated_at).toLocaleString()})` : ""}`
-                        : `${consolidationStatus.pending_consolidation} memories pending consolidation`
+                        ? consolidationStatus.last_consolidated_at
+                          ? t("allConsolidatedWithDate", {
+                              date: new Date(
+                                consolidationStatus.last_consolidated_at
+                              ).toLocaleString(),
+                            })
+                          : t("allConsolidated")
+                        : t("pendingConsolidation", {
+                            count: consolidationStatus.pending_consolidation,
+                          })
                     }
                   >
                     {consolidationStatus.pending_consolidation === 0 ? (
                       <>
                         <CheckCircle className="w-3 h-3" />
-                        In Sync
+                        {t("inSync")}
                       </>
                     ) : (
                       <>
                         <Clock className="w-3 h-3" />
-                        {consolidationStatus.pending_consolidation} Pending
+                        {t("pendingCount", { count: consolidationStatus.pending_consolidation })}
                         <button
                           onClick={() =>
-                            loadData(
-                              fetchLimit,
-                              searchQuery || undefined,
-                              tagFilters.length > 0 ? tagFilters : undefined
-                            )
+                            (() => {
+                              const { tags, match } = resolveTagQuery();
+                              loadData(fetchLimit, searchQuery || undefined, tags, match);
+                            })()
                           }
                           disabled={loading}
                           className="ml-0.5 opacity-70 hover:opacity-100 disabled:opacity-40 transition-opacity"
-                          title="Refresh observations"
+                          title={t("refreshMemories")}
                         >
                           <RefreshCw className={`w-3 h-3 ${loading ? "animate-spin" : ""}`} />
                         </button>
@@ -526,18 +704,7 @@ export function DataView({
                   }`}
                 >
                   <ScatterChart className="w-4 h-4" />
-                  Constellation
-                </button>
-                <button
-                  onClick={() => setViewMode("graph")}
-                  className={`px-3 py-1.5 rounded-md text-sm font-medium transition-all flex items-center gap-1.5 ${
-                    viewMode === "graph"
-                      ? "bg-background text-foreground shadow-sm"
-                      : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  <Network className="w-4 h-4" />
-                  Graph
+                  {t("constellation")}
                 </button>
                 <button
                   onClick={() => setViewMode("table")}
@@ -548,7 +715,7 @@ export function DataView({
                   }`}
                 >
                   <List className="w-4 h-4" />
-                  Table
+                  {t("table")}
                 </button>
                 <button
                   onClick={() => setViewMode("timeline")}
@@ -559,245 +726,82 @@ export function DataView({
                   }`}
                 >
                   <Calendar className="w-4 h-4" />
-                  Timeline
+                  {t("timeline")}
                 </button>
               </div>
             </div>
           )}
 
-          {!compactMode && viewMode === "graph" && (
-            <div className="flex gap-0">
-              {/* Graph */}
-              <div className="flex-1 min-w-0">
-                <Graph2D
-                  data={graph2DData}
-                  height={700}
-                  showLabels={showLabels}
-                  onNodeClick={handleGraphNodeClick}
-                  maxNodes={maxNodes}
-                  nodeColorFn={nodeColorFn}
-                  linkColorFn={linkColorFn}
-                />
-              </div>
-
-              {/* Right Toggle Button */}
-              <button
-                onClick={() => setShowControlPanel(!showControlPanel)}
-                className="flex-shrink-0 w-5 h-[700px] bg-transparent hover:bg-muted/50 flex items-center justify-center transition-colors"
-                title={showControlPanel ? "Hide panel" : "Show panel"}
-              >
-                {showControlPanel ? (
-                  <ChevronRight className="w-3 h-3 text-muted-foreground/60" />
-                ) : (
-                  <ChevronLeft className="w-3 h-3 text-muted-foreground/60" />
-                )}
-              </button>
-
-              {/* Right Panel - Legend/Controls OR Memory Details */}
-              <div
-                className={`${showControlPanel ? "w-80" : "w-0"} transition-all duration-300 overflow-hidden flex-shrink-0`}
-              >
-                <div className="w-80 h-[700px] bg-card border-l border-border overflow-y-auto">
-                  {selectedGraphNode ? (
-                    /* Memory Detail View */
-                    <MemoryDetailPanel
-                      memory={selectedGraphNode}
-                      onClose={() => setSelectedGraphNode(null)}
-                      inPanel
-                      bankId={currentBank || undefined}
-                    />
-                  ) : (
-                    /* Legend & Controls View */
-                    <div className="p-4 space-y-5">
-                      {/* Legend & Stats */}
-                      <div>
-                        <h3 className="text-sm font-semibold mb-3 text-foreground">Graph</h3>
-                        <div className="space-y-2">
-                          {/* Nodes */}
-                          <div className="flex items-center justify-between text-sm">
-                            <div className="flex items-center gap-2">
-                              <div
-                                className="w-3 h-3 rounded-full"
-                                style={{ backgroundColor: "#0074d9" }}
-                              />
-                              <span className="text-foreground">Nodes</span>
-                            </div>
-                            <span className="font-mono text-foreground">
-                              {Math.min(
-                                maxNodes ?? graph2DData.nodes.length,
-                                graph2DData.nodes.length
-                              )}
-                              /{graph2DData.nodes.length}
-                            </span>
-                          </div>
-
-                          <div className="text-xs font-medium text-muted-foreground mt-2 mb-1">
-                            Links ({linkStats.total}){" "}
-                            <span className="text-muted-foreground/60">· click to filter</span>
-                          </div>
-                          <button
-                            onClick={() => toggleLinkType("semantic")}
-                            className={`w-full flex items-center justify-between text-sm px-2 py-1 rounded transition-all ${
-                              visibleLinkTypes.has("semantic")
-                                ? "hover:bg-muted"
-                                : "opacity-40 hover:opacity-60"
-                            }`}
-                          >
-                            <div className="flex items-center gap-2">
-                              <div className="w-4 h-0.5 bg-[#0074d9]" />
-                              <span className="text-foreground">Semantic</span>
-                            </div>
-                            <span
-                              className={`font-mono ${linkStats.semantic === 0 ? "text-destructive" : "text-foreground"}`}
-                            >
-                              {linkStats.semantic}
-                            </span>
-                          </button>
-                          <button
-                            onClick={() => toggleLinkType("temporal")}
-                            className={`w-full flex items-center justify-between text-sm px-2 py-1 rounded transition-all ${
-                              visibleLinkTypes.has("temporal")
-                                ? "hover:bg-muted"
-                                : "opacity-40 hover:opacity-60"
-                            }`}
-                          >
-                            <div className="flex items-center gap-2">
-                              <div className="w-4 h-0.5 bg-[#009296]" />
-                              <span className="text-foreground">Temporal</span>
-                            </div>
-                            <span
-                              className={`font-mono ${linkStats.temporal === 0 ? "text-destructive" : "text-foreground"}`}
-                            >
-                              {linkStats.temporal}
-                            </span>
-                          </button>
-                          <button
-                            onClick={() => toggleLinkType("entity")}
-                            className={`w-full flex items-center justify-between text-sm px-2 py-1 rounded transition-all ${
-                              visibleLinkTypes.has("entity")
-                                ? "hover:bg-muted"
-                                : "opacity-40 hover:opacity-60"
-                            }`}
-                          >
-                            <div className="flex items-center gap-2">
-                              <div className="w-4 h-0.5 bg-[#f59e0b]" />
-                              <span className="text-foreground">Entity</span>
-                            </div>
-                            <span className="font-mono text-foreground">{linkStats.entity}</span>
-                          </button>
-                          <button
-                            onClick={() => toggleLinkType("causal")}
-                            className={`w-full flex items-center justify-between text-sm px-2 py-1 rounded transition-all ${
-                              visibleLinkTypes.has("causal")
-                                ? "hover:bg-muted"
-                                : "opacity-40 hover:opacity-60"
-                            }`}
-                          >
-                            <div className="flex items-center gap-2">
-                              <div className="w-4 h-0.5 bg-[#8b5cf6]" />
-                              <span className="text-foreground">Causal</span>
-                            </div>
-                            <span
-                              className={`font-mono ${linkStats.causal === 0 ? "text-muted-foreground" : "text-foreground"}`}
-                            >
-                              {linkStats.causal}
-                            </span>
-                          </button>
-                          {Object.entries(linkStats.otherTypes || {}).map(([type, count]) => (
-                            <div key={type} className="flex items-center justify-between text-sm">
-                              <span className="text-muted-foreground capitalize ml-6">{type}</span>
-                              <span className="font-mono text-muted-foreground">
-                                {count as number}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-
-                      <div className="border-t border-border" />
-
-                      {/* Controls Section */}
-                      <div>
-                        <h3 className="text-sm font-semibold mb-3 text-foreground">Display</h3>
-                        <div className="space-y-4">
-                          <div className="flex items-center justify-between">
-                            <Label htmlFor="show-labels" className="text-sm text-foreground">
-                              Show labels
-                            </Label>
-                            <Switch
-                              id="show-labels"
-                              checked={showLabels}
-                              onCheckedChange={setShowLabels}
-                            />
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="border-t border-border" />
-
-                      {/* Limits Section */}
-                      <div>
-                        <h3 className="text-sm font-semibold mb-3 text-foreground">Performance</h3>
-                        <div className="space-y-4">
-                          <div>
-                            <div className="flex items-center justify-between mb-2">
-                              <Label className="text-sm text-foreground">Max nodes</Label>
-                              <span className="text-xs text-muted-foreground">
-                                {graph2DData.nodes.length > 50
-                                  ? `${maxNodes ?? 50} / ${graph2DData.nodes.length}`
-                                  : `${maxNodes ?? "All"} / ${graph2DData.nodes.length}`}
-                              </span>
-                            </div>
-                            <Slider
-                              value={[
-                                graph2DData.nodes.length > 50
-                                  ? maxNodes || 20
-                                  : maxNodes || Math.min(graph2DData.nodes.length, 20),
-                              ]}
-                              min={10}
-                              max={Math.min(Math.max(graph2DData.nodes.length, 10), 50)}
-                              step={10}
-                              onValueChange={([v]) => {
-                                const effectiveMax = Math.min(graph2DData.nodes.length, 50);
-                                // If we have >50 nodes, never allow "All" (undefined), cap at 50
-                                if (graph2DData.nodes.length > 50) {
-                                  setMaxNodes(v);
-                                } else {
-                                  // Original behavior for ≤50 nodes: allow "All" when slider reaches max
-                                  setMaxNodes(v >= effectiveMax ? undefined : v);
-                                }
-                              }}
-                              className="w-full"
-                            />
-                          </div>
-                          <p className="text-xs text-muted-foreground">
-                            All links between visible nodes are shown.
-                            {graph2DData.nodes.length > 50 && (
-                              <span className="block text-amber-600 dark:text-amber-400 mt-1">
-                                ⚠️ Limited to 50 nodes for performance. Total:{" "}
-                                {graph2DData.nodes.length}
-                              </span>
-                            )}
-                          </p>
-                        </div>
-                      </div>
-
-                      <div className="border-t border-border" />
-
-                      {/* Hint */}
-                      <div className="text-xs text-muted-foreground/60 text-center pt-2">
-                        Click a node to see details
-                      </div>
+          {(compactMode || viewMode === "constellation") && (
+            <div className="space-y-3">
+              {/* Constellation controls — moved out of the old side panel to sit
+                  inline above the graph, next to the view toggle / filters. */}
+              {!compactMode && (
+                <div className="flex flex-wrap items-center gap-x-6 gap-y-2">
+                  {factType === "observation" && (
+                    <div className="flex items-center gap-2">
+                      <Layers className="w-3.5 h-3.5 text-muted-foreground" />
+                      <span className="text-xs font-medium text-muted-foreground">
+                        {t("groupByScope")}
+                      </span>
+                      <Switch checked={groupByScope} onCheckedChange={setGroupByScope} />
                     </div>
                   )}
+                  {!(factType === "observation" && groupByScope) && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-medium text-muted-foreground">
+                        {t("colorBy")}
+                      </span>
+                      <Select
+                        value={recencyBasis}
+                        onValueChange={(v) => setRecencyBasis(v as RecencyBasis)}
+                      >
+                        <SelectTrigger className="h-8 w-44 text-xs">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="mentioned_at">{t("mentioned")}</SelectItem>
+                          <SelectItem value="occurred_start">{t("occurredStart")}</SelectItem>
+                          <SelectItem value="occurred_end">{t("occurredEnd")}</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  )}
+                  <div className="flex items-center gap-3">
+                    <span className="text-xs font-medium text-muted-foreground">
+                      {t("linkTypes")}
+                    </span>
+                    {Object.entries({
+                      semantic: "#0074d9",
+                      temporal: "#009296",
+                      entity: "#f59e0b",
+                      causal: "#8b5cf6",
+                    }).map(([type, color]) => (
+                      <button
+                        key={type}
+                        type="button"
+                        className="flex items-center gap-1.5"
+                        onClick={() => toggleLinkType(type)}
+                      >
+                        <span
+                          className="w-3 h-3 rounded-full"
+                          style={{
+                            backgroundColor: color,
+                            opacity: visibleLinkTypes.has(type) ? 1 : 0.2,
+                          }}
+                        />
+                        <span
+                          className={`text-xs capitalize ${visibleLinkTypes.has(type) ? "text-foreground" : "text-muted-foreground line-through"}`}
+                        >
+                          {type}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            </div>
-          )}
+              )}
 
-          {(compactMode || viewMode === "constellation") && (
-            <div className="flex gap-0">
-              <div className="flex-1 min-w-0 border border-border rounded-lg overflow-hidden">
+              <div className="border border-border rounded-lg overflow-hidden">
                 <Constellation
                   key={compactMode ? "compact" : "full"}
                   data={graph2DData}
@@ -806,13 +810,30 @@ export function DataView({
                   nodeColorFn={nodeColorFn}
                   linkColorFn={linkColorFn}
                   nodeSizeFn={factType === "observation" ? observationNodeSizeFn : undefined}
-                  sizeLegendLabel={factType === "observation" ? "source facts" : undefined}
-                  nodeHeatFn={recencyLookup ? recencyHeatFn : undefined}
+                  sizeLegendLabel={factType === "observation" ? t("sourceFactsLabel") : undefined}
+                  clusterKeyFn={
+                    factType === "observation" && groupByScope ? scopeClusterKeyFn : undefined
+                  }
+                  clusterColorFn={
+                    factType === "observation" && groupByScope ? scopeClusterColorFn : undefined
+                  }
+                  clusterLabelFn={
+                    factType === "observation" && groupByScope ? scopeClusterLabelFn : undefined
+                  }
+                  // When grouping by scope, color encodes scope (not recency), so
+                  // suppress the recency heat to avoid a misleading legend.
+                  nodeHeatFn={
+                    !(factType === "observation" && groupByScope) && recencyLookup
+                      ? recencyHeatFn
+                      : undefined
+                  }
                   heatLegendLabel={
-                    recencyLookup ? `recency · ${RECENCY_BASIS_LABEL[recencyBasis]}` : undefined
+                    !(factType === "observation" && groupByScope) && recencyLookup
+                      ? t("recencyLabel", { basis: RECENCY_BASIS_LABEL[recencyBasis] })
+                      : undefined
                   }
                   heatLegendEndpoints={
-                    recencyLookup
+                    !(factType === "observation" && groupByScope) && recencyLookup
                       ? [
                           new Date(recencyLookup.minT).toISOString().slice(0, 10),
                           new Date(recencyLookup.maxT).toISOString().slice(0, 10),
@@ -821,109 +842,46 @@ export function DataView({
                   }
                 />
               </div>
-
-              {/* Right Toggle Button + Panel (hidden in compact mode) */}
-              {!compactMode && (
-                <>
-                  <button
-                    onClick={() => setShowControlPanel(!showControlPanel)}
-                    className="flex-shrink-0 w-5 h-[700px] bg-transparent hover:bg-muted/50 flex items-center justify-center transition-colors"
-                    title={showControlPanel ? "Hide panel" : "Show panel"}
-                  >
-                    {showControlPanel ? (
-                      <ChevronRight className="w-3 h-3 text-muted-foreground" />
-                    ) : (
-                      <ChevronLeft className="w-3 h-3 text-muted-foreground" />
-                    )}
-                  </button>
-
-                  {/* Right Panel — reuse the same panel as graph view */}
-                  {showControlPanel && (
-                    <div className="w-72 flex-shrink-0 border border-border rounded-lg bg-muted/20 overflow-y-auto h-[700px]">
-                      {selectedGraphNode ? (
-                        <MemoryDetailPanel
-                          memory={selectedGraphNode}
-                          onClose={() => setSelectedGraphNode(null)}
-                          inPanel
-                          bankId={currentBank || undefined}
-                        />
-                      ) : (
-                        <div className="p-4 space-y-4">
-                          <h3 className="text-sm font-semibold text-foreground">
-                            Constellation View
-                          </h3>
-                          <p className="text-xs text-muted-foreground">
-                            Canvas-rendered memory map with spatial label deconfliction. Scroll to
-                            zoom, drag to pan, hover to explore entity connections. Click a memory
-                            to view details.
-                          </p>
-                          <div className="space-y-2 pt-2">
-                            <h4 className="text-xs font-medium text-muted-foreground">Color by</h4>
-                            <Select
-                              value={recencyBasis}
-                              onValueChange={(v) => setRecencyBasis(v as RecencyBasis)}
-                            >
-                              <SelectTrigger className="h-8 w-full text-xs">
-                                <SelectValue />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value="mentioned_at">Mentioned</SelectItem>
-                                <SelectItem value="occurred_start">Occurred (start)</SelectItem>
-                                <SelectItem value="occurred_end">Occurred (end)</SelectItem>
-                              </SelectContent>
-                            </Select>
-                          </div>
-                          <div className="space-y-2 pt-2">
-                            <h4 className="text-xs font-medium text-muted-foreground">
-                              Link types
-                            </h4>
-                            {Object.entries({
-                              semantic: "#0074d9",
-                              temporal: "#009296",
-                              entity: "#f59e0b",
-                              causal: "#8b5cf6",
-                            }).map(([type, color]) => (
-                              <div
-                                key={type}
-                                className="flex items-center gap-2 cursor-pointer"
-                                onClick={() => toggleLinkType(type)}
-                              >
-                                <div
-                                  className="w-3 h-3 rounded-full"
-                                  style={{
-                                    backgroundColor: color,
-                                    opacity: visibleLinkTypes.has(type) ? 1 : 0.2,
-                                  }}
-                                />
-                                <span
-                                  className={`text-xs capitalize ${visibleLinkTypes.has(type) ? "text-foreground" : "text-muted-foreground line-through"}`}
-                                >
-                                  {type}
-                                </span>
-                              </div>
-                            ))}
-                          </div>
-                          <div className="text-xs text-muted-foreground space-y-1 pt-2">
-                            <div>
-                              Nodes:{" "}
-                              <span className="text-foreground">{graph2DData.nodes.length}</span>
-                            </div>
-                            <div>
-                              Links:{" "}
-                              <span className="text-foreground">{graph2DData.links.length}</span>
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </>
-              )}
             </div>
           )}
 
           {!compactMode && viewMode === "table" && (
             <div>
+              {factType !== "observation" && (
+                <div className="flex items-center gap-2 mb-3">
+                  <div className="flex items-center gap-1 bg-muted rounded-lg p-1">
+                    <button
+                      onClick={() => {
+                        setShowInvalidated(false);
+                        setCurrentPage(1);
+                      }}
+                      className={`px-3 py-1.5 rounded-md text-sm font-medium transition-all ${
+                        !showInvalidated
+                          ? "bg-background text-foreground shadow-sm"
+                          : "text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      {t("filterActive")}
+                    </button>
+                    <button
+                      onClick={() => {
+                        setShowInvalidated(true);
+                        setCurrentPage(1);
+                      }}
+                      className={`px-3 py-1.5 rounded-md text-sm font-medium transition-all ${
+                        showInvalidated
+                          ? "bg-background text-foreground shadow-sm"
+                          : "text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      {t("filterInvalidated")}
+                    </button>
+                  </div>
+                  {showInvalidated && (
+                    <span className="text-xs text-muted-foreground">{t("invalidatedHint")}</span>
+                  )}
+                </div>
+              )}
               <div className="w-full">
                 <div className="pb-4">
                   {filteredTableRows.length > 0 ? (
@@ -941,22 +899,24 @@ export function DataView({
                                 <TableHead
                                   className={factType === "observation" ? "w-[35%]" : "w-[38%]"}
                                 >
-                                  {factType === "observation" ? "Observation" : "Memory"}
+                                  {factType === "observation"
+                                    ? t("columnObservation")
+                                    : t("columnMemory")}
                                 </TableHead>
-                                <TableHead className="w-[15%]">Entities</TableHead>
-                                <TableHead className="w-[15%]">Tags</TableHead>
+                                <TableHead className="w-[15%]">{t("columnEntities")}</TableHead>
+                                <TableHead className="w-[15%]">{t("columnTags")}</TableHead>
                                 {factType === "observation" && (
-                                  <TableHead className="w-[10%]">Sources</TableHead>
+                                  <TableHead className="w-[10%]">{t("columnSources")}</TableHead>
                                 )}
                                 <TableHead
                                   className={factType === "observation" ? "w-[12%]" : "w-[16%]"}
                                 >
-                                  Occurred
+                                  {t("columnOccurred")}
                                 </TableHead>
                                 <TableHead
                                   className={factType === "observation" ? "w-[13%]" : "w-[16%]"}
                                 >
-                                  Mentioned
+                                  {t("columnMentioned")}
                                 </TableHead>
                               </TableRow>
                             </TableHeader>
@@ -1000,12 +960,7 @@ export function DataView({
                                             .split(", ")
                                             .slice(0, 2)
                                             .map((entity: string, i: number) => (
-                                              <span
-                                                key={i}
-                                                className="text-[10px] px-1.5 py-0.5 rounded-full bg-primary/10 text-primary font-medium"
-                                              >
-                                                {entity}
-                                              </span>
+                                              <EntityChip key={i} entity={entity} size="xs" />
                                             ))}
                                           {row.entities.split(", ").length > 2 && (
                                             <span className="text-[10px] text-muted-foreground">
@@ -1023,12 +978,7 @@ export function DataView({
                                           {(row.tags as string[])
                                             .slice(0, 2)
                                             .map((tag: string, i: number) => (
-                                              <span
-                                                key={i}
-                                                className="text-[10px] px-1.5 py-0.5 rounded-md bg-amber-500/10 text-amber-700 border border-amber-500/20 font-medium font-mono"
-                                              >
-                                                #{tag}
-                                              </span>
+                                              <TagChip key={i} tag={tag} size="xs" />
                                             ))}
                                           {row.tags.length > 2 && (
                                             <span className="text-[10px] text-muted-foreground">
@@ -1116,9 +1066,7 @@ export function DataView({
                     })()
                   ) : (
                     <div className="text-center py-12 text-muted-foreground">
-                      {data.table_rows?.length > 0
-                        ? "No memories match your filter"
-                        : "No memories found"}
+                      {filtersActive ? t("noMemoriesMatchFilter") : t("noMemoriesFound")}
                     </div>
                   )}
                 </div>
@@ -1138,22 +1086,31 @@ export function DataView({
       ) : (
         <div className="flex items-center justify-center py-20">
           <div className="text-center">
-            <div className="text-4xl mb-2">📊</div>
-            <div className="text-sm text-muted-foreground">No data available</div>
+            <ScatterChart className="w-10 h-10 mx-auto mb-3 text-muted-foreground/50" />
+            <div className="text-sm text-muted-foreground">{t("noDataAvailable")}</div>
           </div>
         </div>
       )}
 
       {/* Memory Detail Modal */}
-      <MemoryDetailModal memoryId={modalMemoryId} onClose={() => setModalMemoryId(null)} />
+      <MemoryDetailModal
+        memoryId={modalMemoryId}
+        onClose={() => setModalMemoryId(null)}
+        onChanged={() => {
+          if (showInvalidated) loadInvalidated();
+        }}
+      />
     </div>
   );
 }
 
-// Timeline View Component - Custom compact timeline with zoom and navigation
+// Timeline View Component - Custom compact timeline with zoom and navigation.
+// Exported for reuse (e.g. the per-entity timeline in entities-view). It renders
+// purely from `filteredRows`; `data`/`bankId` are accepted for backward-compat
+// with the memories view but unused here.
 type Granularity = "year" | "month" | "week" | "day";
 
-function TimelineView({
+export function TimelineView({
   data,
   filteredRows,
   bankId,
@@ -1164,6 +1121,7 @@ function TimelineView({
   bankId?: string;
   onMemoryClick: (id: string) => void;
 }) {
+  const t = useTranslations("dataView");
   const [granularity, setGranularity] = useState<Granularity>("month");
   const [currentIndex, setCurrentIndex] = useState(0);
   const timelineRef = useRef<HTMLDivElement>(null);
@@ -1291,12 +1249,12 @@ function TimelineView({
     return (
       <div className="flex flex-col items-center justify-center py-12">
         <Calendar className="w-12 h-12 text-muted-foreground mb-3" />
-        <div className="text-base font-medium text-foreground mb-1">No Timeline Data</div>
+        <div className="text-base font-medium text-foreground mb-1">{t("noTimelineData")}</div>
         <div className="text-xs text-muted-foreground text-center max-w-md">
-          No memories have occurred_at dates.
+          {t("noTimelineDataDescription")}
           {itemsWithoutDates.length > 0 && (
             <span className="block mt-1">
-              {itemsWithoutDates.length} memories without dates in Table View.
+              {t("memoriesWithoutDatesInTable", { count: itemsWithoutDates.length })}
             </span>
           )}
         </div>
@@ -1316,10 +1274,10 @@ function TimelineView({
   };
 
   const granularityLabels: Record<Granularity, string> = {
-    year: "Year",
-    month: "Month",
-    week: "Week",
-    day: "Day",
+    year: t("granularityYear"),
+    month: t("granularityMonth"),
+    week: t("granularityWeek"),
+    day: t("granularityDay"),
   };
 
   return (
@@ -1329,8 +1287,9 @@ function TimelineView({
         {/* Controls */}
         <div className="flex items-center justify-between mb-3 gap-4">
           <div className="text-xs text-muted-foreground">
-            {sortedItems.length} memories
-            {itemsWithoutDates.length > 0 && ` · ${itemsWithoutDates.length} without dates`}
+            {t("timelineMemoriesCount", { count: sortedItems.length })}
+            {itemsWithoutDates.length > 0 &&
+              ` ${t("timelineWithoutDates", { count: itemsWithoutDates.length })}`}
             {dateRange && (
               <span className="ml-2 text-foreground">
                 ({dateRange.first.toLocaleDateString("en-US", { month: "short", year: "numeric" })}{" "}
@@ -1348,7 +1307,7 @@ function TimelineView({
                 onClick={zoomOut}
                 disabled={granularity === "year"}
                 className="h-7 w-7 p-0"
-                title="Zoom out"
+                title={t("zoomOut")}
               >
                 <ZoomOut className="h-3 w-3" />
               </Button>
@@ -1361,7 +1320,7 @@ function TimelineView({
                 onClick={zoomIn}
                 disabled={granularity === "day"}
                 className="h-7 w-7 p-0"
-                title="Zoom in"
+                title={t("zoomIn")}
               >
                 <ZoomIn className="h-3 w-3" />
               </Button>
@@ -1375,7 +1334,7 @@ function TimelineView({
                 onClick={() => scrollToGroup(0)}
                 disabled={timelineGroups.length <= 1}
                 className="h-7 w-7 p-0"
-                title="First"
+                title={t("first")}
               >
                 <ChevronsLeft className="h-3 w-3" />
               </Button>
@@ -1385,7 +1344,7 @@ function TimelineView({
                 onClick={() => scrollToGroup(currentIndex - 1)}
                 disabled={currentIndex === 0}
                 className="h-7 w-7 p-0"
-                title="Previous"
+                title={t("previous")}
               >
                 <ChevronLeft className="h-3 w-3" />
               </Button>
@@ -1398,7 +1357,7 @@ function TimelineView({
                 onClick={() => scrollToGroup(currentIndex + 1)}
                 disabled={currentIndex >= timelineGroups.length - 1}
                 className="h-7 w-7 p-0"
-                title="Next"
+                title={t("next")}
               >
                 <ChevronRight className="h-3 w-3" />
               </Button>
@@ -1408,7 +1367,7 @@ function TimelineView({
                 onClick={() => scrollToGroup(timelineGroups.length - 1)}
                 disabled={timelineGroups.length <= 1}
                 className="h-7 w-7 p-0"
-                title="Last"
+                title={t("last")}
               >
                 <ChevronsRight className="h-3 w-3" />
               </Button>
@@ -1432,7 +1391,8 @@ function TimelineView({
                 </div>
                 <div className="w-2 h-2 rounded-full bg-primary z-10" />
                 <span className="ml-2 text-[10px] text-muted-foreground">
-                  {group.items.length} {group.items.length === 1 ? "item" : "items"}
+                  {group.items.length}{" "}
+                  {group.items.length === 1 ? t("timelineItem") : t("timelineItems")}
                 </span>
               </div>
 
@@ -1479,12 +1439,7 @@ function TimelineView({
                             .split(", ")
                             .slice(0, 3)
                             .map((entity: string, i: number) => (
-                              <span
-                                key={i}
-                                className="text-[9px] px-1.5 py-0.5 rounded-full bg-primary/10 text-primary font-medium"
-                              >
-                                {entity}
-                              </span>
+                              <EntityChip key={i} entity={entity} size="xs" />
                             ))}
                           {item.entities.split(", ").length > 3 && (
                             <span className="text-[9px] text-muted-foreground">

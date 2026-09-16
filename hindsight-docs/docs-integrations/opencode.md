@@ -6,7 +6,26 @@ description: "Add long-term memory to OpenCode with Hindsight. Automatically cap
 
 # OpenCode
 
+:::warning Superseded by the Coding Agents plugin
+**The opencode plugin** is superseded by the [Coding Agents plugin](/sdks/integrations/coding-agents) — one
+package covering Claude Code, Codex, opencode, Kilo, Cursor, Copilot, Grok, Antigravity, Devin and Cline and other CLI agents, with a per-repo memory bank they all share instead
+of one bank per agent.
+
+This page and the published package still work; they are no longer developed. To switch:
+
+```bash
+cd /path/to/your/repo
+npx @vectorize-io/hindsight-coding-agents install opencode
+```
+
+Memory does not move automatically — the banks are scoped differently and this agent's history cannot be imported (it is kept in an internal database). See
+[Migrating from the per-agent plugins](/sdks/integrations/coding-agents#migrating-from-the-per-agent-plugins).
+:::
+
+
 Persistent long-term memory plugin for [OpenCode](https://opencode.ai) using [Hindsight](https://vectorize.io/hindsight). Automatically captures conversations, recalls relevant context on session start, and provides retain/recall/reflect tools the agent can call directly.
+
+[View Changelog →](/changelog/integrations/opencode)
 
 ## Quick Start
 
@@ -133,9 +152,20 @@ Create `~/.hindsight/opencode.json` for persistent configuration that applies ac
 | `HINDSIGHT_RECALL_TAGS_MATCH` | Tag match mode: `any`, `all`, `any_strict`, `all_strict` | `any` |
 | `HINDSIGHT_DYNAMIC_BANK_ID` | Enable dynamic bank ID derivation | `false` |
 | `HINDSIGHT_BANK_MISSION` | Bank mission/context for reflect | |
-| `HINDSIGHT_DEBUG` | Enable debug logging to stderr | `false` |
 
 Configuration priority (later wins): defaults < `~/.hindsight/opencode.json` < plugin options < env vars.
+
+### Logging & debugging
+
+The plugin logs through OpenCode's own log stream (`service=hindsight`), visible with `opencode --print-logs` or in the OpenCode log files. Errors (failed retain/recall, unreachable API, auth problems) and the resolved API URL + bank are logged **by default** — so if memories aren't saving, the reason is visible without any opt-in.
+
+Verbose tracing is controlled by the `debug` option, which is **config-only** (set `"debug": true` in `opencode.json` plugin options or `~/.hindsight/opencode.json`). There is intentionally no `HINDSIGHT_DEBUG` environment variable: env vars are unreliable to set for OpenCode's plugin runtime (notably on Windows, where a persistent OpenCode server may never see them).
+
+```json
+{
+  "plugin": [["@vectorize-io/opencode-hindsight", { "debug": true }]]
+}
+```
 
 ## Dynamic Bank IDs
 

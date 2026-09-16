@@ -9,6 +9,7 @@ to the fallback after a configurable number of consecutive failures.
 """
 
 import asyncio
+import inspect
 import logging
 import os
 import time
@@ -42,11 +43,11 @@ def _sanitize_env_for_claude_sdk() -> None:
     for var in _TOXIC_ENV_VARS:
         old = os.environ.pop(var, None)
         if old is not None:
-            logger.info(f"Removed toxic env var {var}={old!r} (breaks Claude Agent SDK)")
+            logger.info(f"Removed toxic env var {var} from Claude Agent SDK environment")
     # macOS EINTR workaround (SDK #541)
     if "CLAUDE_CODE_STREAM_CLOSE_TIMEOUT" not in os.environ:
         os.environ["CLAUDE_CODE_STREAM_CLOSE_TIMEOUT"] = "180000"
-        logger.info("Set CLAUDE_CODE_STREAM_CLOSE_TIMEOUT=180000 (macOS EINTR fix)")
+        logger.info("Configured Claude SDK stream close timeout for macOS EINTR fix")
     _env_sanitized = True
 
 
@@ -113,6 +114,8 @@ class CircuitBreaker:
 
     def record_success(self) -> None:
         """Record a primary provider success — reset to closed."""
+        if self.permanently_disabled:
+            return
         if self.state != "closed":
             logger.info(f"Circuit breaker CLOSED (was {self.state}) — primary recovered")
         self.state = "closed"
@@ -290,12 +293,37 @@ class FallbackLLMProvider:
             )
         return base
 
-    def with_config(self, config: Any) -> Any:
-        """Return a ConfiguredLLMProvider wrapping this fallback provider."""
-        from ..llm_wrapper import ConfiguredLLMProvider
+    def with_config(
+        self,
+        config: Any,
+        *,
+        bank_id: str | None = None,
+        operation: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        """Apply upstream trace and bank context around both failover legs."""
+        from ..llm_wrapper import LLMProvider
 
-        gemini_settings = getattr(config, "llm_gemini_safety_settings", None)
-        return ConfiguredLLMProvider(self, gemini_settings)
+        return LLMProvider.with_config(self, config, bank_id=bank_id, operation=operation, metadata=metadata)
+
+    def __getattr__(self, name: str) -> Any:
+        # Preserve upstream provider metadata/defaults through this wrapper.
+        provider = self._fallback if self.is_fallback_active else self._primary
+        return getattr(provider, name)
+
+    def supports_prompt_caching(self) -> bool:
+        """Capabilities track the currently selected provider."""
+        provider = self._fallback if self.is_fallback_active else self._primary
+        supports = getattr(provider, "supports_prompt_caching", None)
+        if not callable(supports):
+            return False
+        value = supports()
+        if inspect.isawaitable(value):
+            close = getattr(value, "close", None)
+            if callable(close):
+                close()
+            return False
+        return value is True
 
     # --- Core LLM methods with failover ---
 
@@ -306,14 +334,16 @@ class FallbackLLMProvider:
         max_completion_tokens: int | None = None,
         temperature: float | None = None,
         scope: str = "memory",
-        max_retries: int = 10,
-        initial_backoff: float = 1.0,
-        max_backoff: float = 60.0,
+        max_retries: int | None = None,
+        initial_backoff: float | None = None,
+        max_backoff: float | None = None,
         skip_validation: bool = False,
-        strict_schema: bool = False,
-        return_usage: bool = False,
+        strict_schema: bool | None = None,
+        cached_prefix: str | None = None,
     ) -> Any:
+        tried_primary = False
         if self._circuit_breaker.should_try_primary():
+            tried_primary = True
             try:
                 result = await asyncio.wait_for(
                     self._primary.call(
@@ -327,7 +357,7 @@ class FallbackLLMProvider:
                         max_backoff=max_backoff,
                         skip_validation=skip_validation,
                         strict_schema=strict_schema,
-                        return_usage=return_usage,
+                        cached_prefix=cached_prefix,
                     ),
                     timeout=_PRIMARY_CALL_TIMEOUT,
                 )
@@ -360,7 +390,9 @@ class FallbackLLMProvider:
                     f"{self._fallback.provider}/{self._fallback.model}"
                 )
 
-        # Use fallback with original retry params
+        # Use fallback with original retry params. Prompt-cache handles are
+        # provider-specific; never send a primary cache token to a fallback leg.
+        fallback_cached_prefix = None if tried_primary else cached_prefix
         return await self._fallback.call(
             messages=messages,
             response_format=response_format,
@@ -372,7 +404,7 @@ class FallbackLLMProvider:
             max_backoff=max_backoff,
             skip_validation=skip_validation,
             strict_schema=strict_schema,
-            return_usage=return_usage,
+            cached_prefix=fallback_cached_prefix,
         )
 
     async def call_with_tools(
@@ -382,12 +414,16 @@ class FallbackLLMProvider:
         max_completion_tokens: int | None = None,
         temperature: float | None = None,
         scope: str = "tools",
-        max_retries: int = 5,
-        initial_backoff: float = 1.0,
-        max_backoff: float = 30.0,
+        max_retries: int | None = None,
+        initial_backoff: float | None = None,
+        max_backoff: float | None = None,
         tool_choice: str | dict[str, Any] = "auto",
+        cached_prefix: str | None = None,
+        cached_prefix_message_count: int = 0,
     ) -> Any:
+        tried_primary = False
         if self._circuit_breaker.should_try_primary():
+            tried_primary = True
             try:
                 result = await asyncio.wait_for(
                     self._primary.call_with_tools(
@@ -400,6 +436,8 @@ class FallbackLLMProvider:
                         initial_backoff=initial_backoff,
                         max_backoff=max_backoff,
                         tool_choice=tool_choice,
+                        cached_prefix=cached_prefix,
+                        cached_prefix_message_count=cached_prefix_message_count,
                     ),
                     timeout=_PRIMARY_CALL_TIMEOUT,
                 )
@@ -431,7 +469,8 @@ class FallbackLLMProvider:
                     f"Primary LLM tool call failed (scope={scope}): {e!r} — falling back to "
                     f"{self._fallback.provider}/{self._fallback.model}"
                 )
-
+        fallback_cached_prefix = None if tried_primary else cached_prefix
+        fallback_cached_prefix_message_count = 0 if tried_primary else cached_prefix_message_count
         return await self._fallback.call_with_tools(
             messages=messages,
             tools=tools,
@@ -442,6 +481,8 @@ class FallbackLLMProvider:
             initial_backoff=initial_backoff,
             max_backoff=max_backoff,
             tool_choice=tool_choice,
+            cached_prefix=fallback_cached_prefix,
+            cached_prefix_message_count=fallback_cached_prefix_message_count,
         )
 
     async def verify_connection(self) -> None:

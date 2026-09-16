@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { localizeApiErrorPayload } from "@/lib/i18n/api-errors";
 import { sdk, lowLevelClient } from "@/lib/hindsight-client";
 import { respondWithSdk } from "@/lib/sdk-response";
 
@@ -7,7 +8,13 @@ export async function POST(request: NextRequest) {
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    return NextResponse.json(
+      localizeApiErrorPayload(request, {
+        error: "Invalid JSON body",
+        errorKey: "api.errors.auth.invalidRequestBody",
+      }),
+      { status: 400 }
+    );
   }
   const bankId = body.bank_id || body.agent_id || "default";
   const {
@@ -18,10 +25,13 @@ export async function POST(request: NextRequest) {
     include_tool_calls,
     tags,
     tags_match,
+    tag_groups,
+    apply_all_directives,
     max_tokens,
     fact_types,
     exclude_mental_models,
     exclude_mental_model_ids,
+    response_schema,
   } = body;
 
   const requestBody: any = {
@@ -29,10 +39,13 @@ export async function POST(request: NextRequest) {
     budget: budget || (thinking_budget ? "mid" : "low"),
     tags,
     tags_match,
+    tag_groups,
+    apply_all_directives: apply_all_directives || undefined,
     max_tokens: max_tokens || undefined,
     fact_types: fact_types || undefined,
     exclude_mental_models: exclude_mental_models || undefined,
     exclude_mental_model_ids: exclude_mental_model_ids || undefined,
+    response_schema: response_schema || undefined,
   };
 
   // Add include options if specified
@@ -52,5 +65,5 @@ export async function POST(request: NextRequest) {
     path: { bank_id: bankId },
     body: requestBody,
   });
-  return respondWithSdk(response, "Failed to reflect");
+  return respondWithSdk(response, "Failed to reflect", { request });
 }

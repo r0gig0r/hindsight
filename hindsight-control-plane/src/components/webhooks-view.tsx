@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { useTranslations } from "next-intl";
 import { useBank } from "@/lib/bank-context";
 import { client, Webhook, WebhookDelivery, WebhookHttpConfig } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -37,17 +38,24 @@ import {
   Trash2,
   Eye,
   EyeOff,
-  Loader2,
   CheckCircle,
   AlertCircle,
   Clock,
   X,
   ChevronDown,
   ChevronRight,
+  ChevronLeft,
+  ChevronsLeft,
+  ChevronsRight,
   Pencil,
 } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 
-const AVAILABLE_EVENT_TYPES = ["consolidation.completed", "retain.completed"];
+const AVAILABLE_EVENT_TYPES = [
+  "consolidation.completed",
+  "retain.completed",
+  "memory_defense.triggered",
+];
 
 interface KeyValuePair {
   key: string;
@@ -66,6 +74,8 @@ interface CreateWebhookForm {
     params: KeyValuePair[];
   };
 }
+
+const ITEMS_PER_PAGE = 50;
 
 const DEFAULT_FORM: CreateWebhookForm = {
   url: "",
@@ -100,6 +110,7 @@ interface KVEditorProps {
 }
 
 function KVEditor({ label, pairs, onChange }: KVEditorProps) {
+  const t = useTranslations("webhooksView");
   const addPair = () => onChange([...pairs, { key: "", value: "" }]);
   const removePair = (i: number) => onChange(pairs.filter((_, idx) => idx !== i));
   const updatePair = (i: number, field: "key" | "value", val: string) => {
@@ -119,7 +130,7 @@ function KVEditor({ label, pairs, onChange }: KVEditorProps) {
           onClick={addPair}
         >
           <Plus className="w-3 h-3 mr-1" />
-          Add
+          {t("kvAdd")}
         </Button>
       </div>
       {pairs.length > 0 && (
@@ -127,13 +138,13 @@ function KVEditor({ label, pairs, onChange }: KVEditorProps) {
           {pairs.map((pair, i) => (
             <div key={i} className="flex items-center gap-2">
               <Input
-                placeholder="Key"
+                placeholder={t("kvKeyPlaceholder")}
                 value={pair.key}
                 onChange={(e) => updatePair(i, "key", e.target.value)}
                 className="h-8 text-sm flex-1"
               />
               <Input
-                placeholder="Value"
+                placeholder={t("kvValuePlaceholder")}
                 value={pair.value}
                 onChange={(e) => updatePair(i, "value", e.target.value)}
                 className="h-8 text-sm flex-1"
@@ -142,6 +153,7 @@ function KVEditor({ label, pairs, onChange }: KVEditorProps) {
                 type="button"
                 onClick={() => removePair(i)}
                 className="text-muted-foreground hover:text-foreground shrink-0"
+                aria-label={t("kvRemovePair")}
               >
                 <X className="w-4 h-4" />
               </button>
@@ -153,26 +165,27 @@ function KVEditor({ label, pairs, onChange }: KVEditorProps) {
   );
 }
 
-function statusBadge(status: string) {
+function StatusBadge({ status }: { status: string }) {
+  const t = useTranslations("webhooksView");
   if (status === "completed")
     return (
       <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
         <CheckCircle className="w-3 h-3" />
-        delivered
+        {t("deliveryStatusDelivered")}
       </span>
     );
   if (status === "pending")
     return (
       <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
         <Clock className="w-3 h-3" />
-        pending
+        {t("deliveryStatusPending")}
       </span>
     );
   if (status === "failed")
     return (
       <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-red-500/10 text-red-600 dark:text-red-400 border border-red-500/20">
         <AlertCircle className="w-3 h-3" />
-        failed
+        {t("deliveryStatusFailed")}
       </span>
     );
   return (
@@ -189,6 +202,7 @@ function DeliveryTableRow({
   delivery: WebhookDelivery;
   formatDate: (d: string | null) => string;
 }) {
+  const t = useTranslations("webhooksView");
   const [expanded, setExpanded] = useState(false);
   const hasDetails = delivery.last_response_body || delivery.last_error;
 
@@ -209,7 +223,9 @@ function DeliveryTableRow({
             <span className="w-4 h-4 inline-block" />
           )}
         </TableCell>
-        <TableCell>{statusBadge(delivery.status)}</TableCell>
+        <TableCell>
+          <StatusBadge status={delivery.status} />
+        </TableCell>
         <TableCell>
           {delivery.last_response_status != null ? (
             <span
@@ -240,7 +256,7 @@ function DeliveryTableRow({
               {delivery.last_error && (
                 <div className="space-y-1">
                   <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
-                    Error
+                    {t("expandedError")}
                   </p>
                   <p className="font-mono text-xs text-red-600 dark:text-red-400 break-all">
                     {delivery.last_error}
@@ -250,7 +266,7 @@ function DeliveryTableRow({
               {delivery.last_response_body && (
                 <div className="space-y-1">
                   <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
-                    Response Body
+                    {t("expandedResponseBody")}
                     {delivery.last_attempt_at && (
                       <span className="ml-2 normal-case font-normal">
                         · {formatDate(delivery.last_attempt_at)}
@@ -292,8 +308,12 @@ function webhookToForm(webhook: Webhook): CreateWebhookForm {
 }
 
 export function WebhooksView() {
+  const t = useTranslations("webhooksView");
   const { currentBank } = useBank();
   const [webhooks, setWebhooks] = useState<Webhook[]>([]);
+  // Pagination state — the listing endpoint pages (see loadWebhooks).
+  const [currentPage, setCurrentPage] = useState(1);
+  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -319,12 +339,16 @@ export function WebhooksView() {
   const [deliveriesCursor, setDeliveriesCursor] = useState<string | null>(null);
   const [loadingMoreDeliveries, setLoadingMoreDeliveries] = useState(false);
 
-  const loadWebhooks = async () => {
+  const loadWebhooks = async (page: number = currentPage) => {
     if (!currentBank) return;
     setLoading(true);
     try {
-      const data = await client.listWebhooks(currentBank);
+      const data = await client.listWebhooks(currentBank, {
+        limit: ITEMS_PER_PAGE,
+        offset: (page - 1) * ITEMS_PER_PAGE,
+      });
       setWebhooks(data.items || []);
+      setTotal(data.total || 0);
     } catch (error) {
       console.error("Error loading webhooks:", error);
     } finally {
@@ -332,9 +356,29 @@ export function WebhooksView() {
     }
   };
 
+  const totalPages = Math.ceil(total / ITEMS_PER_PAGE);
+  const offset = (currentPage - 1) * ITEMS_PER_PAGE;
+
+  const handlePageChange = async (newPage: number) => {
+    setCurrentPage(newPage);
+    await loadWebhooks(newPage);
+  };
+
+  // A delete can empty the last page; step back so the view never lands on a
+  // page that no longer exists.
+  const reloadAfterMutation = async () => {
+    const page = webhooks.length === 1 && currentPage > 1 ? currentPage - 1 : currentPage;
+    setCurrentPage(page);
+    await loadWebhooks(page);
+  };
+
   useEffect(() => {
     if (currentBank) {
-      loadWebhooks();
+      // Back to page 1 on a bank switch: the page number belongs to the bank we
+      // just left, and carrying it over lands on an offset the new bank may not
+      // reach (page 3 of a 120-webhook bank, then a bank with two).
+      setCurrentPage(1);
+      loadWebhooks(1);
     }
   }, [currentBank]);
 
@@ -352,7 +396,9 @@ export function WebhooksView() {
       setCreateDialogOpen(false);
       setForm(DEFAULT_FORM);
       setShowSecret(false);
-      await loadWebhooks();
+      // Rows are ordered oldest-first, so the new webhook is on the last page —
+      // reloading the current page would close the dialog and appear to do nothing.
+      await handlePageChange(Math.ceil((total + 1) / ITEMS_PER_PAGE));
     } catch (error) {
       // Error toast shown by API client interceptor
     } finally {
@@ -366,7 +412,7 @@ export function WebhooksView() {
     setDeleteConfirmWebhook(null);
     try {
       await client.deleteWebhook(currentBank, webhookId);
-      await loadWebhooks();
+      await reloadAfterMutation();
     } catch (error) {
       // Error toast shown by API client interceptor
     } finally {
@@ -454,7 +500,7 @@ export function WebhooksView() {
   };
 
   const formatDate = (dateStr: string | null) => {
-    if (!dateStr) return "N/A";
+    if (!dateStr) return t("formatDateNA");
     return new Date(dateStr).toLocaleString();
   };
 
@@ -466,11 +512,12 @@ export function WebhooksView() {
       <div className="flex items-center justify-between">
         <div>
           <div className="flex items-center gap-2">
-            <h3 className="text-lg font-semibold">Webhooks</h3>
+            <h3 className="text-lg font-semibold">{t("title")}</h3>
             <button
               onClick={() => loadWebhooks()}
               className="p-1 rounded hover:bg-muted transition-colors"
-              title="Refresh webhooks"
+              title={t("refreshTitle")}
+              aria-label={t("refreshAriaLabel")}
               disabled={loading}
             >
               <RefreshCw
@@ -478,13 +525,11 @@ export function WebhooksView() {
               />
             </button>
           </div>
-          <p className="text-sm text-muted-foreground">
-            {webhooks.length} webhook{webhooks.length !== 1 ? "s" : ""}
-          </p>
+          <p className="text-sm text-muted-foreground">{t("webhookCount", { count: total })}</p>
         </div>
         <Button size="sm" onClick={() => setCreateDialogOpen(true)}>
           <Plus className="w-4 h-4 mr-2" />
-          Add Webhook
+          {t("addWebhook")}
         </Button>
       </div>
 
@@ -494,11 +539,11 @@ export function WebhooksView() {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>URL</TableHead>
-                <TableHead>Method</TableHead>
-                <TableHead>Event Types</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Created At</TableHead>
+                <TableHead>{t("tableHeaderUrl")}</TableHead>
+                <TableHead>{t("tableHeaderMethod")}</TableHead>
+                <TableHead>{t("tableHeaderEventTypes")}</TableHead>
+                <TableHead>{t("tableHeaderStatus")}</TableHead>
+                <TableHead>{t("tableHeaderCreatedAt")}</TableHead>
                 <TableHead className="w-[120px]"></TableHead>
               </TableRow>
             </TableHeader>
@@ -525,7 +570,7 @@ export function WebhooksView() {
                           </span>
                         ))
                       ) : (
-                        <span className="text-xs text-muted-foreground">All events</span>
+                        <span className="text-xs text-muted-foreground">{t("allEvents")}</span>
                       )}
                     </div>
                   </TableCell>
@@ -533,11 +578,11 @@ export function WebhooksView() {
                     {webhook.enabled ? (
                       <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
                         <CheckCircle className="w-3 h-3" />
-                        Enabled
+                        {t("statusEnabled")}
                       </span>
                     ) : (
                       <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-muted text-muted-foreground border border-border">
-                        Disabled
+                        {t("statusDisabled")}
                       </span>
                     )}
                   </TableCell>
@@ -551,17 +596,18 @@ export function WebhooksView() {
                         size="sm"
                         className="h-7 text-xs"
                         onClick={() => handleViewDeliveries(webhook)}
-                        title="View deliveries"
+                        title={t("viewDeliveriesTitle")}
                       >
                         <Eye className="w-3 h-3 mr-1" />
-                        Deliveries
+                        {t("deliveriesButton")}
                       </Button>
                       <Button
                         variant="ghost"
                         size="sm"
                         className="h-7 text-xs text-muted-foreground hover:text-foreground"
                         onClick={() => handleOpenEdit(webhook)}
-                        title="Edit webhook"
+                        title={t("editWebhookTitle")}
+                        aria-label={t("editWebhookAriaLabel")}
                       >
                         <Pencil className="w-3 h-3" />
                       </Button>
@@ -571,10 +617,11 @@ export function WebhooksView() {
                         className="h-7 text-xs text-muted-foreground hover:text-red-600 dark:hover:text-red-400"
                         onClick={() => setDeleteConfirmWebhook(webhook)}
                         disabled={deletingId === webhook.id}
-                        title="Delete webhook"
+                        title={t("deleteWebhookTitle")}
+                        aria-label={t("deleteWebhookAriaLabel")}
                       >
                         {deletingId === webhook.id ? (
-                          <Loader2 className="w-3 h-3 animate-spin" />
+                          <Spinner size="xs" />
                         ) : (
                           <Trash2 className="w-3 h-3" />
                         )}
@@ -585,11 +632,57 @@ export function WebhooksView() {
               ))}
             </TableBody>
           </Table>
+          {totalPages > 1 && (
+            <div className="flex items-center justify-between mt-3 pt-3 border-t">
+              <div className="text-xs text-muted-foreground">
+                {offset + 1}-{Math.min(offset + ITEMS_PER_PAGE, total)} of {total}
+              </div>
+              <div className="flex items-center gap-1">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => handlePageChange(1)}
+                  disabled={currentPage === 1 || loading}
+                  className="h-7 w-7 p-0"
+                >
+                  <ChevronsLeft className="h-3 w-3" />
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => handlePageChange(currentPage - 1)}
+                  disabled={currentPage === 1 || loading}
+                  className="h-7 w-7 p-0"
+                >
+                  <ChevronLeft className="h-3 w-3" />
+                </Button>
+                <span className="text-xs px-2">
+                  {currentPage} / {totalPages}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => handlePageChange(currentPage + 1)}
+                  disabled={currentPage === totalPages || loading}
+                  className="h-7 w-7 p-0"
+                >
+                  <ChevronRight className="h-3 w-3" />
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => handlePageChange(totalPages)}
+                  disabled={currentPage === totalPages || loading}
+                  className="h-7 w-7 p-0"
+                >
+                  <ChevronsRight className="h-3 w-3" />
+                </Button>
+              </div>
+            </div>
+          )}
         </div>
       ) : (
-        <p className="text-muted-foreground text-center py-8 text-sm">
-          No webhooks configured. Add a webhook to receive event notifications.
-        </p>
+        <p className="text-muted-foreground text-center py-8 text-sm">{t("emptyStateCanManage")}</p>
       )}
 
       {/* Create Webhook Dialog */}
@@ -605,16 +698,14 @@ export function WebhooksView() {
       >
         <DialogContent className="max-w-lg max-h-[85vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Add Webhook</DialogTitle>
-            <DialogDescription>
-              Configure a webhook endpoint to receive event notifications.
-            </DialogDescription>
+            <DialogTitle>{t("createDialogTitle")}</DialogTitle>
+            <DialogDescription>{t("createDialogDescription")}</DialogDescription>
           </DialogHeader>
 
           <div className="space-y-4 py-2">
             {/* Type (display only for now) */}
             <div className="space-y-1.5">
-              <Label>Type</Label>
+              <Label>{t("formTypeLabel")}</Label>
               <div className="flex items-center h-9 px-3 rounded-md border border-border bg-muted text-sm text-muted-foreground">
                 HTTP
               </div>
@@ -623,12 +714,12 @@ export function WebhooksView() {
             {/* URL */}
             <div className="space-y-1.5">
               <Label htmlFor="webhook-url">
-                URL <span className="text-red-500">*</span>
+                {t("formUrlLabel")} <span className="text-red-500">*</span>
               </Label>
               <Input
                 id="webhook-url"
                 type="url"
-                placeholder="https://example.com/webhook"
+                placeholder={t("formUrlPlaceholder")}
                 value={form.url}
                 onChange={(e) => setForm((prev) => ({ ...prev, url: e.target.value }))}
               />
@@ -637,7 +728,7 @@ export function WebhooksView() {
             {/* Method + Timeout row */}
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1.5">
-                <Label>Method</Label>
+                <Label>{t("formMethodLabel")}</Label>
                 <Select
                   value={form.http_config.method}
                   onValueChange={(v) =>
@@ -657,7 +748,7 @@ export function WebhooksView() {
                 </Select>
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor="webhook-timeout">Timeout (seconds)</Label>
+                <Label htmlFor="webhook-timeout">{t("formTimeoutLabel")}</Label>
                 <Input
                   id="webhook-timeout"
                   type="number"
@@ -680,13 +771,14 @@ export function WebhooksView() {
             {/* Secret */}
             <div className="space-y-1.5">
               <Label htmlFor="webhook-secret">
-                Secret <span className="text-muted-foreground text-xs">(optional)</span>
+                {t("formSecretLabel")}{" "}
+                <span className="text-muted-foreground text-xs">{t("formSecretOptional")}</span>
               </Label>
               <div className="relative">
                 <Input
                   id="webhook-secret"
                   type={showSecret ? "text" : "password"}
-                  placeholder="Signing secret"
+                  placeholder={t("formSecretPlaceholderOptional")}
                   value={form.secret}
                   onChange={(e) => setForm((prev) => ({ ...prev, secret: e.target.value }))}
                   className="pr-10"
@@ -696,6 +788,7 @@ export function WebhooksView() {
                   onClick={() => setShowSecret((v) => !v)}
                   className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
                   tabIndex={-1}
+                  aria-label={showSecret ? t("formHideSecret") : t("formShowSecret")}
                 >
                   {showSecret ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                 </button>
@@ -704,7 +797,7 @@ export function WebhooksView() {
 
             {/* Custom Headers */}
             <KVEditor
-              label="Custom Headers"
+              label={t("formCustomHeaders")}
               pairs={form.http_config.headers}
               onChange={(pairs) =>
                 setForm((prev) => ({
@@ -716,7 +809,7 @@ export function WebhooksView() {
 
             {/* Custom Query Params */}
             <KVEditor
-              label="Query Parameters"
+              label={t("formQueryParams")}
               pairs={form.http_config.params}
               onChange={(pairs) =>
                 setForm((prev) => ({
@@ -728,7 +821,7 @@ export function WebhooksView() {
 
             {/* Event Types */}
             <div className="space-y-2">
-              <Label>Event Types</Label>
+              <Label>{t("formEventTypes")}</Label>
               <div className="space-y-2">
                 {AVAILABLE_EVENT_TYPES.map((eventType) => (
                   <div key={eventType} className="flex items-center gap-2">
@@ -755,7 +848,7 @@ export function WebhooksView() {
                 checked={form.enabled}
                 onCheckedChange={(checked) => setForm((prev) => ({ ...prev, enabled: checked }))}
               />
-              <Label htmlFor="webhook-enabled">Enabled</Label>
+              <Label htmlFor="webhook-enabled">{t("formEnabled")}</Label>
             </div>
           </div>
 
@@ -765,16 +858,16 @@ export function WebhooksView() {
               onClick={() => setCreateDialogOpen(false)}
               disabled={creating}
             >
-              Cancel
+              {t("cancel")}
             </Button>
             <Button onClick={handleCreate} disabled={creating || !form.url}>
               {creating ? (
                 <>
-                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                  Creating...
+                  <Spinner size="sm" className="mr-2" />
+                  {t("creating")}
                 </>
               ) : (
-                "Create Webhook"
+                t("createWebhook")
               )}
             </Button>
           </DialogFooter>
@@ -796,14 +889,14 @@ export function WebhooksView() {
       >
         <DialogContent className="max-w-lg max-h-[85vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Edit Webhook</DialogTitle>
-            <DialogDescription>Update the webhook configuration.</DialogDescription>
+            <DialogTitle>{t("editDialogTitle")}</DialogTitle>
+            <DialogDescription>{t("editDialogDescription")}</DialogDescription>
           </DialogHeader>
 
           <div className="space-y-4 py-2">
             {/* Type */}
             <div className="space-y-1.5">
-              <Label>Type</Label>
+              <Label>{t("formTypeLabel")}</Label>
               <div className="flex items-center h-9 px-3 rounded-md border border-border bg-muted text-sm text-muted-foreground">
                 HTTP
               </div>
@@ -812,12 +905,12 @@ export function WebhooksView() {
             {/* URL */}
             <div className="space-y-1.5">
               <Label htmlFor="edit-webhook-url">
-                URL <span className="text-red-500">*</span>
+                {t("formUrlLabel")} <span className="text-red-500">*</span>
               </Label>
               <Input
                 id="edit-webhook-url"
                 type="url"
-                placeholder="https://example.com/webhook"
+                placeholder={t("formUrlPlaceholder")}
                 value={editForm.url}
                 onChange={(e) => setEditForm((prev) => ({ ...prev, url: e.target.value }))}
               />
@@ -826,7 +919,7 @@ export function WebhooksView() {
             {/* Method + Timeout */}
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1.5">
-                <Label>Method</Label>
+                <Label>{t("formMethodLabel")}</Label>
                 <Select
                   value={editForm.http_config.method}
                   onValueChange={(v) =>
@@ -846,7 +939,7 @@ export function WebhooksView() {
                 </Select>
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor="edit-webhook-timeout">Timeout (seconds)</Label>
+                <Label htmlFor="edit-webhook-timeout">{t("formTimeoutLabel")}</Label>
                 <Input
                   id="edit-webhook-timeout"
                   type="number"
@@ -868,12 +961,12 @@ export function WebhooksView() {
 
             {/* Secret */}
             <div className="space-y-1.5">
-              <Label htmlFor="edit-webhook-secret">Secret</Label>
+              <Label htmlFor="edit-webhook-secret">{t("formSecretLabel")}</Label>
               <div className="relative">
                 <Input
                   id="edit-webhook-secret"
                   type={showEditSecret ? "text" : "password"}
-                  placeholder="Leave blank to keep existing"
+                  placeholder={t("formSecretPlaceholderEdit")}
                   value={editForm.secret}
                   disabled={clearSecret}
                   onChange={(e) => setEditForm((prev) => ({ ...prev, secret: e.target.value }))}
@@ -884,6 +977,7 @@ export function WebhooksView() {
                   onClick={() => setShowEditSecret((v) => !v)}
                   className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
                   tabIndex={-1}
+                  aria-label={showEditSecret ? t("formHideSecret") : t("formShowSecret")}
                 >
                   {showEditSecret ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                 </button>
@@ -901,14 +995,14 @@ export function WebhooksView() {
                   htmlFor="edit-clear-secret"
                   className="text-xs text-muted-foreground cursor-pointer"
                 >
-                  Clear existing secret
+                  {t("formClearSecret")}
                 </Label>
               </div>
             </div>
 
             {/* Custom Headers */}
             <KVEditor
-              label="Custom Headers"
+              label={t("formCustomHeaders")}
               pairs={editForm.http_config.headers}
               onChange={(pairs) =>
                 setEditForm((prev) => ({
@@ -920,7 +1014,7 @@ export function WebhooksView() {
 
             {/* Custom Query Params */}
             <KVEditor
-              label="Query Parameters"
+              label={t("formQueryParams")}
               pairs={editForm.http_config.params}
               onChange={(pairs) =>
                 setEditForm((prev) => ({
@@ -932,7 +1026,7 @@ export function WebhooksView() {
 
             {/* Event Types */}
             <div className="space-y-2">
-              <Label>Event Types</Label>
+              <Label>{t("formEventTypes")}</Label>
               <div className="space-y-2">
                 {AVAILABLE_EVENT_TYPES.map((eventType) => (
                   <div key={eventType} className="flex items-center gap-2">
@@ -968,22 +1062,22 @@ export function WebhooksView() {
                   setEditForm((prev) => ({ ...prev, enabled: checked }))
                 }
               />
-              <Label htmlFor="edit-webhook-enabled">Enabled</Label>
+              <Label htmlFor="edit-webhook-enabled">{t("formEnabled")}</Label>
             </div>
           </div>
 
           <DialogFooter>
             <Button variant="outline" onClick={() => setEditDialogOpen(false)} disabled={saving}>
-              Cancel
+              {t("cancel")}
             </Button>
             <Button onClick={handleSave} disabled={saving || !editForm.url}>
               {saving ? (
                 <>
-                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                  Saving...
+                  <Spinner size="sm" className="mr-2" />
+                  {t("saving")}
                 </>
               ) : (
-                "Save Changes"
+                t("saveChanges")
               )}
             </Button>
           </DialogFooter>
@@ -999,11 +1093,8 @@ export function WebhooksView() {
       >
         <DialogContent className="max-w-md">
           <DialogHeader>
-            <DialogTitle>Delete Webhook</DialogTitle>
-            <DialogDescription>
-              Are you sure you want to delete this webhook? This action cannot be undone and all
-              pending deliveries will be cancelled.
-            </DialogDescription>
+            <DialogTitle>{t("deleteDialogTitle")}</DialogTitle>
+            <DialogDescription>{t("deleteDialogDescription")}</DialogDescription>
           </DialogHeader>
           {deleteConfirmWebhook && (
             <div className="py-2">
@@ -1014,7 +1105,7 @@ export function WebhooksView() {
           )}
           <DialogFooter>
             <Button variant="outline" onClick={() => setDeleteConfirmWebhook(null)}>
-              Cancel
+              {t("cancel")}
             </Button>
             <Button
               variant="destructive"
@@ -1023,11 +1114,11 @@ export function WebhooksView() {
             >
               {deletingId ? (
                 <>
-                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                  Deleting...
+                  <Spinner size="sm" className="mr-2" />
+                  {t("deleting")}
                 </>
               ) : (
-                "Delete Webhook"
+                t("deleteWebhookConfirm")
               )}
             </Button>
           </DialogFooter>
@@ -1047,7 +1138,7 @@ export function WebhooksView() {
       >
         <DialogContent className="max-w-3xl max-h-[80vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Webhook Deliveries</DialogTitle>
+            <DialogTitle>{t("deliveriesDialogTitle")}</DialogTitle>
             {selectedWebhook && (
               <DialogDescription className="font-mono text-xs truncate">
                 {selectedWebhook.url}
@@ -1057,7 +1148,7 @@ export function WebhooksView() {
 
           {loadingDeliveries ? (
             <div className="flex items-center justify-center py-8">
-              <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+              <Spinner size="md" variant="jump" />
             </div>
           ) : deliveries.length > 0 ? (
             <>
@@ -1066,11 +1157,13 @@ export function WebhooksView() {
                   <TableHeader>
                     <TableRow>
                       <TableHead className="w-8 pl-3 pr-0" />
-                      <TableHead>Status</TableHead>
-                      <TableHead>HTTP</TableHead>
-                      <TableHead className="text-center">Attempts</TableHead>
-                      <TableHead>Event</TableHead>
-                      <TableHead>Created At</TableHead>
+                      <TableHead>{t("deliveriesTableHeaderStatus")}</TableHead>
+                      <TableHead>{t("deliveriesTableHeaderHttp")}</TableHead>
+                      <TableHead className="text-center">
+                        {t("deliveriesTableHeaderAttempts")}
+                      </TableHead>
+                      <TableHead>{t("deliveriesTableHeaderEvent")}</TableHead>
+                      <TableHead>{t("deliveriesTableHeaderCreatedAt")}</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -1092,16 +1185,14 @@ export function WebhooksView() {
                     onClick={handleLoadMoreDeliveries}
                     disabled={loadingMoreDeliveries}
                   >
-                    {loadingMoreDeliveries && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
-                    Load more
+                    {loadingMoreDeliveries && <Spinner size="sm" className="mr-2" />}
+                    {t("loadMore")}
                   </Button>
                 </div>
               )}
             </>
           ) : (
-            <p className="text-muted-foreground text-center py-8 text-sm">
-              No deliveries yet for this webhook.
-            </p>
+            <p className="text-muted-foreground text-center py-8 text-sm">{t("noDeliveries")}</p>
           )}
         </DialogContent>
       </Dialog>

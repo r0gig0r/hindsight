@@ -1,5 +1,7 @@
 // Moltbot plugin API types (minimal subset needed for this plugin)
 
+import type { MinScores } from "@vectorize-io/hindsight-client";
+
 export interface PluginPromptHookResult {
   prependContext?: string;
   prependSystemContext?: string;
@@ -80,6 +82,25 @@ export interface PluginConfig {
    * `observations_mission` field on first use.
    */
   observationsMission?: string;
+  /**
+   * Fact extraction mode stamped onto dynamic/static banks on first use.
+   * Leave unset to keep the Hindsight server default for new banks.
+   */
+  retainExtractionMode?: "concise" | "verbose" | "custom" | "verbatim" | "chunks";
+  /** Toggle observation consolidation for new banks. */
+  enableObservations?: boolean;
+  /** Toggle automatic consolidation scheduling for new banks. */
+  enableAutoConsolidation?: boolean;
+  /** Reflect disposition traits (1–5) stamped on first bank use. */
+  dispositionSkepticism?: number;
+  dispositionLiteralism?: number;
+  dispositionEmpathy?: number;
+  /**
+   * Controlled vocabulary for entity labels. Either a list of attribute defs or
+   * a `{ attributes: [...] }` object — passed through to PATCH /banks/{id}/config
+   * as `entity_labels`. Other shapes are ignored (the server only accepts these two).
+   */
+  entityLabels?: unknown;
   embedPort?: number;
   daemonIdleTimeout?: number; // Seconds before daemon shuts down (0 = never)
   embedVersion?: string; // hindsight-embed version (default: "latest")
@@ -96,6 +117,7 @@ export interface PluginConfig {
   bankIdPrefix?: string; // Prefix for bank IDs (e.g. 'prod' -> 'prod-slack-C123')
   retainTags?: string[]; // Tags applied to all retained documents after trimming and deduplication; auto-retain merges these with inline per-message retain-tag directives (e.g. ['source_system:openclaw', 'agent:agentname'])
   retainSource?: string; // Source written into retained document metadata (default: 'openclaw')
+  retainContext?: string; // Interpretation guidance sent via the retain API context field. Defaults to built-in OpenClaw transcript/routing metadata guidance.
   excludeProviders?: string[]; // Message providers to exclude from recall/retain (e.g. ['telegram', 'discord'])
   autoRecall?: boolean; // Auto-recall memories on every prompt (default: true). Set to false when agent has its own recall tool.
   dynamicBankGranularity?: Array<"agent" | "provider" | "channel" | "user">; // Fields for bank ID derivation. Default: ['agent', 'channel', 'user']
@@ -105,10 +127,10 @@ export interface PluginConfig {
   retainToolCalls?: boolean; // When true (default) and retainFormat='json', each message's content is an Anthropic-shaped array of typed blocks (text, tool_use, tool_result) including the agent's tool calls and their results. When false, content is a flat string with only text.
   recallBudget?: "low" | "mid" | "high"; // Recall effort. Default: 'mid'
   recallMaxTokens?: number; // Max tokens for recall response. Default: 1024
-  recallTypes?: Array<"world" | "experience" | "observation">; // Memory types to recall. Default: ['world', 'experience']
+  recallTypes?: Array<"world" | "experience" | "observation">; // Memory types to recall. Default: ['observation'] — surfaces only the consolidated, deduplicated view (raw world/experience facts can drive the same answer multiple times when many memories say the same thing).
+  preferObservations?: boolean; // When true, recall drops raw facts already consolidated into an observation while keeping unconsolidated ones. Pair with recallTypes including raw types to catch just-retained facts without duplicating consolidated content. Default: false.
+  recallMinScores?: MinScores; // Optional per-stage score floors. Missing fields impose no floor; missing/null result scores pass.
   recallRoles?: Array<"user" | "assistant" | "system" | "tool">; // Roles to include when composing contextual recall query. Default: ['user', 'assistant']
-  includeSenderContext?: boolean; // When true (default), prepend a session context block (sender, channel, provider) to retained transcripts so similarity search can distinguish memories by speaker even when dynamicBankGranularity does not include 'user'. Set false to omit.
-  retainDocumentScope?: "session" | "turn"; // Granularity of the retained document_id. 'session' (default) groups all retains under a single document per OpenClaw session (`openclaw:{sessionKey}`). 'turn' produces a new document per retain (`openclaw:{sessionKey}:turn:NNNNNN` / `:window:NNNNNN`).
   retainEveryNTurns?: number; // Retain every Nth turn (1 = every turn, default: 1). Values > 1 enable chunked retention.
   retainOverlapTurns?: number; // Extra prior turns included when chunked retention fires (default: 0). Window = retainEveryNTurns + retainOverlapTurns.
   recallTopK?: number; // Max number of memories to inject. Default: unlimited
@@ -116,7 +138,7 @@ export interface PluginConfig {
   recallTimeoutMs?: number; // Timeout for auto-recall in milliseconds. Default: 10000
   recallMaxQueryChars?: number; // Max chars for composed recall query. Default: 800
   recallPromptPreamble?: string; // Prompt preamble placed above recalled memories. Default: built-in guidance text.
-  recallInjectionPosition?: "prepend" | "append" | "user"; // Where to inject recalled memories. 'prepend' = start of system prompt (default), 'append' = end of system prompt (preserves prompt cache), 'user' = before user message.
+  recallInjectionPosition?: "prepend" | "append" | "user"; // Where to inject recalled memories. 'user' = before user message (default, preserves system prompt cache), 'prepend' = start of system prompt, 'append' = end of system prompt.
   experimentalHolographicEnhancements?: boolean; // Enable experimental holographic-inspired recall controls. Default: false.
   experimentalRecallShadow?: boolean; // When true, run enhanced recall but inject baseline memories. Default: false.
   experimentalRecallVariant?: "baseline" | "entity_tools" | "trust" | "structural"; // Experimental recall variant. Default: "baseline".
@@ -130,6 +152,15 @@ export interface PluginConfig {
   retainQueueMaxAgeMs?: number; // Max age in ms for queued items. -1 = keep forever (default: -1)
   retainQueueFlushIntervalMs?: number; // How often to attempt flushing the queue in ms. Default: 60000 (1 min)
   enableKnowledgeTools?: boolean; // Register agent_knowledge_* tools. Default: false. Set to true by the self-driving-agents CLI.
+  /**
+   * Regex source matching a human display-name prefix that some channels
+   * prepend to user text ("Alice: today weather?"). Supply the name part only
+   * (e.g. `Alice|Bob` or `[A-Za-z ]{1,20}`) — the `:` separator and anchoring
+   * are added by the plugin. When set, the prefix is removed from both recall
+   * queries and retained transcripts. Unset (default) strips nothing; an
+   * invalid regex is ignored. (#3070)
+   */
+  senderPrefixPattern?: string;
   /**
    * Emit per-hook latency lines (`before_prompt_build` recall RPC time,
    * `agent_end` retain RPC time, total hook time) at info level so users can
@@ -168,8 +199,11 @@ export type {
 export interface RetainRequest {
   content: string;
   documentId?: string;
+  context?: string;
   metadata?: Record<string, unknown>;
   tags?: string[];
+  /** Stable identity reused when an asynchronous retain is retried. */
+  operationId?: string;
   /**
    * `'append'` concatenates this content to the existing document text
    * (Hindsight ≥ 0.5 only — older versions silently ignore the field and

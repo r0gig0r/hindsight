@@ -13,6 +13,8 @@ from hindsight_api import LLMConfig
 from hindsight_api.config import _get_raw_config
 from hindsight_api.engine.retain.fact_extraction import extract_facts_from_text
 
+pytestmark = pytest.mark.hs_llm_core
+
 
 class TestCausalRelationships:
     """Tests for causal relationship extraction and validation."""
@@ -38,7 +40,11 @@ After searching for weeks, I finally found a cheaper apartment in Brooklyn.
         llm_config = LLMConfig.from_env()
 
         facts, _, _ = await extract_facts_from_text(
-            text=text, event_date=datetime(2024, 3, 15), context=context, llm_config=llm_config, agent_name="TestUser",
+            text=text,
+            event_date=datetime(2024, 3, 15),
+            context=context,
+            llm_config=llm_config,
+            agent_name="TestUser",
             config=_get_raw_config(),
         )
 
@@ -79,11 +85,10 @@ After searching for weeks, I finally found a cheaper apartment in Brooklyn.
             f"Got {len(all_causal_relations)}: {all_causal_relations}"
         )
 
-        # Verify relation types are valid (passive only - facts reference PREVIOUS facts)
-        valid_types = {"caused_by", "enabled_by", "prevented_by"}
+        # Retain writes the single canonical passive form for previous facts.
         for rel in all_causal_relations:
-            assert rel["relation_type"] in valid_types, (
-                f"Invalid relation_type '{rel['relation_type']}'. Must be one of {valid_types}"
+            assert rel["relation_type"] == "caused_by", (
+                f"Invalid relation_type '{rel['relation_type']}'. Must be 'caused_by'"
             )
 
     @pytest.mark.asyncio
@@ -107,7 +112,11 @@ The renovation took three months and cost $15,000.
         llm_config = LLMConfig.from_env()
 
         facts, _, _ = await extract_facts_from_text(
-            text=text, event_date=datetime(2024, 6, 1), context=context, llm_config=llm_config, agent_name="TestUser",
+            text=text,
+            event_date=datetime(2024, 6, 1),
+            context=context,
+            llm_config=llm_config,
+            agent_name="TestUser",
             config=_get_raw_config(),
         )
 
@@ -138,7 +147,11 @@ Machine learning fascinated me so much that I changed my career to data science.
         llm_config = LLMConfig.from_env()
 
         facts, _, _ = await extract_facts_from_text(
-            text=text, event_date=datetime(2024, 1, 1), context=context, llm_config=llm_config, agent_name="TestUser",
+            text=text,
+            event_date=datetime(2024, 1, 1),
+            context=context,
+            llm_config=llm_config,
+            agent_name="TestUser",
             config=_get_raw_config(),
         )
 
@@ -151,10 +164,9 @@ Machine learning fascinated me so much that I changed my career to data science.
                     )
 
     @pytest.mark.asyncio
-    async def test_bidirectional_causal_relationships(self):
+    async def test_causal_relationships_use_backward_references(self):
         """
-        Test that bidirectional causal relationships (causes and caused_by)
-        are handled correctly.
+        Test that causal relationships are represented as backward references.
         """
         text = """
 My promotion at work caused me to move to New York.
@@ -166,7 +178,11 @@ The new role enabled me to lead a team of engineers.
         llm_config = LLMConfig.from_env()
 
         facts, _, _ = await extract_facts_from_text(
-            text=text, event_date=datetime(2024, 2, 15), context=context, llm_config=llm_config, agent_name="TestUser",
+            text=text,
+            event_date=datetime(2024, 2, 15),
+            context=context,
+            llm_config=llm_config,
+            agent_name="TestUser",
             config=_get_raw_config(),
         )
 
@@ -178,4 +194,3 @@ The new role enabled me to lead a team of engineers.
                         f"Invalid target_fact_index {rel.target_fact_index} in fact {i}. "
                         f"Must reference previous facts only (valid range: 0 to {i - 1})"
                     )
-

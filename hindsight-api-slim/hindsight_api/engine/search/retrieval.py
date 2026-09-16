@@ -8,21 +8,25 @@ Implements:
 4. Temporal retrieval (time-aware search with spreading)
 """
 
-import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from ...config import get_config
-from ..db_utils import acquire_with_retry
+from ..db.ops import UpdatedWindow
 from ..memory_engine import fq_table
 from ..sql import create_sql_dialect
+from .bm25_term_selection import build_bm25_query_text
 from .graph_retrieval import GraphRetriever
-from .link_expansion_retrieval import LinkExpansionRetriever
+from .link_expansion_retrieval import GRAPH_SEED_LIMIT, LinkExpansionRetriever
 from .tags import TagGroup, TagsMatch, build_tag_groups_where_clause, build_tags_where_clause_simple
 from .types import GraphRetrievalTimings, RetrievalResult
+
+if TYPE_CHECKING:
+    from ..query_analyzer import QueryAnalyzer
+    from ..response_models import TemporalWindow
 
 logger = logging.getLogger(__name__)
 
@@ -64,14 +68,37 @@ class MultiFactTypeRetrievalResult:
     max_conn_wait: float = 0.0
 
 
+@dataclass
+class SemanticBm25Result:
+    """Per-fact-type candidates returned by the shared semantic/BM25 query."""
+
+    semantic: list[RetrievalResult]
+    bm25: list[RetrievalResult]
+    graph_seeds: list[RetrievalResult] | None
+
+
 # Default graph retriever instance (can be overridden)
 _default_graph_retriever: GraphRetriever | None = None
 
 
 def get_default_graph_retriever() -> GraphRetriever:
-    """Get or create the default graph retriever based on config."""
+    """Get or create the default graph retriever.
+
+    The memories store gets first refusal: the SQL retrievers walk `memory_links`
+    and `unit_entities`, so a store that keeps its links elsewhere has to supply
+    its own or the graph arm would silently return nothing. A store whose links
+    are in Postgres returns None and ``config.graph_retriever`` decides, as ever.
+    """
     global _default_graph_retriever
     if _default_graph_retriever is None:
+        from ..memories import get_memories
+
+        from_store = get_memories().graph_retriever()
+        if from_store is not None:
+            _default_graph_retriever = from_store
+            logger.info("Using the memories store's graph retriever")
+            return _default_graph_retriever
+
         config = get_config()
         retriever_type = config.graph_retriever.lower()
         if retriever_type == "link_expansion":
@@ -83,13 +110,17 @@ def get_default_graph_retriever() -> GraphRetriever:
     return _default_graph_retriever
 
 
-def set_default_graph_retriever(retriever: GraphRetriever) -> None:
-    """Set the default graph retriever (for configuration/testing)."""
+def set_default_graph_retriever(retriever: GraphRetriever | None) -> None:
+    """Set the default graph retriever (for configuration/testing).
+
+    ``None`` clears the cache so the next call re-resolves it — used when the
+    memories store changes, since the retriever is chosen from it.
+    """
     global _default_graph_retriever
     _default_graph_retriever = retriever
 
 
-async def retrieve_semantic_bm25_combined(
+async def retrieve_semantic_bm25_combined_sql(
     conn,
     query_emb_str: str,
     query_text: str,
@@ -101,9 +132,19 @@ async def retrieve_semantic_bm25_combined(
     tag_groups: list[TagGroup] | None = None,
     created_after: datetime | None = None,
     created_before: datetime | None = None,
-) -> dict[str, tuple[list[RetrievalResult], list[RetrievalResult]]]:
+    min_semantic: float | None = None,
+    min_keyword: float | None = None,
+    graph_seed_min_similarity: float | None = None,
+    enable_text_search: bool = True,
+) -> dict[str, SemanticBm25Result]:
     """
     Combined semantic + BM25 retrieval for multiple fact types in a single query.
+
+    The BM25 half is conditional. It is omitted when the query has no word characters
+    to search for, and when ``enable_text_search`` is False — the pure-vector mode, where
+    the emitted SQL is the semantic UNION alone and every BM25 cost (tokenization, the
+    pg_stats term-selection lookup, the ``@@``/rank scan) is skipped rather than run and
+    discarded.
 
     Uses UNION ALL of per-fact_type subqueries so that each arm has its own
     ORDER BY ... LIMIT, enabling the partial HNSW indexes per fact_type instead
@@ -114,10 +155,14 @@ async def retrieve_semantic_bm25_combined(
     idx_mu_emb_observation, idx_mu_emb_experience), created automatically by
     Alembic migration a3b4c5d6e7f8_add_partial_hnsw_indexes.py.
 
-    HNSW is approximate — semantic arms over-fetch by 5x (min 100) and trim to
-    limit in Python to compensate.  ef_search=200 is set globally on pool
-    connections at init time (see memory_engine.py) to improve recall on sparse
-    graphs.
+    Each semantic arm asks for exactly ``limit`` rows. It used to ask for ``limit * 5``
+    and trim back to ``limit`` in Python "to compensate for HNSW approximation", but that
+    could never work: the rows arrive already ordered by distance within their arm, so
+    keeping the first ``limit`` of ``limit * 5`` returns precisely what ``LIMIT limit``
+    would have — the extra rows were fetched, decoded and dropped, unread. What actually
+    governs ANN quality is the size of the candidate list the scan explores, which is a
+    connection setting, not a row count; the caller sizes it for this query (see
+    ``PostgresMemories.search``) rather than over-fetching rows here.
 
     fact_type values are inlined as literals (safe: they come from a controlled
     internal enum, never from user input).
@@ -133,22 +178,40 @@ async def retrieve_semantic_bm25_combined(
         tags_match: Tag matching mode
 
     Returns:
-        Dict mapping fact_type -> (semantic_results, bm25_results)
+        Candidate groups for each fact type. ``graph_seeds`` is ``None`` when
+        the semantic query's threshold is too strict to cover graph entry points.
     """
-    result_dict: dict[str, tuple[list[RetrievalResult], list[RetrievalResult]]] = {ft: ([], []) for ft in fact_types}
+    result_dict = {ft: SemanticBm25Result(semantic=[], bm25=[], graph_seeds=None) for ft in fact_types}
 
-    tokens = tokenize_query(query_text)
+    config = get_config()
+    # No tokens means no BM25 arm, which is exactly what a bank with text search switched
+    # off wants — so the flag is applied here rather than at a second gate. Tokenizing
+    # feeds nothing else, so skipping it is a real saving, not just tidiness.
+    tokens = tokenize_query(query_text) if enable_text_search else []
 
-    # Over-fetch for HNSW approximation; semantic results trimmed to limit in Python.
-    hnsw_fetch = max(limit * 5, 100)
+    # Per-request retrieval-level score floors (recall min_scores.semantic / .keyword)
+    # override the global config defaults for this query, pruning weak matches in
+    # the SQL arms before fusion.
+    sem_min = min_semantic if min_semantic is not None else config.semantic_min_similarity
+    bm25_min = min_keyword if min_keyword is not None else config.bm25_min_score
+
+    # How many semantic rows each arm must return. Two consumers read them: the semantic
+    # list itself (``limit``), and — when the dense rows also clear the graph arm's
+    # threshold — its entry points (``GRAPH_SEED_LIMIT``), derived from the same ordered
+    # rows instead of a duplicate ANN query per fact type. A budget below GRAPH_SEED_LIMIT
+    # would otherwise starve the graph arm of seeds.
+    graph_seed_threshold = (
+        graph_seed_min_similarity
+        if graph_seed_min_similarity is not None and sem_min <= graph_seed_min_similarity
+        else None
+    )
+    semantic_fetch = max(limit, GRAPH_SEED_LIMIT if graph_seed_threshold is not None else 0)
 
     cols = (
         "id, text, context, event_date, occurred_start, occurred_end, mentioned_at, "
         "fact_type, document_id, chunk_id, tags, metadata, proof_count, trust_score, helpful_count, unhelpful_count"
     )
     table = fq_table("memory_units")
-
-    config = get_config()
 
     # Use the SQL dialect to build backend-specific query arms, avoiding
     # inline if/else branches for each database.
@@ -160,7 +223,7 @@ async def retrieve_semantic_bm25_combined(
     # $1 = query_emb_str  (semantic arms)
     # $2 = bank_id
     # When tokens present:
-    #   $3 = limit          (BM25 LIMIT; semantic uses inlined hnsw_fetch literal)
+    #   $3 = limit          (BM25 LIMIT; semantic inlines the same limit as a literal)
     #   $4 = bm25_text
     #   $5 = tags           (if present)
     #   $6+ = tag_groups params (one per leaf)
@@ -173,21 +236,26 @@ async def retrieve_semantic_bm25_combined(
 
     # tag_groups params start immediately after the tags param slot
     tag_groups_param_start = tags_param_idx + (1 if tags else 0)
-    groups_clause, groups_params, _ = build_tag_groups_where_clause(tag_groups, tag_groups_param_start)
+    built = build_tag_groups_where_clause(tag_groups, tag_groups_param_start)
+    groups_clause = built.sql
+    groups_params = built.params
 
-    # --- created_at time range filter (appended after tags/groups) ---
+    # --- created_after/created_before time range filter (appended after tags/groups) ---
+    # The bounds are named for creation but filter `updated_at` — "memories that changed
+    # in this window", so an edited fact re-enters it. That is what the mental-model delta
+    # refresh needs from its watermark; see META_UPDATED_AT in engine/memories/base.py.
     # Param indices are computed relative to the final params list built below,
     # so we pre-compute the next available index after all preceding params.
     _next_idx = tag_groups_param_start + len(groups_params)
-    created_range_clause = ""
-    created_range_params: list[Any] = []
+    updated_range_clause = ""
+    updated_range_params: list[Any] = []
     if created_after is not None:
-        created_range_params.append(created_after)
-        created_range_clause += f" AND updated_at > ${_next_idx}"
+        updated_range_params.append(created_after)
+        updated_range_clause += f" AND updated_at > ${_next_idx}"
         _next_idx += 1
     if created_before is not None:
-        created_range_params.append(created_before)
-        created_range_clause += f" AND updated_at < ${_next_idx}"
+        updated_range_params.append(created_before)
+        updated_range_clause += f" AND updated_at < ${_next_idx}"
         _next_idx += 1
 
     # --- Semantic UNION ALL arms (one per fact_type) ---
@@ -200,10 +268,11 @@ async def retrieve_semantic_bm25_combined(
             fact_type=ft,
             embedding_param="$1",
             bank_id_param="$2",
-            fetch_limit=hnsw_fetch,
+            fetch_limit=semantic_fetch,
+            min_similarity=sem_min,
             tags_clause=tags_clause,
             groups_clause=groups_clause,
-            extra_where=created_range_clause,
+            extra_where=updated_range_clause,
         )
         for ft in fact_types
     ]
@@ -211,7 +280,17 @@ async def retrieve_semantic_bm25_combined(
     # --- BM25 UNION ALL arms (one per fact_type, only when tokens present) ---
     if _include_bm25:
         text_ext = config.text_search_extension
-        bm25_text_param: str = dialect.prepare_bm25_text(tokens, query_text, text_search_extension=text_ext)
+        # Shared with knowledge search (search_knowledge_pages) so the two BM25
+        # paths cannot drift apart on query shape again — see build_bm25_query_text.
+        bm25_text_param: str = await build_bm25_query_text(
+            conn,
+            dialect,
+            tokens=tokens,
+            query_text=query_text,
+            table="memory_units",
+            language=config.text_search_extension_native_language,
+            config=config,
+        )
         for i, ft in enumerate(fact_types):
             arms.append(
                 dialect.build_bm25_arm(
@@ -225,7 +304,12 @@ async def retrieve_semantic_bm25_combined(
                     groups_clause=groups_clause,
                     arm_index=i,
                     text_search_extension=text_ext,
-                    extra_where=created_range_clause,
+                    bm25_language=config.text_search_extension_native_language,
+                    bm25_min_score=bm25_min,
+                    pg_search_function_schema=config.text_search_extension_pg_search_function_schema,
+                    pg_search_tokenizer=config.text_search_extension_pg_search_tokenizer,
+                    max_query_terms=config.bm25_max_query_terms,
+                    extra_where=updated_range_clause,
                 )
             )
 
@@ -238,7 +322,7 @@ async def retrieve_semantic_bm25_combined(
     if tags:
         params.append(tags)
     params.extend(groups_params)
-    params.extend(created_range_params)
+    params.extend(updated_range_params)
 
     try:
         rows = await conn.fetch(query, *params)
@@ -255,14 +339,15 @@ async def retrieve_semantic_bm25_combined(
             fb_tags_idx = 3
             fb_tags_clause = build_tags_where_clause_simple(tags, fb_tags_idx, match=tags_match)
             fb_groups_start = fb_tags_idx + (1 if tags else 0)
-            fb_groups_clause, _, _ = build_tag_groups_where_clause(tag_groups, fb_groups_start)
+            built = build_tag_groups_where_clause(tag_groups, fb_groups_start)
+            fb_groups_clause = built.sql
             fb_next_idx = fb_groups_start + len(groups_params)
-            fb_created_clause = ""
+            fb_updated_clause = ""
             if created_after is not None:
-                fb_created_clause += f" AND updated_at > ${fb_next_idx}"
+                fb_updated_clause += f" AND updated_at > ${fb_next_idx}"
                 fb_next_idx += 1
             if created_before is not None:
-                fb_created_clause += f" AND updated_at < ${fb_next_idx}"
+                fb_updated_clause += f" AND updated_at < ${fb_next_idx}"
                 fb_next_idx += 1
             fb_arms = [
                 dialect.build_semantic_arm(
@@ -271,10 +356,11 @@ async def retrieve_semantic_bm25_combined(
                     fact_type=ft,
                     embedding_param="$1",
                     bank_id_param="$2",
-                    fetch_limit=hnsw_fetch,
+                    fetch_limit=semantic_fetch,
+                    min_similarity=sem_min,
                     tags_clause=fb_tags_clause,
                     groups_clause=fb_groups_clause,
-                    extra_where=fb_created_clause,
+                    extra_where=fb_updated_clause,
                 )
                 for ft in fact_types
             ]
@@ -283,13 +369,13 @@ async def retrieve_semantic_bm25_combined(
             if tags:
                 fb_params.append(tags)
             fb_params.extend(groups_params)
-            fb_params.extend(created_range_params)
+            fb_params.extend(updated_range_params)
             rows = await conn.fetch(fb_query, *fb_params)
         else:
             raise
 
-    # Group results; trim semantic to limit (over-fetched for HNSW approximation).
-    sem_counts: dict[str, int] = {ft: 0 for ft in fact_types}
+    # Group results, converting only the prefix either consumer can observe.
+    semantic_candidates: dict[str, list[RetrievalResult]] = {ft: [] for ft in fact_types}
     for r in rows:
         row = dict(r)
         source = row.pop("source")
@@ -297,16 +383,84 @@ async def retrieve_semantic_bm25_combined(
         if ft not in result_dict:
             continue
         if source == "semantic":
-            if sem_counts[ft] < limit:
-                result_dict[ft][0].append(RetrievalResult.from_db_row(row))
-                sem_counts[ft] += 1
+            if len(semantic_candidates[ft]) < semantic_fetch:
+                semantic_candidates[ft].append(RetrievalResult.from_db_row(row))
         else:
-            result_dict[ft][1].append(RetrievalResult.from_db_row(row))
+            result_dict[ft].bm25.append(RetrievalResult.from_db_row(row))
+
+    for ft, candidates in semantic_candidates.items():
+        result_dict[ft].semantic.extend(candidates[:limit])
+        if graph_seed_threshold is not None:
+            result_dict[ft].graph_seeds = [
+                candidate
+                for candidate in candidates
+                if candidate.similarity is not None and candidate.similarity >= graph_seed_threshold
+            ][:GRAPH_SEED_LIMIT]
 
     return result_dict
 
 
-async def retrieve_temporal_combined(
+# Temporal entry-point selection tuning.
+_TEMPORAL_POOL_SIZE = 60  # ANN candidates fetched per fact_type before coverage selection
+_TEMPORAL_ENTRY_POINTS = 10  # entry points kept per fact_type after coverage selection
+_TEMPORAL_COVERAGE_BUCKETS = 8  # time-buckets the window is divided into for coverage
+
+
+def _coalesce_date(row: Any) -> datetime | None:
+    """The unit's effective time — matches COALESCE(occurred_start, mentioned_at, occurred_end)."""
+    return row["occurred_start"] or row["mentioned_at"] or row["occurred_end"]
+
+
+def _select_with_temporal_coverage(
+    pool: list,
+    start_date: datetime,
+    end_date: datetime,
+    limit: int,
+    n_buckets: int,
+) -> list:
+    """Pick `limit` entry points from a similarity-ranked pool, spread across the window.
+
+    The window [start_date, end_date] is split into `n_buckets` equal time-buckets.
+    Candidates are taken round-robin across the buckets that contain them — the
+    best-similarity item from each populated bucket first, then the second-best from each,
+    and so on — so every populated slice of the window is represented before any slice
+    contributes a second item. Within a tier, higher-similarity items lead. When the
+    in-window dates are degenerate (all in one bucket — e.g. a batch stamped with a single
+    date) this collapses to plain similarity order.
+    """
+    if len(pool) <= limit:
+        return list(pool)
+
+    ranked = sorted(pool, key=lambda r: r["similarity"], reverse=True)
+    span = (end_date - start_date).total_seconds()
+
+    def _bucket(row: Any) -> int:
+        d = _coalesce_date(row)
+        if d is None or span <= 0:
+            return 0
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=UTC)
+        frac = (d - start_date).total_seconds() / span
+        return max(0, min(int(frac * n_buckets), n_buckets - 1))
+
+    buckets: dict[int, list] = {}
+    for row in ranked:  # ranked is similarity-desc, so each bucket list inherits that order
+        buckets.setdefault(_bucket(row), []).append(row)
+
+    selected: list = []
+    tier = 0
+    while len(selected) < limit and any(len(b) > tier for b in buckets.values()):
+        # The tier-th best item from every bucket that still has one, strongest first.
+        tier_rows = [b[tier] for b in buckets.values() if len(b) > tier]
+        tier_rows.sort(key=lambda r: r["similarity"], reverse=True)
+        for row in tier_rows:
+            if len(selected) < limit:
+                selected.append(row)
+        tier += 1
+    return selected
+
+
+async def retrieve_temporal_combined_sql(
     conn,
     query_emb_str: str,
     bank_id: str,
@@ -349,87 +503,112 @@ async def retrieve_temporal_combined(
         end_date = end_date.replace(tzinfo=UTC)
 
     # Build tags clause
-    # Entry point query: fixed params are $1-$6, tags at $7
-    tags_clause = build_tags_where_clause_simple(tags, 7, match=tags_match)
-    tag_groups_param_start = 7 + (1 if tags else 0)
-    groups_clause, groups_params, _ = build_tag_groups_where_clause(tag_groups, tag_groups_param_start)
+    # Entry-point query: fixed params are $1-$5 (emb, bank, start, end, threshold), tags at $6.
+    # fact_type is inlined as a literal per UNION ALL arm (not a bind) — this avoids `unnest`,
+    # which has no Oracle equivalent (the `<=>` operator and LIMIT are translated to Oracle by
+    # the backend on execute, but `unnest` is not). Mirrors retrieve_semantic_bm25_combined_sql.
+    tags_clause = build_tags_where_clause_simple(tags, 6, match=tags_match)
+    tag_groups_param_start = 6 + (1 if tags else 0)
+    built = build_tag_groups_where_clause(tag_groups, tag_groups_param_start)
+    groups_clause = built.sql
+    groups_params = built.params
 
-    # created_at time range filter (after tags/groups)
+    # created_after/created_before time range filter (after tags/groups) — filters
+    # `updated_at`, as above.
     _next_idx = tag_groups_param_start + len(groups_params)
-    created_range_clause = ""
-    created_range_params: list[Any] = []
+    updated_range_clause = ""
+    updated_range_params: list[Any] = []
     if created_after is not None:
-        created_range_params.append(created_after)
-        created_range_clause += f" AND updated_at > ${_next_idx}"
+        updated_range_params.append(created_after)
+        updated_range_clause += f" AND updated_at > ${_next_idx}"
         _next_idx += 1
     if created_before is not None:
-        created_range_params.append(created_before)
-        created_range_clause += f" AND updated_at < ${_next_idx}"
+        updated_range_params.append(created_before)
+        updated_range_clause += f" AND updated_at < ${_next_idx}"
         _next_idx += 1
 
-    params: list = [query_emb_str, bank_id, fact_types, start_date, end_date, semantic_threshold]
+    params: list = [query_emb_str, bank_id, start_date, end_date, semantic_threshold]
     if tags:
         params.append(tags)
     params.extend(groups_params)
-    params.extend(created_range_params)
+    params.extend(updated_range_params)
 
-    # Two-phase entry point query:
-    # Phase 1 (date_ranked): rank by date only — no embedding computation — for all units in
-    #   the temporal window. This lets the planner use date indexes for filtering.
-    # Phase 2 (sim_ranked): join back to memory_units for only the top-50-per-type candidates
-    #   and compute embedding similarity for that small set (≤ 50 × len(fact_types) rows).
-    # This avoids computing embedding distances for potentially thousands of date-range rows.
-    entry_points = await conn.fetch(
-        f"""
-        WITH date_ranked AS MATERIALIZED (
-            SELECT id, fact_type,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY fact_type
-                       ORDER BY COALESCE(occurred_start, mentioned_at, occurred_end) DESC NULLS LAST
-                   ) AS rn
-            FROM {fq_table("memory_units")}
-            WHERE bank_id = $2
-              AND fact_type = ANY($3)
-              AND embedding IS NOT NULL
-              AND (
-                  (occurred_start IS NOT NULL AND occurred_end IS NOT NULL
-                   AND occurred_start <= $5 AND occurred_end >= $4)
-                  OR
-                  (mentioned_at IS NOT NULL AND mentioned_at BETWEEN $4 AND $5)
-                  OR
-                  (occurred_start IS NOT NULL AND occurred_start BETWEEN $4 AND $5)
-                  OR
-                  (occurred_end IS NOT NULL AND occurred_end BETWEEN $4 AND $5)
-              )
-              {tags_clause}
-              {groups_clause}
-              {created_range_clause}
-        ),
-        sim_ranked AS (
-            SELECT mu.id, mu.text, mu.context, mu.event_date, mu.occurred_start, mu.occurred_end, mu.mentioned_at, mu.fact_type, mu.proof_count, mu.trust_score, mu.helpful_count, mu.unhelpful_count, mu.document_id, mu.chunk_id, mu.tags, mu.metadata,
-                   1 - (mu.embedding <=> $1::vector) AS similarity,
-                   ROW_NUMBER() OVER (PARTITION BY mu.fact_type ORDER BY mu.embedding <=> $1::vector) AS sim_rn
-            FROM date_ranked dr
-            JOIN {fq_table("memory_units")} mu ON mu.id = dr.id
-            WHERE dr.rn <= 50
-              AND (1 - (mu.embedding <=> $1::vector)) >= $6
-        )
-        SELECT id, text, context, event_date, occurred_start, occurred_end, mentioned_at, fact_type, proof_count, trust_score, helpful_count, unhelpful_count, document_id, chunk_id, tags, metadata, similarity
-        FROM sim_ranked
-        WHERE sim_rn <= 10
-        """,
-        *params,
+    # Entry-point selection: similarity-gated, window-filtered, then narrowed for coverage.
+    #
+    # For each fact_type, ANN-rank the units whose time overlaps the window
+    # (ORDER BY embedding <=> query) and keep a pool of the most relevant
+    # (_TEMPORAL_POOL_SIZE). The planner serves this from the per-(bank, fact_type) vector
+    # index when the window is broad — the dense-metadata case, where the window matches
+    # most rows — and from the partial date indexes plus an exact sort when the window is
+    # narrow. Either way the work is bounded; neither path is a scan-and-sort of the whole
+    # match set.
+    #
+    # Selecting by *similarity* (not recency) is deliberate. The earlier form ranked the
+    # entire match set by COALESCE(occurred_start, mentioned_at, occurred_end) and kept the
+    # 50 most recent: that biased results toward the end of the window and, on banks with
+    # dense/near-uniform dates (e.g. a retain batch stamped with one date), the date key was
+    # degenerate so the "50 most recent" became a near-random sample that could drop the
+    # single most relevant in-window memory — and it degraded to a full scan + disk-spilling
+    # sort (30s+ on a 660k-row bank). The pool is then narrowed to _TEMPORAL_ENTRY_POINTS per
+    # fact_type by _select_with_temporal_coverage so the entry points span the window's range
+    # rather than clustering in one slice.
+    if not fact_types:
+        return {}
+
+    # One similarity-ranked, window-filtered arm per fact_type, UNION ALL'd — each arm has its
+    # own ORDER BY ... LIMIT so the per-(bank, fact_type) vector index can serve it. fact_type
+    # is inlined as a literal (controlled internal enum, never user input), matching
+    # retrieve_semantic_bm25_combined_sql; this keeps the query free of `unnest`/LATERAL, which the
+    # Oracle backend cannot translate.
+    pool_cols = (
+        "id, text, context, event_date, occurred_start, occurred_end, mentioned_at, "
+        "fact_type, proof_count, trust_score, helpful_count, unhelpful_count, document_id, chunk_id, tags, metadata"
     )
+    table = fq_table("memory_units")
+    arms = [
+        f"""(
+        SELECT {pool_cols}, 1 - (embedding <=> $1::vector) AS similarity
+        FROM {table}
+        WHERE bank_id = $2
+          AND fact_type = '{ft}'
+          AND embedding IS NOT NULL
+          AND (
+              (occurred_start IS NOT NULL AND occurred_end IS NOT NULL
+               AND occurred_start <= $4 AND occurred_end >= $3)
+              OR
+              (mentioned_at IS NOT NULL AND mentioned_at BETWEEN $3 AND $4)
+              OR
+              (occurred_start IS NOT NULL AND occurred_start BETWEEN $3 AND $4)
+              OR
+              (occurred_end IS NOT NULL AND occurred_end BETWEEN $3 AND $4)
+          )
+          AND (1 - (embedding <=> $1::vector)) >= $5
+          {tags_clause}
+          {groups_clause}
+          {updated_range_clause}
+        ORDER BY embedding <=> $1::vector
+        LIMIT {_TEMPORAL_POOL_SIZE}
+        )"""
+        for ft in fact_types
+    ]
+    pool_rows = await conn.fetch("\nUNION ALL\n".join(arms), *params)
 
-    if not entry_points:
+    if not pool_rows:
         return {ft: [] for ft in fact_types}
 
-    # Group entry points by fact type
-    entries_by_ft: dict[str, list] = {ft: [] for ft in fact_types}
-    for ep in entry_points:
-        ft = ep["fact_type"]
-        if ft in entries_by_ft:
-            entries_by_ft[ft].append(ep)
+    # Group the ANN pool by fact type, then narrow each to coverage-spread entry points.
+    pool_by_ft: dict[str, list] = {ft: [] for ft in fact_types}
+    for row in pool_rows:
+        ft = row["fact_type"]
+        if ft in pool_by_ft:
+            pool_by_ft[ft].append(row)
+
+    entries_by_ft: dict[str, list] = {
+        ft: _select_with_temporal_coverage(
+            rows, start_date, end_date, _TEMPORAL_ENTRY_POINTS, _TEMPORAL_COVERAGE_BUCKETS
+        )
+        for ft, rows in pool_by_ft.items()
+    }
 
     # Calculate shared temporal parameters
     total_days = (end_date - start_date).total_seconds() / 86400
@@ -465,6 +644,8 @@ async def retrieve_temporal_combined(
                 best_date = ep["mentioned_at"]
 
             if best_date:
+                if best_date.tzinfo is None:
+                    best_date = best_date.replace(tzinfo=UTC)
                 days_from_mid = abs((best_date - mid_date).total_seconds() / 86400)
                 temporal_proximity = 1.0 - min(days_from_mid / (total_days / 2), 1.0) if total_days > 0 else 1.0
             else:
@@ -491,11 +672,25 @@ async def retrieve_temporal_combined(
         # Build tags clause for spreading (use param 7 since 1-6 are used)
         spreading_tags_clause = build_tags_where_clause_simple(tags, 7, table_alias="mu.", match=tags_match)
         spreading_groups_param_start = 7 + (1 if tags else 0)
-        spreading_groups_clause, spreading_groups_params, _ = build_tag_groups_where_clause(
-            tag_groups, spreading_groups_param_start, table_alias="mu."
+        built = build_tag_groups_where_clause(tag_groups, spreading_groups_param_start, table_alias="mu.")
+        spreading_groups_clause = built.sql
+        spreading_groups_params = built.params
+        # The window has to be repeated here, not just on the entry-point query
+        # above: spreading walks temporal/causal links outward, so an in-window
+        # entry point would otherwise pull out-of-window neighbours into results.
+        spreading_window = UpdatedWindow(
+            after=created_after,
+            before=created_before,
+            first_param_index=spreading_groups_param_start + len(spreading_groups_params),
         )
 
-        while frontier and budget_remaining > 0 and iteration < max_iterations:
+        # Multi-hop temporal spreading expands a batch of seed ids with
+        # ``FROM unnest($2::uuid[])``, which has no Oracle equivalent. On backends
+        # without unnest, skip the spread: the temporal entry points are still
+        # returned above, and the semantic/keyword/graph retrievers cover the rest.
+        supports_unnest = getattr(conn, "backend_type", "postgresql") != "oracle"
+
+        while frontier and budget_remaining > 0 and iteration < max_iterations and supports_unnest:
             iteration += 1
             batch_ids = frontier[:batch_size]
             frontier = frontier[batch_size:]
@@ -505,6 +700,7 @@ async def retrieve_temporal_combined(
             if tags:
                 spreading_params.append(tags)
             spreading_params.extend(spreading_groups_params)
+            spreading_params.extend(spreading_window.params)
 
             # LATERAL join: for each source node, fetch top-K neighbors by weight using
             # the existing idx_memory_links_from_type_weight index with early-exit semantics.
@@ -532,6 +728,7 @@ async def retrieve_temporal_combined(
                   AND (1 - (mu.embedding <=> $1::vector)) >= $4
                   {spreading_tags_clause}
                   {spreading_groups_clause}
+                  {spreading_window.clause("mu")}
                 """,
                 *spreading_params,
             )
@@ -558,6 +755,8 @@ async def retrieve_temporal_combined(
                     neighbor_best_date = n["mentioned_at"]
 
                 if neighbor_best_date:
+                    if neighbor_best_date.tzinfo is None:
+                        neighbor_best_date = neighbor_best_date.replace(tzinfo=UTC)
                     days_from_mid = abs((neighbor_best_date - mid_date).total_seconds() / 86400)
                     neighbor_temporal_proximity = (
                         1.0 - min(days_from_mid / (total_days / 2), 1.0) if total_days > 0 else 1.0
@@ -602,23 +801,29 @@ async def retrieve_all_fact_types_parallel(
     thinking_budget: int,
     question_date: datetime | None = None,
     query_analyzer: Optional["QueryAnalyzer"] = None,
-    graph_retriever: GraphRetriever | None = None,
     tags: list[str] | None = None,
     tags_match: TagsMatch = "any",
     tag_groups: list[TagGroup] | None = None,
     created_after: datetime | None = None,
     created_before: datetime | None = None,
+    min_semantic: float | None = None,
+    min_keyword: float | None = None,
+    temporal_window: "TemporalWindow | None" = None,
+    enable_text_search: bool = True,
+    enable_temporal_retrieval: bool = True,
+    enable_graph_retrieval: bool = True,
 ) -> MultiFactTypeRetrievalResult:
     """
-    Optimized retrieval for multiple fact types using batched queries.
+    Retrieve every recall arm for all fact types, through the memories store.
 
-    This reduces database round-trips by:
-    1. Combining semantic + BM25 into one CTE query for ALL fact types (1 query instead of 2N)
-    2. Running graph retrieval per fact type in parallel (N parallel tasks)
-    3. Running temporal retrieval per fact type in parallel (N parallel tasks)
+    Extracts the temporal constraint (CPU-only), then hands the whole recall off to the
+    store's single ``recall_unified`` method — the one recall interface. How the arms are
+    run (a per-arm SQL orchestration for Postgres, a single index query for a store that
+    owns its index) is the store's business; this only assembles the per-arm result it
+    returns into :class:`MultiFactTypeRetrievalResult`. Fusion/rerank happen downstream.
 
     Args:
-        pool: Database connection pool
+        pool: Database connection pool, handed to the store as its connection handle.
         query_text: Query text
         query_embedding_str: Query embedding as string
         bank_id: Bank ID
@@ -626,150 +831,110 @@ async def retrieve_all_fact_types_parallel(
         thinking_budget: Budget for graph traversal and retrieval limits
         question_date: Optional date when question was asked (for temporal filtering)
         query_analyzer: Query analyzer to use (defaults to TransformerQueryAnalyzer)
-        graph_retriever: Graph retrieval strategy (defaults to configured retriever)
+        temporal_window: Caller-supplied window for the temporal arm. When set, it is used
+            verbatim instead of analysing the query text for dates. Gated by
+            enable_temporal_retrieval like any other source of a window.
+        enable_text_search: Run the keyword (BM25) arm. False leaves the arm out of the
+            SQL entirely rather than filtering its rows away, so recall is a pure vector
+            query and pays none of the arm's cost.
+        enable_temporal_retrieval: Run the temporal arm. False also skips the date-aware
+            query analysis that feeds it (no constraint means nothing to filter on).
+        enable_graph_retrieval: Run the entity/link graph arm. False skips those queries
+            and returns no graph results.
 
     Returns:
         MultiFactTypeRetrievalResult with results organized by fact type
     """
     import time
 
-    retriever = graph_retriever or get_default_graph_retriever()
+    config = get_config()
     start_time = time.time()
     timings: dict[str, float] = {}
 
     # Step 1: Extract temporal constraint first (CPU work, no DB)
-    # Do this before DB queries so we know if we need temporal retrieval
+    # Do this before the store call so we know whether the temporal arm is needed at all.
     temporal_extraction_start = time.time()
-    from .temporal_extraction import extract_temporal_constraint
+    temporal_constraint = None
+    if enable_temporal_retrieval:
+        if temporal_window is not None:
+            # The caller already knows the range it means, so there is nothing to
+            # infer. Skipping the analysis is also the point: it is pure CPU
+            # serialised through a single worker, and costs up to ~1.3s on
+            # document-sized query text (see temporal_extraction).
+            temporal_constraint = (temporal_window.start, temporal_window.end)
+        else:
+            from .temporal_extraction import extract_temporal_constraint_async
 
-    temporal_constraint = extract_temporal_constraint(query_text, reference_date=question_date, analyzer=query_analyzer)
+            # Off the event loop: this is pure CPU and would otherwise stall every
+            # other in-flight request in the process, not just this recall.
+            temporal_constraint = await extract_temporal_constraint_async(
+                query_text, reference_date=question_date, analyzer=query_analyzer
+            )
     temporal_extraction_time = time.time() - temporal_extraction_start
     timings["temporal_extraction"] = temporal_extraction_time
 
-    # Step 2: Run semantic + BM25 + temporal combined in ONE connection!
-    # This reduces connection usage from 2 to 1 for these operations
-    semantic_bm25_start = time.time()
-    temporal_results_by_ft: dict[str, list[RetrievalResult]] = {}
-    temporal_time = 0.0
+    # Step 2: Run every arm for every fact type through the store's single recall method.
+    from ..memories import RecallArms, get_memories
 
-    async with acquire_with_retry(pool) as conn:
-        conn_wait = time.time() - semantic_bm25_start
+    # Time the store call itself. Without it `parallel_retrieval` is a black box: it reported 135ms
+    # while a bare store-level query measured 33ms, and there was no way to tell whether the
+    # difference was the store doing more work (this is 3 fact types x 4 arms in ONE call, not one
+    # query) or the host adding overhead around it. The nine per-arm rows below cannot answer that
+    # either -- a store-owned recall returns every arm from a single call, so their durations are
+    # literals.
+    _unified_start = time.time()
+    unified = await get_memories().recall_unified(
+        conn=pool,
+        bank_id=bank_id,
+        fact_types=fact_types,
+        query_embedding=query_embedding_str,
+        query_text=query_text,
+        limit=thinking_budget,
+        temporal_window=temporal_constraint,
+        temporal_semantic_threshold=config.temporal_semantic_min_similarity,
+        tags=tags,
+        tags_match=tags_match,
+        tag_groups=tag_groups,
+        created_after=created_after,
+        created_before=created_before,
+        min_semantic=min_semantic,
+        min_keyword=min_keyword,
+        enable_text_search=enable_text_search,
+        enable_graph=enable_graph_retrieval,
+    )
 
-        # Semantic + BM25 combined
-        semantic_bm25_results = await retrieve_semantic_bm25_combined(
-            conn,
-            query_embedding_str,
-            query_text,
-            bank_id,
-            fact_types,
-            thinking_budget,
-            tags=tags,
-            tags_match=tags_match,
-            tag_groups=tag_groups,
-            created_after=created_after,
-            created_before=created_before,
-        )
-        semantic_bm25_time = time.time() - semantic_bm25_start
+    _unified_elapsed = time.time() - _unified_start
 
-        # Temporal combined (if constraint detected) - same connection!
-        if temporal_constraint:
-            tc_start, tc_end = temporal_constraint
-            temporal_start = time.time()
-            temporal_results_by_ft = await retrieve_temporal_combined(
-                conn,
-                query_embedding_str,
-                bank_id,
-                fact_types,
-                tc_start,
-                tc_end,
-                budget=thinking_budget,
-                semantic_threshold=0.1,
-                tags=tags,
-                tags_match=tags_match,
-                tag_groups=tag_groups,
-                created_after=created_after,
-                created_before=created_before,
-            )
-            temporal_time = time.time() - temporal_start
-
-    timings["semantic_bm25_combined"] = semantic_bm25_time
-    timings["temporal_combined"] = temporal_time
-
-    # Step 3: Run graph retrieval for each fact type in parallel
-    async def run_graph_for_fact_type(
-        ft: str,
-    ) -> tuple[str, list[RetrievalResult], float, GraphRetrievalTimings | None]:
-        graph_start = time.time()
-        results, graph_timing = await retriever.retrieve(
-            pool=pool,
-            query_embedding_str=query_embedding_str,
-            bank_id=bank_id,
-            fact_type=ft,
-            budget=thinking_budget,
-            query_text=query_text,
-            semantic_seeds=None,
-            temporal_seeds=None,
-            tags=tags,
-            tags_match=tags_match,
-            tag_groups=tag_groups,
-            created_after=created_after,
-            created_before=created_before,
-        )
-        return ft, results, time.time() - graph_start, graph_timing
-
-    # Run graph for all fact types in parallel
-    graph_tasks = [run_graph_for_fact_type(ft) for ft in fact_types]
-    graph_results_list = await asyncio.gather(*graph_tasks)
-
-    # Organize results by fact type
     results_by_fact_type: dict[str, ParallelRetrievalResult] = {}
-    max_conn_wait = conn_wait  # Single connection for semantic+bm25+temporal
-    all_graph_timings: list[GraphRetrievalTimings] = []
-
     for ft in fact_types:
-        # Get semantic + bm25 results for this fact type
-        semantic_results, bm25_results = semantic_bm25_results.get(ft, ([], []))
-
-        # Find graph results for this fact type
-        graph_results = []
-        graph_time = 0.0
-        graph_timing = None
-        for gr in graph_results_list:
-            if gr[0] == ft:
-                graph_results = gr[1]
-                graph_time = gr[2]
-                graph_timing = gr[3]
-                if graph_timing:
-                    all_graph_timings.append(graph_timing)
-                break
-
-        # Get temporal results for this fact type from combined result
-        temporal_results = temporal_results_by_ft.get(ft) if temporal_constraint else None
-        if temporal_results is not None and len(temporal_results) == 0:
-            temporal_results = None
-
+        arms = unified.get(ft) or RecallArms()
+        # An empty temporal list collapses to None — the "no temporal arm" signal downstream.
+        temporal_arm = arms.temporal or None
         results_by_fact_type[ft] = ParallelRetrievalResult(
-            semantic=semantic_results,
-            bm25=bm25_results,
-            graph=graph_results,
-            temporal=temporal_results,
+            semantic=arms.semantic,
+            bm25=arms.bm25,
+            graph=arms.graph,
+            temporal=temporal_arm,
+            # A store-owned recall returns every arm from ONE call, so there is no per-arm
+            # split to report and these stay 0.0 -- they are "not measured", not "instant", and
+            # reading them as instant is what sent an investigation looking for the missing time
+            # outside the store. `store_recall` carries what IS measurable: the whole call.
             timings={
-                "semantic": semantic_bm25_time / 2,  # Approximate split
-                "bm25": semantic_bm25_time / 2,
-                "graph": graph_time,
-                "temporal": temporal_time,  # Same for all fact types (single query)
+                "semantic": 0.0,
+                "bm25": 0.0,
+                "graph": 0.0,
+                "temporal": 0.0,
                 "temporal_extraction": temporal_extraction_time,
+                "store_recall": _unified_elapsed,
             },
             temporal_constraint=temporal_constraint,
-            graph_timings=[graph_timing] if graph_timing else [],
-            max_conn_wait=max_conn_wait,
+            graph_timings=[],
+            max_conn_wait=0.0,
         )
 
-    total_time = time.time() - start_time
-    timings["total"] = total_time
-
+    timings["total"] = time.time() - start_time
     return MultiFactTypeRetrievalResult(
         results_by_fact_type=results_by_fact_type,
         timings=timings,
-        max_conn_wait=max_conn_wait,
+        max_conn_wait=0.0,
     )

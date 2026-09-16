@@ -3,9 +3,26 @@
 import * as React from "react";
 import { Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { useTranslations } from "next-intl";
 import { useBank } from "@/lib/bank-context";
 import { bankRoute } from "@/lib/bank-url";
+import { hoistCurrentBank } from "@/lib/bank-order";
+import { withBasePath } from "@/lib/base-path";
 import { client } from "@/lib/api";
+import type { RetainContentBlock as ContentBlock } from "@/lib/api";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+
+/** One element of a document composed as an ordered block list. */
+type DocBlock =
+  | { kind: "text"; text: string }
+  | { kind: "attachment"; name: string; mediaType: string; data: string; size: number };
+
+import { LanguageSwitcher } from "@/components/language-switcher";
 import { Button } from "@/components/ui/button";
 import {
   Command,
@@ -38,7 +55,12 @@ import {
   ChevronDown,
   ChevronRight,
   LogOut,
+  Copy,
+  Paperclip,
+  ChevronUp,
 } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
+import { toast } from "sonner";
 import { useTheme } from "@/lib/theme-context";
 import { useFeatures } from "@/lib/features-context";
 import Image from "next/image";
@@ -54,7 +76,7 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
-import type { BankInfo } from "@/lib/bank-context";
+import { BANKS_PAGE_SIZE, type BankInfo } from "@/lib/bank-context";
 
 function formatCompact(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
@@ -85,10 +107,30 @@ function formatTimeAgo(isoDate: string): string {
 function BankSelectorInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { currentBank, setCurrentBank, banks, bankInfos, banksLoading, loadBanks } = useBank();
+  const tNav = useTranslations("nav");
+  const tNavBank = useTranslations("nav.bank");
+  const tCommon = useTranslations("common");
+  const tAddDocument = useTranslations("addDocument");
+  const tApiError = useTranslations("api.errors.files");
+  const {
+    currentBank,
+    setCurrentBank,
+    bankInfos,
+    banksLoading,
+    banksLoadingMore,
+    hasMoreBanks,
+    bankSearch,
+    currentBankName,
+    searchBanks,
+    loadBanks,
+    loadMoreBanks,
+  } = useBank();
   const { theme, toggleTheme } = useTheme();
   const { features } = useFeatures();
   const [open, setOpen] = React.useState(false);
+  // One-shot spin of the header logo, fired by sidebar navigation (see the
+  // "hindsight:logo-spin" listener below). Reset on animationEnd so it can replay.
+  const [logoSpinning, setLogoSpinning] = React.useState(false);
   const [createDialogOpen, setCreateDialogOpen] = React.useState(false);
   const [newBankId, setNewBankId] = React.useState("");
   const [isCreating, setIsCreating] = React.useState(false);
@@ -101,12 +143,24 @@ function BankSelectorInner() {
   const [docDialogOpen, setDocDialogOpen] = React.useState(false);
   const [docTab, setDocTab] = React.useState<"text" | "upload">("text");
   const [docContent, setDocContent] = React.useState("");
+  // Attachments to interleave into the document's content. Kept in order, and
+  // appended after the prose: the API takes an ordered block list, and a form
+  // with one textarea has no way to express "this picture goes *here*". Anyone
+  // needing exact placement sends blocks through the API directly.
+  // How the document's content is being composed. "text" is the plain textarea
+  // every document has always used; "blocks" is the ordered list that lets an
+  // attachment sit *between* two runs of prose, which is the whole point of
+  // inline attachments and cannot be expressed with one textarea. Kept as a
+  // switch so the common case — typing some text — is not cluttered by an
+  // editor most documents never need.
+  const [docComposeMode, setDocComposeMode] = React.useState<"text" | "blocks">("text");
+  const [docBlocks, setDocBlocks] = React.useState<DocBlock[]>([]);
   const [docContext, setDocContext] = React.useState("");
   const [docEventDate, setDocEventDate] = React.useState("");
   const [docDocumentId, setDocDocumentId] = React.useState("");
   const [docTags, setDocTags] = React.useState("");
   const [docObservationScopes, setDocObservationScopes] = React.useState<
-    "per_tag" | "combined" | "all_combinations" | "custom"
+    "per_tag" | "combined" | "all_combinations" | "custom" | "shared"
   >("combined");
   const [docObservationScopesCustom, setDocObservationScopesCustom] = React.useState("");
   const [docMetadata, setDocMetadata] = React.useState("");
@@ -163,19 +217,68 @@ function BankSelectorInner() {
       });
   }, []);
 
-  const sortedBanks = React.useMemo(() => {
-    // Sort by last document inserted descending, then by created_at
-    return [...bankInfos].sort((a, b) => {
-      const aTime = a.last_document_at || a.created_at || "";
-      const bTime = b.last_document_at || b.created_at || "";
-      return bTime.localeCompare(aTime);
-    });
-  }, [bankInfos]);
+  // Spin the header logo whenever a sidebar item is clicked. Decoupled via a
+  // window event (like DOCUMENTS_REFRESH_EVENT) since the sidebar and this header
+  // are siblings, not parent/child. onAnimationEnd clears the flag so the next
+  // click replays it. (A mid-spin re-click is a no-op — the flag is already set —
+  // which is fine; we avoid a requestAnimationFrame restart because rAF is paused
+  // in background tabs, which would drop the spin entirely.)
+  React.useEffect(() => {
+    const spin = () => setLogoSpinning(true);
+    window.addEventListener("hindsight:logo-spin", spin);
+    return () => window.removeEventListener("hindsight:logo-spin", spin);
+  }, []);
+
+  // The banks overview page has its own "create bank" button; the dialog (with its
+  // template import) lives here, so that button asks for it rather than duplicating it.
+  React.useEffect(() => {
+    const openCreate = () => setCreateDialogOpen(true);
+    window.addEventListener("hindsight:create-bank", openCreate);
+    return () => window.removeEventListener("hindsight:create-bank", openCreate);
+  }, []);
 
   const maxFactCount = React.useMemo(
-    () => Math.max(1, ...sortedBanks.map((b) => b.fact_count)),
-    [sortedBanks]
+    () => Math.max(1, ...bankInfos.map((b) => b.fact_count)),
+    [bankInfos]
   );
+
+  // Banks arrive already ordered by last write descending, one page at a time, so the
+  // list stays in server order — re-sorting it here would only shuffle a later page
+  // above an earlier one. The single exception is hoisting the current bank; see
+  // hoistCurrentBank for why that one is worth the reorder.
+  const orderedBanks = React.useMemo(
+    () => hoistCurrentBank(bankInfos, currentBank),
+    [bankInfos, currentBank]
+  );
+
+  // Search runs server-side (the bank list is paginated), so the input holds a draft
+  // that is debounced into a fresh first page.
+  const [searchDraft, setSearchDraft] = React.useState("");
+  React.useEffect(() => {
+    if (!open || searchDraft === bankSearch) return;
+    const timer = setTimeout(() => searchBanks(searchDraft), 250);
+    return () => clearTimeout(timer);
+  }, [open, searchDraft, bankSearch, searchBanks]);
+
+  // Infinite scroll: fetch the next page once the end of the list scrolls into view.
+  // The nodes are tracked as state via callback refs, not useRef: the popover content
+  // mounts in a portal after the commit that flips `open`, so an effect reading
+  // ref.current would find null and never re-run. The observer is also rebuilt
+  // whenever a page lands, so a sentinel that is still visible (a page shorter than
+  // the list viewport) keeps paging instead of stalling.
+  const [listEl, setListEl] = React.useState<HTMLDivElement | null>(null);
+  const [sentinelEl, setSentinelEl] = React.useState<HTMLDivElement | null>(null);
+  React.useEffect(() => {
+    if (!hasMoreBanks || !listEl || !sentinelEl) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) loadMoreBanks();
+      },
+      { root: listEl, rootMargin: "120px" }
+    );
+    observer.observe(sentinelEl);
+    return () => observer.disconnect();
+  }, [hasMoreBanks, listEl, sentinelEl, loadMoreBanks, bankInfos.length]);
 
   const handleCreateBank = async () => {
     if (!newBankId.trim()) return;
@@ -203,7 +306,9 @@ function BankSelectorInner() {
           await client.importBankTemplate(newBankId.trim(), manifest);
         } catch (importError) {
           setTemplateError(
-            importError instanceof Error ? importError.message : "Failed to import template"
+            importError instanceof Error
+              ? importError.message
+              : tAddDocument("failedToImportTemplate")
           );
           setIsCreating(false);
           return;
@@ -219,7 +324,7 @@ function BankSelectorInner() {
       setCurrentBank(newBankId.trim());
       router.push(bankRoute(newBankId.trim(), "?view=data"));
     } catch (error) {
-      setCreateError(error instanceof Error ? error.message : "Failed to create bank");
+      setCreateError(error instanceof Error ? error.message : tAddDocument("failedToCreateBank"));
     } finally {
       setIsCreating(false);
     }
@@ -257,8 +362,12 @@ function BankSelectorInner() {
 
   const computeScopes = (
     tags: string[],
-    mode: "per_tag" | "combined" | "all_combinations"
+    mode: "per_tag" | "combined" | "all_combinations" | "custom" | "shared"
   ): string[][] => {
+    // "shared" is tag-independent: a single global (untagged) scope, matching the
+    // server's `parsed === "shared" -> [[]]` handling in consolidator.py.
+    if (mode === "shared") return [[]];
+    if (mode === "custom") return [];
     if (tags.length === 0) return [];
     if (mode === "per_tag") return tags.map((t) => [t]);
     if (mode === "combined") return [tags];
@@ -361,10 +470,17 @@ function BankSelectorInner() {
       setDocAsync(false);
       setUploadProgress("");
 
+      // Nudge the documents view to surface the new file_convert_retain
+      // operations right away (it derives pending rows from the server).
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new Event("hindsight:documents-refresh"));
+      }
+
       // Navigate to documents view
       router.push(bankRoute(currentBank!, "?view=documents"));
-    } catch {
-      // Error toast is shown automatically by the API client interceptor
+    } catch (error) {
+      // Multipart uploads bypass the API client's shared error interceptor.
+      toast.error(error instanceof Error ? error.message : tApiError("upload"));
     } finally {
       setIsCreatingDoc(false);
       setUploadProgress("");
@@ -372,7 +488,11 @@ function BankSelectorInner() {
   };
 
   const handleCreateDocument = async () => {
-    if (!currentBank || !docContent.trim()) return;
+    const hasBlockContent = docBlocks.some((b) =>
+      b.kind === "text" ? b.text.trim().length > 0 : true
+    );
+    const hasContent = docComposeMode === "blocks" ? hasBlockContent : docContent.trim().length > 0;
+    if (!currentBank || !hasContent) return;
 
     setIsCreatingDoc(true);
 
@@ -383,16 +503,38 @@ function BankSelectorInner() {
         .filter(Boolean);
 
       const item: {
-        content: string;
+        content: string | ContentBlock[];
         context?: string;
         timestamp?: string;
         document_id?: string;
         tags?: string[];
-        observation_scopes?: "per_tag" | "combined" | "all_combinations" | string[][];
+        observation_scopes?: "per_tag" | "combined" | "all_combinations" | "shared" | string[][];
         metadata?: Record<string, string>;
         entities?: Array<{ text: string }>;
         strategy?: string;
       } = { content: docContent };
+      if (docComposeMode === "blocks") {
+        // Sent in the order they were arranged, so an attachment reaches the
+        // extractor between the sentences that frame it. An image block for
+        // images and a file block for everything else — the distinction the API
+        // keeps because the providers keep it.
+        item.content = docBlocks
+          .filter((b) => (b.kind === "text" ? b.text.trim().length > 0 : true))
+          .map((b) =>
+            b.kind === "text"
+              ? { type: "text" as const, text: b.text }
+              : b.mediaType.startsWith("image/")
+                ? {
+                    type: "image" as const,
+                    source: { type: "base64" as const, media_type: b.mediaType, data: b.data },
+                  }
+                : {
+                    type: "file" as const,
+                    filename: b.name,
+                    source: { type: "base64" as const, media_type: b.mediaType, data: b.data },
+                  }
+          );
+      }
       if (docContext) item.context = docContext;
       if (docEventDate) item.timestamp = toIsoTimestamp(docEventDate);
       if (docDocumentId) item.document_id = docDocumentId;
@@ -403,6 +545,8 @@ function BankSelectorInner() {
         item.observation_scopes = "combined";
       } else if (docObservationScopes === "all_combinations") {
         item.observation_scopes = "all_combinations";
+      } else if (docObservationScopes === "shared") {
+        item.observation_scopes = "shared";
       } else if (docObservationScopes === "custom") {
         const customScopes = docObservationScopesCustom
           .split("\n")
@@ -430,6 +574,8 @@ function BankSelectorInner() {
       // Reset form and close dialog
       setDocDialogOpen(false);
       setDocContent("");
+      setDocBlocks([]);
+      setDocComposeMode("text");
       setDocContext("");
       setDocEventDate("");
       setDocDocumentId("");
@@ -454,15 +600,35 @@ function BankSelectorInner() {
   return (
     <div className="bg-card text-card-foreground px-5 py-3 border-b-4 border-primary-gradient">
       <div className="flex items-center gap-4 text-sm">
-        {/* Logo */}
-        <Image
-          src="/logo.png"
-          alt="Hindsight"
-          width={40}
-          height={40}
-          className="h-10 w-auto"
-          unoptimized
-        />
+        {/* Logo, split so only the mark spins on navigation while the wordmark
+            stays put. The mark is the standalone favicon.png (so it can rotate
+            freely); the wordmark is the right slice of the full lockup (logo.png)
+            shown via a cropped background. Their widths sum to the full logo, so
+            the two pieces butt together seamlessly at h-10. */}
+        {/* The logo is the way back to the banks overview, as it is in most apps. */}
+        <button
+          type="button"
+          className="flex items-center h-10 select-none cursor-pointer"
+          aria-label={tNavBank("allBanks")}
+          title={tNavBank("allBanks")}
+          onClick={() => router.push("/dashboard")}
+        >
+          <img
+            src={withBasePath("/favicon.png")}
+            alt=""
+            className={cn("h-10 w-auto", logoSpinning && "animate-logo-wiggle")}
+            onAnimationEnd={() => setLogoSpinning(false)}
+          />
+          <div
+            className="h-10 w-[99px]"
+            style={{
+              backgroundImage: `url(${withBasePath("/logo.png")})`,
+              backgroundSize: "auto 100%",
+              backgroundPosition: "right center",
+              backgroundRepeat: "no-repeat",
+            }}
+          />
+        </button>
 
         {/* Separator */}
         <div className="h-8 w-px bg-border" />
@@ -472,7 +638,12 @@ function BankSelectorInner() {
           open={open}
           onOpenChange={(isOpen) => {
             setOpen(isOpen);
-            if (isOpen) loadBanks();
+            if (isOpen) {
+              // Reopen on an unfiltered first page rather than whatever was typed last.
+              setSearchDraft("");
+              if (bankSearch) searchBanks("");
+              else loadBanks();
+            }
           }}
         >
           <PopoverTrigger asChild>
@@ -482,28 +653,53 @@ function BankSelectorInner() {
               aria-expanded={open}
               className="w-[250px] justify-between font-bold border-2 border-primary hover:bg-accent"
             >
-              <span className="truncate">{currentBank || "Select a memory bank..."}</span>
+              <span className="truncate">
+                {currentBankName || currentBank || tNavBank("select")}
+              </span>
               <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
             </Button>
           </PopoverTrigger>
           <PopoverContent className="w-[420px] p-0" align="start">
-            <Command>
-              {sortedBanks.length > 0 && <CommandInput placeholder="Search memory banks..." />}
-              <CommandList>
+            {/* shouldFilter={false}: matching is done by the server so search reaches
+                banks that haven't been paged in yet. */}
+            <Command shouldFilter={false}>
+              <CommandInput
+                placeholder={tNavBank("search")}
+                value={searchDraft}
+                onValueChange={setSearchDraft}
+              />
+              <CommandList
+                ref={setListEl}
+                // cmdk keeps --cmdk-list-height in sync with the rendered rows, so the
+                // popover eases down to the filtered set instead of snapping shut.
+                className="h-[min(300px,var(--cmdk-list-height,300px))] transition-[height] duration-200 ease-out motion-reduce:transition-none"
+              >
                 <CommandEmpty>
                   {banksLoading ? (
                     <div className="flex items-center justify-center gap-2 py-2">
-                      <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-                      <span>Loading banks...</span>
+                      <Spinner size="sm" />
+                      <span>{tCommon("loading")}</span>
                     </div>
+                  ) : bankSearch ? (
+                    tNavBank("noSearchResults")
                   ) : (
-                    "No memory banks yet."
+                    tNavBank("empty")
                   )}
                 </CommandEmpty>
-                <CommandGroup>
-                  {sortedBanks.map((bank) => {
+                {/* The previous results stay put and dim while a search is in flight —
+                    blanking the list first makes every keystroke flash. */}
+                <CommandGroup
+                  className={cn(
+                    "transition-opacity duration-150 motion-reduce:transition-none",
+                    banksLoading && bankInfos.length > 0 && "opacity-40"
+                  )}
+                >
+                  {orderedBanks.map((bank, index) => {
                     const barPct = (bank.fact_count / maxFactCount) * 100;
                     const isSelected = currentBank === bank.bank_id;
+                    // Last write, not last ingestion: appends to an existing document
+                    // bump last_write_at only.
+                    const lastWriteAt = bank.last_write_at || bank.last_document_at;
                     return (
                       <CommandItem
                         key={bank.bank_id}
@@ -518,7 +714,20 @@ function BankSelectorInner() {
                             : `?view=${view}`;
                           router.push(bankRoute(value, queryString));
                         }}
-                        className="relative overflow-hidden py-2.5 mb-0.5"
+                        // Only rows that actually mount animate: React keeps the pages
+                        // already on screen, so appending page 2 flows in without
+                        // replaying page 1. The stagger restarts per page and is capped
+                        // so the tail of a 50-row page doesn't crawl in.
+                        className={cn(
+                          "relative overflow-hidden py-2.5 mb-0.5 group animate-list-row-enter",
+                          // Not bg-accent: cmdk paints the keyboard-active row with
+                          // data-[selected=true]:bg-accent, so reusing it here would
+                          // make two rows look active at once while arrowing down.
+                          isSelected && "ring-1 ring-inset ring-primary/50"
+                        )}
+                        style={{
+                          animationDelay: `${Math.min(index % BANKS_PAGE_SIZE, 10) * 18}ms`,
+                        }}
                       >
                         {/* Background bar — proportional to memory count */}
                         <div
@@ -529,20 +738,44 @@ function BankSelectorInner() {
                           <Check
                             className={cn(
                               "h-4 w-4 shrink-0",
-                              isSelected ? "opacity-100" : "opacity-0"
+                              isSelected ? "opacity-100 text-primary" : "opacity-0"
                             )}
                           />
-                          <span className="truncate flex-1 font-medium" title={bank.bank_id}>
-                            {bank.bank_id}
+                          <span
+                            className={cn(
+                              "truncate flex-1",
+                              isSelected ? "font-semibold" : "font-medium"
+                            )}
+                            title={bank.name || bank.bank_id}
+                          >
+                            {bank.name || bank.bank_id}
                           </span>
+                          <button
+                            type="button"
+                            aria-label={tNavBank("copyName")}
+                            title={tNavBank("copyName")}
+                            className="inline-flex h-6 w-6 items-center justify-center rounded hover:bg-accent-foreground/10 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity shrink-0"
+                            onMouseDown={(e) => {
+                              // Stop cmdk from intercepting before onClick fires.
+                              e.stopPropagation();
+                              e.preventDefault();
+                            }}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              navigator.clipboard.writeText(bank.bank_id).then(
+                                () => toast.success(tNavBank("copied")),
+                                () => toast.error(tNavBank("copied"))
+                              );
+                            }}
+                          >
+                            <Copy className="h-3.5 w-3.5" />
+                          </button>
                           <span className="shrink-0 tabular-nums text-[11px] text-muted-foreground/70">
                             {bank.fact_count > 0 ? (
                               <>
                                 {formatCompact(bank.fact_count)}
                                 <span className="ml-1.5 text-muted-foreground/40">
-                                  {bank.last_document_at
-                                    ? formatTimeAgo(bank.last_document_at)
-                                    : ""}
+                                  {lastWriteAt ? formatTimeAgo(lastWriteAt) : ""}
                                 </span>
                               </>
                             ) : (
@@ -554,6 +787,15 @@ function BankSelectorInner() {
                     );
                   })}
                 </CommandGroup>
+                {hasMoreBanks && (
+                  <div ref={setSentinelEl} className="flex items-center justify-center py-2">
+                    {banksLoadingMore && (
+                      <span className="animate-soft-fade-in">
+                        <Spinner size="sm" />
+                      </span>
+                    )}
+                  </div>
+                )}
               </CommandList>
               {/* Footer: Create new bank */}
               <div className="border-t border-border p-1">
@@ -565,7 +807,7 @@ function BankSelectorInner() {
                   }}
                 >
                   <Plus className="h-4 w-4" />
-                  <span>Create new bank</span>
+                  <span>{tNavBank("create")}</span>
                 </button>
               </div>
             </Command>
@@ -582,11 +824,11 @@ function BankSelectorInner() {
             size="sm"
             className="h-9 gap-1.5"
             onClick={() => setDocDialogOpen(true)}
-            title="Add document to current bank"
+            title={tAddDocument("addDocumentToCurrentBank")}
             data-add-document
           >
             <Plus className="h-4 w-4" />
-            <span>Add Document</span>
+            <span>{tAddDocument("addDocumentButton")}</span>
           </Button>
         )}
 
@@ -599,7 +841,7 @@ function BankSelectorInner() {
           target="_blank"
           rel="noopener noreferrer"
           className="flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-accent transition-colors text-muted-foreground hover:text-foreground"
-          title="View on GitHub"
+          title={tNav("viewOnGitHub")}
         >
           <Github className="h-5 w-5" />
           <span className="text-sm font-medium">GitHub</span>
@@ -614,10 +856,12 @@ function BankSelectorInner() {
           size="icon"
           onClick={toggleTheme}
           className="h-9 w-9"
-          title={theme === "light" ? "Switch to dark mode" : "Switch to light mode"}
+          title={theme === "light" ? tNav("darkMode") : tNav("lightMode")}
         >
           {theme === "light" ? <Moon className="h-5 w-5" /> : <Sun className="h-5 w-5" />}
         </Button>
+
+        <LanguageSwitcher />
 
         {features?.access_key_auth && (
           <>
@@ -629,9 +873,9 @@ function BankSelectorInner() {
               title="Logout"
               onClick={async () => {
                 try {
-                  await fetch("/api/auth/logout", { method: "POST" });
+                  await fetch(withBasePath("/api/auth/logout"), { method: "POST" });
                 } finally {
-                  window.location.href = "/login";
+                  window.location.href = withBasePath("/login");
                 }
               }}
             >
@@ -643,11 +887,11 @@ function BankSelectorInner() {
         <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
           <DialogContent className="sm:max-w-[550px]">
             <DialogHeader>
-              <DialogTitle>Create New Memory Bank</DialogTitle>
+              <DialogTitle>{tAddDocument("createBankTitle")}</DialogTitle>
             </DialogHeader>
             <div className="py-4 space-y-4">
               <Input
-                placeholder="Enter bank ID..."
+                placeholder={tAddDocument("createBankIdPlaceholder")}
                 value={newBankId}
                 onChange={(e) => setNewBankId(e.target.value)}
                 onKeyDown={(e) => {
@@ -669,7 +913,9 @@ function BankSelectorInner() {
                       }
                     }}
                   />
-                  <label className="text-sm font-medium">Import from template</label>
+                  <label className="text-sm font-medium">
+                    {tAddDocument("importFromTemplateLabel")}
+                  </label>
                 </div>
                 {useTemplate && (
                   <a
@@ -678,15 +924,14 @@ function BankSelectorInner() {
                     rel="noopener noreferrer"
                     className="text-xs text-muted-foreground hover:text-foreground transition-colors"
                   >
-                    Browse templates &rarr;
+                    {tAddDocument("browseTemplates")}
                   </a>
                 )}
               </div>
               {useTemplate && (
                 <div>
                   <p className="text-xs text-muted-foreground mb-2">
-                    Paste a template manifest JSON to pre-configure the bank with settings, mental
-                    models, and directives.
+                    {tAddDocument("templateManifestHelp")}
                   </p>
                   <Textarea
                     placeholder='{"version": "1", "bank": {...}, "mental_models": [...]}'
@@ -716,10 +961,10 @@ function BankSelectorInner() {
                   setTemplateError(null);
                 }}
               >
-                Cancel
+                {tCommon("cancel")}
               </Button>
               <Button onClick={handleCreateBank} disabled={isCreating || !newBankId.trim()}>
-                {isCreating ? "Creating..." : "Create"}
+                {isCreating ? tAddDocument("creating") : tCommon("create")}
               </Button>
             </DialogFooter>
           </DialogContent>
@@ -728,9 +973,9 @@ function BankSelectorInner() {
         <Dialog open={docDialogOpen} onOpenChange={setDocDialogOpen}>
           <DialogContent className="sm:max-w-[750px] max-h-[90vh] flex flex-col">
             <DialogHeader>
-              <DialogTitle>Add New Document</DialogTitle>
+              <DialogTitle>{tAddDocument("dialogTitle")}</DialogTitle>
               <p className="text-sm text-muted-foreground">
-                Add a new document to memory bank:{" "}
+                {tAddDocument("dialogSubtitle")}
                 <span className="font-semibold">{currentBank}</span>
               </p>
             </DialogHeader>
@@ -741,7 +986,7 @@ function BankSelectorInner() {
                 <TabsList className="grid w-full grid-cols-2">
                   <TabsTrigger value="text" className="flex items-center gap-2">
                     <FileText className="h-4 w-4" />
-                    Text
+                    {tAddDocument("tabText")}
                   </TabsTrigger>
                   <TabsTrigger
                     value="upload"
@@ -753,19 +998,209 @@ function BankSelectorInner() {
                     ) : (
                       <Upload className="h-4 w-4" />
                     )}
-                    Upload Files
+                    {tAddDocument("tabUploadFiles")}
                   </TabsTrigger>
                 </TabsList>
 
                 <TabsContent value="text" className="mt-3">
-                  <label className="font-bold block mb-1 text-sm text-foreground">Content *</label>
-                  <Textarea
-                    value={docContent}
-                    onChange={(e) => setDocContent(e.target.value)}
-                    placeholder="Enter the document content..."
-                    className="min-h-[150px] resize-y"
-                    autoFocus
-                  />
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="font-bold text-sm text-foreground">
+                      {tAddDocument("contentLabel")}
+                    </label>
+                    {/* The switch, rather than always showing the block editor:
+                        most documents are just text, and an ordered block list
+                        would be clutter in front of every one of them. */}
+                    <div className="flex items-center rounded border border-border overflow-hidden text-xs">
+                      <button
+                        type="button"
+                        onClick={() => setDocComposeMode("text")}
+                        className={`px-2 py-1 ${
+                          docComposeMode === "text"
+                            ? "bg-muted text-foreground font-semibold"
+                            : "text-muted-foreground hover:bg-muted/50"
+                        }`}
+                      >
+                        {tAddDocument("composeText")}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          // Carry the typed text across so switching never
+                          // silently loses what is already written.
+                          setDocBlocks((current) =>
+                            current.length > 0 ? current : [{ kind: "text", text: docContent }]
+                          );
+                          setDocComposeMode("blocks");
+                        }}
+                        className={`px-2 py-1 border-l border-border ${
+                          docComposeMode === "blocks"
+                            ? "bg-muted text-foreground font-semibold"
+                            : "text-muted-foreground hover:bg-muted/50"
+                        }`}
+                      >
+                        {tAddDocument("composeBlocks")}
+                      </button>
+                    </div>
+                  </div>
+
+                  {docComposeMode === "text" ? (
+                    <Textarea
+                      value={docContent}
+                      onChange={(e) => setDocContent(e.target.value)}
+                      placeholder={tAddDocument("contentPlaceholder")}
+                      className="min-h-[150px] resize-y"
+                      autoFocus
+                    />
+                  ) : (
+                    <div className="space-y-2">
+                      <p className="text-xs text-muted-foreground">
+                        {tAddDocument("composeBlocksHint")}
+                      </p>
+                      {docBlocks.map((block, index) => (
+                        <div
+                          key={index}
+                          className="group relative rounded border border-border bg-muted/20 p-2"
+                        >
+                          {/* Controls overlay the block rather than sitting in a
+                              column beside it: at this width a fixed gutter of
+                              arrows and a close button squeezed the content into
+                              a sliver. Revealed on hover and on keyboard focus,
+                              so they stay reachable without a pointer. */}
+                          <div className="absolute top-1 right-1 flex items-center gap-0.5 rounded bg-background/80 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+                            <button
+                              type="button"
+                              aria-label={tAddDocument("blockMoveUp")}
+                              disabled={index === 0}
+                              onClick={() =>
+                                setDocBlocks((current) => {
+                                  const next = [...current];
+                                  [next[index - 1], next[index]] = [next[index], next[index - 1]];
+                                  return next;
+                                })
+                              }
+                              className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-25"
+                            >
+                              <ChevronUp className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              aria-label={tAddDocument("blockMoveDown")}
+                              disabled={index === docBlocks.length - 1}
+                              onClick={() =>
+                                setDocBlocks((current) => {
+                                  const next = [...current];
+                                  [next[index], next[index + 1]] = [next[index + 1], next[index]];
+                                  return next;
+                                })
+                              }
+                              className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-25"
+                            >
+                              <ChevronDown className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              aria-label={tAddDocument("blockRemove")}
+                              onClick={() =>
+                                setDocBlocks((current) => current.filter((_, i) => i !== index))
+                              }
+                              className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted"
+                            >
+                              <X className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+
+                          {block.kind === "text" ? (
+                            <Textarea
+                              value={block.text}
+                              onChange={(e) =>
+                                setDocBlocks((current) =>
+                                  current.map((b, i) =>
+                                    i === index && b.kind === "text"
+                                      ? { ...b, text: e.target.value }
+                                      : b
+                                  )
+                                )
+                              }
+                              placeholder={tAddDocument("contentPlaceholder")}
+                              // Room for the overlay so the first line never runs
+                              // underneath it.
+                              className="min-h-[80px] resize-y border-0 bg-transparent p-0 pr-20 shadow-none focus-visible:ring-0"
+                            />
+                          ) : (
+                            <div className="flex items-center gap-2 pr-20 text-sm">
+                              <Paperclip className="h-4 w-4 shrink-0 text-muted-foreground" />
+                              <span className="truncate">{block.name}</span>
+                              <span className="shrink-0 text-xs text-muted-foreground">
+                                {(block.size / 1024).toFixed(0)} KB
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+
+                      <input
+                        id="doc-attachment-input"
+                        type="file"
+                        multiple
+                        className="hidden"
+                        onChange={async (e) => {
+                          const files = Array.from(e.target.files ?? []);
+                          const encoded = await Promise.all(
+                            files.map(
+                              (file) =>
+                                new Promise<DocBlock>((resolve, reject) => {
+                                  const reader = new FileReader();
+                                  reader.onerror = () => reject(reader.error);
+                                  reader.onload = () =>
+                                    resolve({
+                                      kind: "attachment",
+                                      name: file.name,
+                                      // Some browsers report "" for unusual
+                                      // extensions; the API accepts any
+                                      // well-formed type, so fall back to a
+                                      // generic one rather than refusing it.
+                                      mediaType: file.type || "application/octet-stream",
+                                      size: file.size,
+                                      // readAsDataURL gives "data:<type>;base64,<payload>";
+                                      // the API wants the payload alone.
+                                      data: String(reader.result).split(",", 2)[1] ?? "",
+                                    });
+                                  reader.readAsDataURL(file);
+                                })
+                            )
+                          );
+                          setDocBlocks((current) => [...current, ...encoded]);
+                          // Let the same file be picked again after removal.
+                          e.target.value = "";
+                        }}
+                      />
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button type="button" variant="outline" size="sm">
+                            <Plus className="mr-1.5 h-3.5 w-3.5" />
+                            {tAddDocument("blockAdd")}
+                            <ChevronDown className="ml-1.5 h-3.5 w-3.5" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="start">
+                          <DropdownMenuItem
+                            onSelect={() =>
+                              setDocBlocks((current) => [...current, { kind: "text", text: "" }])
+                            }
+                          >
+                            {tAddDocument("blockAddText")}
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onSelect={() =>
+                              document.getElementById("doc-attachment-input")?.click()
+                            }
+                          >
+                            {tAddDocument("blockAddAttachment")}
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
+                  )}
                 </TabsContent>
 
                 <TabsContent value="upload" className="mt-3">
@@ -773,15 +1208,18 @@ function BankSelectorInner() {
                     <div className="flex flex-col items-center justify-center py-8 text-center space-y-3">
                       <Lock className="h-12 w-12 text-muted-foreground/50" />
                       <div>
-                        <p className="font-semibold text-foreground">File Upload API Disabled</p>
+                        <p className="font-semibold text-foreground">
+                          {tAddDocument("fileUploadDisabled")}
+                        </p>
                         <p className="text-sm text-muted-foreground mt-1">
-                          File upload is not enabled on this server.
+                          {tAddDocument("fileUploadDisabledMessage")}
                         </p>
                         <p className="text-xs text-muted-foreground mt-2">
-                          To enable, set{" "}
-                          <code className="bg-muted px-1 py-0.5 rounded">
-                            HINDSIGHT_API_ENABLE_FILE_UPLOAD_API=true
-                          </code>
+                          {tAddDocument.rich("fileUploadEnableHint", {
+                            code: (chunks) => (
+                              <code className="bg-muted px-1 py-0.5 rounded">{chunks}</code>
+                            ),
+                          })}
                         </p>
                       </div>
                     </div>
@@ -801,7 +1239,7 @@ function BankSelectorInner() {
                       >
                         <Upload className="h-8 w-8 text-muted-foreground mb-2" />
                         <span className="text-sm text-muted-foreground">
-                          Click to select files or drag and drop
+                          {tAddDocument("clickToSelectFiles")}
                         </span>
                       </label>
 
@@ -827,7 +1265,7 @@ function BankSelectorInner() {
                                     type="button"
                                     className="flex items-center gap-1.5 min-w-0 flex-1 text-left hover:opacity-75 transition-opacity"
                                     onClick={() => toggleFileExpanded(index)}
-                                    title="Edit metadata for this file"
+                                    title={tAddDocument("editFileMetadata")}
                                   >
                                     {meta?.expanded ? (
                                       <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
@@ -875,7 +1313,7 @@ function BankSelectorInner() {
                                           <div className="grid grid-cols-2 gap-2">
                                             <div>
                                               <label className="font-bold block mb-1 text-sm text-foreground">
-                                                Event Date
+                                                {tAddDocument("eventDateLabel")}
                                               </label>
                                               <Input
                                                 type="date"
@@ -888,7 +1326,7 @@ function BankSelectorInner() {
                                             </div>
                                             <div>
                                               <label className="font-bold block mb-1 text-sm text-foreground">
-                                                Document ID
+                                                {tAddDocument("documentIdLabel")}
                                               </label>
                                               <Input
                                                 value={meta.document_id}
@@ -899,14 +1337,14 @@ function BankSelectorInner() {
                                                     e.target.value
                                                   )
                                                 }
-                                                placeholder="Optional ID..."
+                                                placeholder={tAddDocument("fileIdPlaceholder")}
                                                 className="h-8 text-sm"
                                               />
                                             </div>
                                           </div>
                                           <div>
                                             <label className="font-bold block mb-1 text-sm text-foreground">
-                                              Strategy
+                                              {tAddDocument("strategyLabel")}
                                             </label>
                                             {bankStrategies.length > 0 ? (
                                               <Select
@@ -925,7 +1363,7 @@ function BankSelectorInner() {
                                                 <SelectContent>
                                                   <SelectItem value="__none__">
                                                     <span className="text-muted-foreground italic">
-                                                      Default
+                                                      {tAddDocument("strategyDefault")}
                                                     </span>
                                                   </SelectItem>
                                                   {bankStrategies.map((name) => (
@@ -941,7 +1379,7 @@ function BankSelectorInner() {
                                                 onChange={(e) =>
                                                   updateFileMeta(index, "strategy", e.target.value)
                                                 }
-                                                placeholder="Strategy name (optional)..."
+                                                placeholder={tAddDocument("strategyPlaceholder")}
                                                 className="h-8 text-sm"
                                               />
                                             )}
@@ -950,33 +1388,32 @@ function BankSelectorInner() {
                                         <TabsContent value="tags" className="mt-0 space-y-2">
                                           <div>
                                             <label className="font-bold block mb-1 text-sm text-foreground">
-                                              Tags
+                                              {tAddDocument("tagsLabel")}
                                             </label>
                                             <Input
                                               value={meta.tags}
                                               onChange={(e) =>
                                                 updateFileMeta(index, "tags", e.target.value)
                                               }
-                                              placeholder="tag1, tag2..."
+                                              placeholder={tAddDocument("fileTagsPlaceholder")}
                                               className="h-8 text-sm"
                                             />
                                             <p className="text-xs text-muted-foreground mt-1">
-                                              Comma-separated — used to filter memories during
-                                              recall/reflect
+                                              {tAddDocument("fileTagsHelp")}
                                             </p>
                                           </div>
                                         </TabsContent>
                                         <TabsContent value="source" className="mt-0 space-y-2">
                                           <div>
                                             <label className="font-bold block mb-1 text-sm text-foreground">
-                                              Context
+                                              {tAddDocument("contextLabel")}
                                             </label>
                                             <Input
                                               value={meta.context}
                                               onChange={(e) =>
                                                 updateFileMeta(index, "context", e.target.value)
                                               }
-                                              placeholder="Optional context..."
+                                              placeholder={tAddDocument("fileContextPlaceholder")}
                                               className="h-8 text-sm"
                                             />
                                           </div>
@@ -1015,12 +1452,14 @@ function BankSelectorInner() {
               {/* Context — text tab only */}
               {docTab === "text" && (
                 <div>
-                  <label className="font-bold block mb-1 text-sm text-foreground">Context</label>
+                  <label className="font-bold block mb-1 text-sm text-foreground">
+                    {tAddDocument("contextLabel")}
+                  </label>
                   <Input
                     type="text"
                     value={docContext}
                     onChange={(e) => setDocContext(e.target.value)}
-                    placeholder="Optional context about this document..."
+                    placeholder={tAddDocument("contextPlaceholder")}
                   />
                 </div>
               )}
@@ -1058,7 +1497,7 @@ function BankSelectorInner() {
                         <div className="grid grid-cols-2 gap-3">
                           <div>
                             <label className="font-bold block mb-1 text-sm text-foreground">
-                              Event Date
+                              {tAddDocument("eventDateLabel")}
                             </label>
                             <Input
                               type="date"
@@ -1069,19 +1508,19 @@ function BankSelectorInner() {
                           </div>
                           <div>
                             <label className="font-bold block mb-1 text-sm text-foreground">
-                              Document ID
+                              {tAddDocument("documentIdLabel")}
                             </label>
                             <Input
                               type="text"
                               value={docDocumentId}
                               onChange={(e) => setDocDocumentId(e.target.value)}
-                              placeholder="Optional document identifier..."
+                              placeholder={tAddDocument("documentIdPlaceholder")}
                             />
                           </div>
                         </div>
                         <div>
                           <label className="font-bold block mb-1 text-sm text-foreground">
-                            Strategy
+                            {tAddDocument("strategyLabel")}
                           </label>
                           {bankStrategies.length > 0 ? (
                             <Select
@@ -1093,7 +1532,9 @@ function BankSelectorInner() {
                               </SelectTrigger>
                               <SelectContent>
                                 <SelectItem value="__none__">
-                                  <span className="text-muted-foreground italic">Default</span>
+                                  <span className="text-muted-foreground italic">
+                                    {tAddDocument("strategyDefault")}
+                                  </span>
                                 </SelectItem>
                                 {bankStrategies.map((name) => (
                                   <SelectItem key={name} value={name}>
@@ -1107,11 +1548,11 @@ function BankSelectorInner() {
                               type="text"
                               value={docStrategy}
                               onChange={(e) => setDocStrategy(e.target.value)}
-                              placeholder="Strategy name (optional)..."
+                              placeholder={tAddDocument("strategyPlaceholder")}
                             />
                           )}
                           <p className="text-xs text-muted-foreground mt-1">
-                            Override the bank&apos;s default extraction strategy for this document.
+                            {tAddDocument("strategyHelpText")}
                           </p>
                         </div>
                         <div className="flex items-center gap-2">
@@ -1124,7 +1565,7 @@ function BankSelectorInner() {
                             htmlFor="async-doc"
                             className="text-sm cursor-pointer text-foreground"
                           >
-                            Process in background (async)
+                            {tAddDocument("asyncLabel")}
                           </label>
                         </div>
                       </TabsContent>
@@ -1132,27 +1573,32 @@ function BankSelectorInner() {
                       <TabsContent value="tags" className="mt-0 space-y-3">
                         <div>
                           <label className="font-bold block mb-1 text-sm text-foreground">
-                            Tags
+                            {tAddDocument("tagsLabel")}
                           </label>
                           <Input
                             type="text"
                             value={docTags}
                             onChange={(e) => setDocTags(e.target.value)}
-                            placeholder="user_alice, session_123, project_x"
+                            placeholder={tAddDocument("tagsPlaceholder")}
                           />
                           <p className="text-xs text-muted-foreground mt-1">
-                            Comma-separated — used to filter memories during recall/reflect
+                            {tAddDocument("tagsHelpText")}
                           </p>
                         </div>
                         <div>
                           <label className="font-bold block mb-1 text-sm text-foreground">
-                            Observation Scopes
+                            {tAddDocument("observationScopesLabel")}
                           </label>
                           <Select
                             value={docObservationScopes}
                             onValueChange={(v) =>
                               setDocObservationScopes(
-                                v as "per_tag" | "combined" | "all_combinations" | "custom"
+                                v as
+                                  | "per_tag"
+                                  | "combined"
+                                  | "all_combinations"
+                                  | "custom"
+                                  | "shared"
                               )
                             }
                           >
@@ -1160,13 +1606,28 @@ function BankSelectorInner() {
                               <SelectValue />
                             </SelectTrigger>
                             <SelectContent>
-                              <SelectItem value="per_tag">Per tag</SelectItem>
+                              <SelectItem value="per_tag">
+                                {tAddDocument("observationScopePerTag")}
+                              </SelectItem>
                               <SelectItem value="combined">Combined</SelectItem>
-                              <SelectItem value="all_combinations">All combinations</SelectItem>
-                              <SelectItem value="custom">Custom</SelectItem>
+                              <SelectItem value="all_combinations">
+                                {tAddDocument("observationScopeAllCombinations")}
+                              </SelectItem>
+                              <SelectItem value="shared">
+                                {tAddDocument("observationScopeShared")}
+                              </SelectItem>
+                              <SelectItem value="custom">
+                                {tAddDocument("observationScopeCustom")}
+                              </SelectItem>
                             </SelectContent>
                           </Select>
+                          {docObservationScopes === "shared" && (
+                            <p className="text-xs text-muted-foreground mt-1.5 italic">
+                              {tAddDocument("observationScopeSharedHelp")}
+                            </p>
+                          )}
                           {docObservationScopes !== "custom" &&
+                            docObservationScopes !== "shared" &&
                             (() => {
                               const tags = docTags
                                 .split(",")
@@ -1177,7 +1638,7 @@ function BankSelectorInner() {
                               if (tags.length === 0) {
                                 return (
                                   <p className="text-xs text-muted-foreground/60 mt-1.5 italic">
-                                    Add tags above to preview observation scopes
+                                    {tAddDocument("observationScopesEmpty")}
                                   </p>
                                 );
                               }
@@ -1195,7 +1656,7 @@ function BankSelectorInner() {
                                   ))}
                                   {scopes.length > MAX && (
                                     <li className="text-xs text-muted-foreground">
-                                      +{scopes.length - MAX} more scopes
+                                      {tAddDocument("moreScopes", { count: scopes.length - MAX })}
                                     </li>
                                   )}
                                 </ul>
@@ -1224,7 +1685,11 @@ function BankSelectorInner() {
                             className="min-h-[72px] resize-y font-mono text-sm"
                           />
                           <p className="text-xs text-muted-foreground mt-1">
-                            One <code className="bg-muted px-0.5 rounded">key: value</code> per line
+                            {tAddDocument.rich("metadataHelpText", {
+                              code: (chunks) => (
+                                <code className="bg-muted px-0.5 rounded">{chunks}</code>
+                              ),
+                            })}
                           </p>
                         </div>
                         <div>
@@ -1238,7 +1703,7 @@ function BankSelectorInner() {
                             placeholder="Alice, Google, ML model"
                           />
                           <p className="text-xs text-muted-foreground mt-1">
-                            Comma-separated hints merged with auto-extracted entities
+                            {tAddDocument("entitiesHelpText")}
                           </p>
                         </div>
                       </TabsContent>
@@ -1248,12 +1713,21 @@ function BankSelectorInner() {
               )}
             </div>
 
+            {features?.store_document_text === false && (
+              <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+                <Lock className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                <span>{tAddDocument("textNotStoredWarning")}</span>
+              </div>
+            )}
+
             <DialogFooter>
               <Button
                 variant="secondary"
                 onClick={() => {
                   setDocDialogOpen(false);
                   setDocContent("");
+                  setDocBlocks([]);
+                  setDocComposeMode("text");
                   setDocContext("");
                   setDocEventDate("");
                   setDocDocumentId("");
@@ -1269,14 +1743,23 @@ function BankSelectorInner() {
                   setUploadProgress("");
                 }}
               >
-                Cancel
+                {tAddDocument("cancel")}
               </Button>
               {docTab === "text" ? (
                 <Button
                   onClick={handleCreateDocument}
-                  disabled={isCreatingDoc || !docContent.trim()}
+                  disabled={
+                    isCreatingDoc ||
+                    (docComposeMode === "blocks"
+                      ? !docBlocks.some((b) =>
+                          b.kind === "text" ? b.text.trim().length > 0 : true
+                        )
+                      : !docContent.trim())
+                  }
                 >
-                  {isCreatingDoc ? "Adding..." : "Add Document"}
+                  {isCreatingDoc
+                    ? tAddDocument("addingDocument")
+                    : tAddDocument("addDocumentSubmit")}
                 </Button>
               ) : (
                 <Button
@@ -1284,8 +1767,8 @@ function BankSelectorInner() {
                   disabled={isCreatingDoc || selectedFiles.length === 0}
                 >
                   {isCreatingDoc
-                    ? uploadProgress || "Uploading..."
-                    : `Upload ${selectedFiles.length} File${selectedFiles.length !== 1 ? "s" : ""}`}
+                    ? uploadProgress || tAddDocument("uploading")
+                    : tAddDocument("uploadFiles", { count: selectedFiles.length })}
                 </Button>
               )}
             </DialogFooter>
@@ -1303,7 +1786,7 @@ export function BankSelector() {
         <div className="bg-card text-card-foreground px-5 py-3 border-b-4 border-primary-gradient">
           <div className="flex items-center gap-4 text-sm">
             <Image
-              src="/logo.png"
+              src={withBasePath("/logo.png")}
               alt="Hindsight"
               width={40}
               height={40}

@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { localizeApiErrorPayload } from "@/lib/i18n/api-errors";
 import { dataplaneBankUrl, getDataplaneHeaders } from "@/lib/hindsight-client";
 
 export async function GET(request: Request, { params }: { params: Promise<{ bankId: string }> }) {
@@ -7,9 +8,17 @@ export async function GET(request: Request, { params }: { params: Promise<{ bank
     const { searchParams } = new URL(request.url);
     const tags = searchParams.getAll("tags");
     const tagsMatch = searchParams.get("tags_match");
+    const limit = searchParams.get("limit");
+    const offset = searchParams.get("offset");
 
     if (!bankId) {
-      return NextResponse.json({ error: "bank_id is required" }, { status: 400 });
+      return NextResponse.json(
+        localizeApiErrorPayload(request, {
+          error: "bank_id is required",
+          errorKey: "api.errors.validation.bankIdRequired",
+        }),
+        { status: 400 }
+      );
     }
 
     const queryParams = new URLSearchParams();
@@ -18,6 +27,12 @@ export async function GET(request: Request, { params }: { params: Promise<{ bank
     }
     if (tagsMatch) {
       queryParams.append("tags_match", tagsMatch);
+    }
+    if (limit) {
+      queryParams.append("limit", limit);
+    }
+    if (offset) {
+      queryParams.append("offset", offset);
     }
 
     const url = dataplaneBankUrl(
@@ -29,14 +44,26 @@ export async function GET(request: Request, { params }: { params: Promise<{ bank
     if (!response.ok) {
       const errorText = await response.text();
       console.error("API error listing directives:", errorText);
-      return NextResponse.json({ error: "Failed to list directives" }, { status: response.status });
+      return NextResponse.json(
+        localizeApiErrorPayload(request, {
+          error: "Failed to list directives",
+          errorKey: "api.errors.directives.list",
+        }),
+        { status: response.status }
+      );
     }
 
     const data = await response.json();
     return NextResponse.json(data, { status: 200 });
   } catch (error) {
     console.error("Error listing directives:", error);
-    return NextResponse.json({ error: "Failed to list directives" }, { status: 500 });
+    return NextResponse.json(
+      localizeApiErrorPayload(request, {
+        error: "Failed to list directives",
+        errorKey: "api.errors.directives.list",
+      }),
+      { status: 500 }
+    );
   }
 }
 
@@ -45,7 +72,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ ban
     const { bankId } = await params;
 
     if (!bankId) {
-      return NextResponse.json({ error: "bank_id is required" }, { status: 400 });
+      return NextResponse.json(
+        localizeApiErrorPayload(request, {
+          error: "bank_id is required",
+          errorKey: "api.errors.validation.bankIdRequired",
+        }),
+        { status: 400 }
+      );
     }
 
     const body = await request.json();
@@ -60,7 +93,10 @@ export async function POST(request: Request, { params }: { params: Promise<{ ban
       const errorText = await response.text();
       console.error("API error creating directive:", errorText);
       return NextResponse.json(
-        { error: errorText || "Failed to create directive" },
+        localizeApiErrorPayload(request, {
+          error: errorText || "Failed to create directive",
+          errorKey: "api.errors.directives.create",
+        }),
         { status: response.status }
       );
     }
@@ -69,6 +105,12 @@ export async function POST(request: Request, { params }: { params: Promise<{ ban
     return NextResponse.json(data, { status: 201 });
   } catch (error) {
     console.error("Error creating directive:", error);
-    return NextResponse.json({ error: "Failed to create directive" }, { status: 500 });
+    return NextResponse.json(
+      localizeApiErrorPayload(request, {
+        error: "Failed to create directive",
+        errorKey: "api.errors.directives.create",
+      }),
+      { status: 500 }
+    );
   }
 }

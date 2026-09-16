@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { localizeApiErrorPayload } from "@/lib/i18n/api-errors";
 import { lowLevelClient, sdk } from "@/lib/hindsight-client";
 
 export async function POST(request: NextRequest) {
@@ -9,6 +10,7 @@ export async function POST(request: NextRequest) {
       query,
       types,
       fact_type,
+      prefer_observations,
       max_tokens,
       trace,
       budget,
@@ -16,6 +18,9 @@ export async function POST(request: NextRequest) {
       query_timestamp,
       tags,
       tags_match,
+      tag_groups,
+      min_scores,
+      temporal_window,
     } = body;
 
     const response = await sdk.recallMemories({
@@ -24,6 +29,7 @@ export async function POST(request: NextRequest) {
       body: {
         query,
         types: types || fact_type,
+        prefer_observations,
         max_tokens,
         trace,
         budget: budget || "mid",
@@ -31,6 +37,9 @@ export async function POST(request: NextRequest) {
         query_timestamp,
         tags,
         tags_match,
+        tag_groups,
+        min_scores,
+        temporal_window,
       },
     });
 
@@ -51,6 +60,12 @@ export async function POST(request: NextRequest) {
     return NextResponse.json(jsonResponse, { status: 200 });
   } catch (error) {
     console.error("Error recalling:", error);
-    return NextResponse.json({ error: "Failed to recall" }, { status: 500 });
+    return NextResponse.json(
+      localizeApiErrorPayload(request, {
+        error: "Failed to recall",
+        errorKey: "api.errors.recall.failed",
+      }),
+      { status: 500 }
+    );
   }
 }

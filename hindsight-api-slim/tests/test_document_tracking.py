@@ -1,6 +1,7 @@
 """
 Tests for document tracking and upsert functionality.
 """
+
 import logging
 from datetime import datetime, timezone
 from unittest.mock import patch
@@ -8,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from hindsight_api import RequestContext
-from hindsight_api.engine.response_models import TokenUsage
+from hindsight_api.engine.response_models import LLMCallResult, TokenUsage
 
 
 @pytest.mark.asyncio
@@ -121,6 +122,67 @@ async def test_document_deletion(memory, request_context):
         await memory.delete_bank(bank_id, request_context=request_context)
 
 
+async def _retain_shared_document(memory, request_context, banks, document_id):
+    """Give each bank its own copy of the same document_id — legal, `documents` is keyed on (id, bank_id)."""
+    for bank_id in banks:
+        await memory.retain_async(
+            bank_id=bank_id,
+            content="Alice works at Google.",
+            context="Test",
+            document_id=document_id,
+            request_context=request_context,
+        )
+
+
+async def _units(memory, request_context, bank_id, document_id):
+    page = await memory.list_memory_units(bank_id=bank_id, document_id=document_id, request_context=request_context)
+    return page["items"]
+
+
+@pytest.mark.asyncio
+async def test_document_deletion_counts_only_its_own_bank_units(memory, request_context):
+    """`memory_units_deleted` must report the caller's units, not those of every bank sharing the document_id."""
+    stamp = datetime.now(timezone.utc).timestamp()
+    bank_a, bank_b = f"test_del_scope_a_{stamp}", f"test_del_scope_b_{stamp}"
+    document_id = f"shared-document-id-{stamp}"
+
+    try:
+        await _retain_shared_document(memory, request_context, (bank_a, bank_b), document_id)
+        a_count = len(await _units(memory, request_context, bank_a, document_id))
+        assert a_count > 0
+
+        result = await memory.delete_document(document_id, bank_a, request_context=request_context)
+
+        assert result["memory_units_deleted"] == a_count
+        assert len(await _units(memory, request_context, bank_b, document_id)) == a_count
+
+    finally:
+        for bank_id in (bank_a, bank_b):
+            await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_document_tag_update_is_scoped_to_its_bank(memory, request_context):
+    """Re-tagging a document must not re-tag the memory units of another bank sharing the document_id."""
+    stamp = datetime.now(timezone.utc).timestamp()
+    bank_a, bank_b = f"test_tag_scope_a_{stamp}", f"test_tag_scope_b_{stamp}"
+    document_id = f"shared-document-id-{stamp}"
+
+    try:
+        await _retain_shared_document(memory, request_context, (bank_a, bank_b), document_id)
+
+        await memory.update_document(document_id, bank_a, tags=["rewritten"], request_context=request_context)
+
+        for unit in await _units(memory, request_context, bank_a, document_id):
+            assert unit["tags"] == ["rewritten"]
+        for unit in await _units(memory, request_context, bank_b, document_id):
+            assert "rewritten" not in (unit["tags"] or [])
+
+    finally:
+        for bank_id in (bank_a, bank_b):
+            await memory.delete_bank(bank_id, request_context=request_context)
+
+
 @pytest.mark.asyncio
 async def test_memory_without_document(memory, request_context):
     """Test that memories can still be created without document tracking."""
@@ -206,13 +268,67 @@ async def test_document_without_metadata(memory, request_context):
 
 
 @pytest.mark.asyncio
-async def test_document_persisted_with_zero_facts(memory, request_context):
+async def test_document_observation_scopes_from_retain_params(memory, request_context):
+    """observation_scopes passed at retain time is captured into retain_params and surfaced by get_document."""
+    bank_id = f"test_doc_obs_scopes_{datetime.now(timezone.utc).timestamp()}"
+
+    try:
+        document_id = "doc-with-scopes"
+        await memory.retain_batch_async(
+            bank_id=bank_id,
+            contents=[
+                {
+                    "content": "Alice and Bob are friends.",
+                    "tags": ["alice", "bob"],
+                    "observation_scopes": "all_combinations",
+                }
+            ],
+            document_id=document_id,
+            request_context=request_context,
+        )
+
+        doc = await memory.get_document(document_id, bank_id, request_context=request_context)
+        assert doc is not None
+        # Surfaced as a top-level field and persisted in retain_params.
+        assert doc["observation_scopes"] == "all_combinations"
+        assert doc["retain_params"]["observation_scopes"] == "all_combinations"
+
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_document_observation_scopes_none_when_unset(memory, request_context):
+    """get_document returns observation_scopes None when none was configured at retain time."""
+    bank_id = f"test_doc_no_scopes_{datetime.now(timezone.utc).timestamp()}"
+
+    try:
+        document_id = "doc-no-scopes"
+        await memory.retain_async(
+            bank_id=bank_id,
+            content="Bob works at Microsoft.",
+            document_id=document_id,
+            request_context=request_context,
+        )
+
+        doc = await memory.get_document(document_id, bank_id, request_context=request_context)
+        assert doc is not None
+        assert doc["observation_scopes"] is None
+
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.hs_llm_core
+async def test_document_persisted_with_zero_facts(memory_real_llm, request_context):
     """
     Test that documents are persisted even when zero facts are extracted.
 
     This is a regression test for issue #324 where documents with no extractable
     facts were reported as disappearing from the system.
     """
+    memory = memory_real_llm
     bank_id = f"test_zero_facts_{datetime.now(timezone.utc).timestamp()}"
 
     try:
@@ -258,12 +374,14 @@ async def test_document_persisted_with_zero_facts(memory, request_context):
 
 
 @pytest.mark.asyncio
-async def test_document_persisted_with_zero_facts_batch(memory, request_context):
+@pytest.mark.hs_llm_core
+async def test_document_persisted_with_zero_facts_batch(memory_real_llm, request_context):
     """
     Test that documents are persisted with zero facts in batch retain operations.
 
     This tests the async batch code path to ensure it also handles zero facts correctly.
     """
+    memory = memory_real_llm
     bank_id = f"test_zero_facts_batch_{datetime.now(timezone.utc).timestamp()}"
 
     try:
@@ -314,13 +432,15 @@ async def test_document_persisted_with_zero_facts_batch(memory, request_context)
 
 
 @pytest.mark.asyncio
-async def test_document_persisted_with_zero_facts_async_submit(memory, request_context):
+@pytest.mark.hs_llm_core
+async def test_document_persisted_with_zero_facts_async_submit(memory_real_llm, request_context):
     """
     Test that documents are persisted with zero facts in fire-and-forget async retain.
 
     This tests the submit_async_retain (background task) code path to ensure it also
     handles zero facts correctly.
     """
+    memory = memory_real_llm
     import asyncio
 
     bank_id = f"test_zero_facts_async_{datetime.now(timezone.utc).timestamp()}"
@@ -351,9 +471,7 @@ async def test_document_persisted_with_zero_facts_async_submit(memory, request_c
             elapsed += wait_interval
 
             # Check if document exists
-            doc = await memory.get_document(
-                "doc-async-zero-facts", bank_id, request_context=request_context
-            )
+            doc = await memory.get_document("doc-async-zero-facts", bank_id, request_context=request_context)
             if doc is not None:
                 break
 
@@ -395,9 +513,7 @@ async def test_document_stored_without_chunks_when_zero_facts(memory_no_llm_veri
 
     async def mock_llm_zero_facts(*args, **kwargs):
         response = {"facts": []}
-        if kwargs.get("return_usage", False):
-            return response, TokenUsage(input_tokens=10, output_tokens=2)
-        return response
+        return LLMCallResult(content=response, usage=TokenUsage(input_tokens=10, output_tokens=2))
 
     try:
         with patch("hindsight_api.engine.llm_wrapper.LLMProvider.call", new=mock_llm_zero_facts):

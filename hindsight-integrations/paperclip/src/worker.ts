@@ -20,14 +20,17 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 import type { ToolRunContext } from "@paperclipai/plugin-sdk";
 import { HindsightClient, formatMemories } from "./client.js";
-import { deriveBankId } from "./bank.js";
+import { deriveBankId, extractUserFromIssue } from "./bank.js";
 
 interface PluginConfig {
   hindsightApiUrl: string;
   hindsightApiKeyRef?: string;
-  bankGranularity?: Array<"company" | "agent">;
+  bankId?: string;
+  dynamicBankId?: boolean;
+  bankGranularity?: Array<"company" | "agent" | "user">;
   recallBudget?: "low" | "mid" | "high";
   autoRetain?: boolean;
+  enabledAgentIds?: string[];
 }
 
 interface RunStartedPayload {
@@ -63,6 +66,12 @@ async function resolveApiKey(
   return resolved ?? undefined;
 }
 
+function isAgentEnabled(config: PluginConfig, agentId: string | undefined | null): boolean {
+  const allowlist = config.enabledAgentIds;
+  if (!allowlist || allowlist.length === 0) return true;
+  return !!agentId && allowlist.includes(agentId);
+}
+
 const plugin = definePlugin({
   async setup(ctx) {
     ctx.logger.info("Hindsight memory plugin starting");
@@ -79,6 +88,7 @@ const plugin = definePlugin({
       const config = await getConfig(ctx);
       const { agentId, runId, issueId } = payload;
       const companyId = event.companyId;
+      if (!isAgentEnabled(config, agentId)) return;
       if (!issueId || !companyId) return;
 
       let issue;
@@ -97,10 +107,22 @@ const plugin = definePlugin({
       const query = [issue.title, issue.description].filter(Boolean).join("\n");
       if (!query.trim()) return;
 
+      // Extract userId from the specific issue being worked on (not an
+      // arbitrary one from list). This is only used when bankGranularity
+      // includes "user".
+      const userId = config.bankGranularity?.includes("user")
+        ? extractUserFromIssue(issue)
+        : undefined;
+
+      // Cache userId so tool calls within this run can derive the same bank ID
+      if (userId) {
+        await ctx.state.set({ scopeKind: "run", scopeId: runId, stateKey: "user-id" }, userId);
+      }
+
       try {
         const apiKey = await resolveApiKey(ctx, config);
         const client = new HindsightClient(config.hindsightApiUrl, apiKey);
-        const bankId = deriveBankId({ companyId, agentId }, config);
+        const bankId = deriveBankId({ companyId, agentId, userId }, config);
 
         const response = await client.recall(bankId, query, config.recallBudget ?? "mid");
 
@@ -165,12 +187,19 @@ const plugin = definePlugin({
       // Bank attribution: comments authored by an agent belong in that agent's
       // bank; user/system comments fall back to the issue's assignee.
       let bankAgentId: string | null = payloadAgentId;
-      if (!bankAgentId) {
+      let userId: string | undefined;
+      let issueForAttribution;
+      if (!bankAgentId || config.bankGranularity?.includes("user")) {
         try {
-          const issue = await ctx.issues.get(issueId, companyId);
-          bankAgentId = issue?.assigneeAgentId ?? null;
+          issueForAttribution = await ctx.issues.get(issueId, companyId);
+          if (!bankAgentId) {
+            bankAgentId = issueForAttribution?.assigneeAgentId ?? null;
+          }
+          if (config.bankGranularity?.includes("user") && issueForAttribution) {
+            userId = extractUserFromIssue(issueForAttribution);
+          }
         } catch {
-          /* ignore */
+          /* ignore — userId stays undefined, bankAgentId fallback already handled */
         }
       }
 
@@ -182,10 +211,18 @@ const plugin = definePlugin({
         return;
       }
 
+      if (!isAgentEnabled(config, bankAgentId)) {
+        ctx.logger.debug("Skipping retain — agent not in enabled list", {
+          commentId,
+          agentId: bankAgentId,
+        });
+        return;
+      }
+
       try {
         const apiKey = await resolveApiKey(ctx, config);
         const client = new HindsightClient(config.hindsightApiUrl, apiKey);
-        const bankId = deriveBankId({ companyId, agentId: bankAgentId }, config);
+        const bankId = deriveBankId({ companyId, agentId: bankAgentId, userId }, config);
         await client.retain(bankId, body, commentId, {
           agentId: bankAgentId,
           companyId,
@@ -212,6 +249,8 @@ const plugin = definePlugin({
     // ---------------------------------------------------------------------------
     ctx.events.on("agent.run.finished", async (event) => {
       const payload = event.payload as RunFinishedPayload;
+      const config = await getConfig(ctx);
+      if (!isAgentEnabled(config, payload?.agentId)) return;
       ctx.logger.debug(
         "agent.run.finished received (no-op; retention handled by issue.comment.created)",
         { runId: payload?.runId }
@@ -237,8 +276,20 @@ const plugin = definePlugin({
       async (params: unknown, runCtx: ToolRunContext) => {
         const { query } = params as { query: string };
         const config = await getConfig(ctx);
+
+        // Read userId cached by agent.run.started for consistent bank derivation
+        let userId: string | undefined;
+        if (config.bankGranularity?.includes("user")) {
+          const cachedUserId = await ctx.state.get({
+            scopeKind: "run",
+            scopeId: runCtx.runId,
+            stateKey: "user-id",
+          });
+          if (cachedUserId && typeof cachedUserId === "string") userId = cachedUserId;
+        }
+
         const bankId = deriveBankId(
-          { companyId: runCtx.companyId, agentId: runCtx.agentId },
+          { companyId: runCtx.companyId, agentId: runCtx.agentId, userId },
           config
         );
 
@@ -288,8 +339,20 @@ const plugin = definePlugin({
       async (params: unknown, runCtx: ToolRunContext) => {
         const { content } = params as { content: string };
         const config = await getConfig(ctx);
+
+        // Read userId cached by agent.run.started for consistent bank derivation
+        let userId: string | undefined;
+        if (config.bankGranularity?.includes("user")) {
+          const cached = await ctx.state.get({
+            scopeKind: "run",
+            scopeId: runCtx.runId,
+            stateKey: "user-id",
+          });
+          if (cached && typeof cached === "string") userId = cached;
+        }
+
         const bankId = deriveBankId(
-          { companyId: runCtx.companyId, agentId: runCtx.agentId },
+          { companyId: runCtx.companyId, agentId: runCtx.agentId, userId },
           config
         );
 

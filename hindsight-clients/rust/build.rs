@@ -43,6 +43,85 @@ fn filter_multipart_endpoints(spec: &mut serde_json::Value) {
     }
 }
 
+/// Drop error responses that carry no schema (the documented 404 on bank-scoped
+/// reads, say).
+///
+/// progenitor models at most one error type per operation --
+/// `assertion failed: response_types.len() <= 1` in method.rs -- and FastAPI
+/// already gives every one of these operations a typed 422. A bodyless 404 adds
+/// a second, empty error type and panics the generator. Dropping it costs the
+/// Rust client nothing: an undeclared status still surfaces as
+/// `Error::UnexpectedResponse`, status code intact.
+fn filter_bodyless_error_responses(spec: &mut serde_json::Value) {
+    let Some(paths) = spec.get_mut("paths").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    for (_path_name, path_item) in paths.iter_mut() {
+        let Some(operations) = path_item.as_object_mut() else {
+            continue;
+        };
+        for (_method, operation) in operations.iter_mut() {
+            let Some(responses) = operation.get_mut("responses").and_then(|v| v.as_object_mut()) else {
+                continue;
+            };
+            responses.retain(|status, response| {
+                let is_error = status
+                    .chars()
+                    .next()
+                    .map(|c| c == '4' || c == '5')
+                    .unwrap_or(false);
+                !(is_error && response.get("content").is_none())
+            });
+        }
+    }
+}
+
+/// Collapse `anyOf` whose members are all plain string types into a single
+/// `{"type": "string"}`. Without this, progenitor emits a struct like
+/// `MemoryItemTimestamp { #[serde(flatten)] subtype_0: Option<DateTime>, ... }`
+/// where flatten on a primitive is a runtime error
+/// (`"can only flatten structs and maps (got a string)"`). For client purposes
+/// the `format: date-time` distinction is lossless — the wire value is just a
+/// string either way — so collapsing to a plain string is safe and lets the
+/// generated client actually serialize.
+fn collapse_string_anyof_unions(value: &mut serde_json::Value) {
+    if let serde_json::Value::Object(obj) = value {
+        let all_strings = obj
+            .get("anyOf")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                !arr.is_empty()
+                    && arr.iter().all(|v| {
+                        v.as_object()
+                            .and_then(|m| m.get("type"))
+                            .and_then(|t| t.as_str())
+                            .map(|s| s == "string")
+                            .unwrap_or(false)
+                    })
+            })
+            .unwrap_or(false);
+
+        if all_strings {
+            obj.remove("anyOf");
+            obj.insert("type".to_string(), serde_json::json!("string"));
+        }
+    }
+
+    match value {
+        serde_json::Value::Object(obj) => {
+            for (_k, v) in obj.iter_mut() {
+                collapse_string_anyof_unions(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                collapse_string_anyof_unions(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn convert_anyof_to_nullable(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(obj) => {
@@ -132,8 +211,18 @@ fn main() {
         }
     }
 
+    // Collapse anyOf-of-only-strings into a plain string. Must run AFTER the
+    // 3.1→3.0 nullable pass so we see `anyOf: [datetime, string]` without the
+    // null arm. Keeps progenitor from emitting unserializable flatten-of-
+    // primitive structs (see collapse_string_anyof_unions docs).
+    collapse_string_anyof_unions(&mut spec_json);
+
     // Filter out multipart/form-data endpoints (progenitor doesn't support them)
     filter_multipart_endpoints(&mut spec_json);
+
+    // Drop schema-less error responses; progenitor allows only one error type
+    // per operation and the typed 422 is the one worth keeping.
+    filter_bodyless_error_responses(&mut spec_json);
 
     // Now parse as OpenAPI struct
     let spec: openapiv3::OpenAPI = serde_json::from_value(spec_json)

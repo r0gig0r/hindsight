@@ -4,13 +4,35 @@ The `hindsight-admin` CLI provides administrative commands for managing your Hin
 
 ## Installation
 
-The admin CLI is included with the `hindsight-api` package:
+The admin CLI is included with the `hindsight-api` package — installing it puts the `hindsight-admin` executable on your `PATH`:
 
 ```bash
 pip install hindsight-api
 # or
 uv add hindsight-api
 ```
+
+## Running the CLI
+
+`hindsight-admin` connects **directly to PostgreSQL** — it does not call the HTTP API. It reads the **same configuration as the API service** (environment variables, and a `.env` file in the current working directory), so it operates on whatever database `HINDSIGHT_API_DATABASE_URL` points to:
+
+- **Default**: `pg0`, the embedded development database (must be run on the host that owns the pg0 data).
+- **Production**: set `HINDSIGHT_API_DATABASE_URL=postgresql://user:pass@host:5432/hindsight`.
+
+Because it talks to the database directly (binary `COPY`, `TRUNCATE`, etc.), the admin CLI is **PostgreSQL-only** (not supported on Oracle). Run it on the same host/container as your API deployment so it inherits the right configuration and has network access to the database:
+
+```bash
+# Bare metal / virtualenv (with the API's env or a .env in the working dir)
+hindsight-admin worker-status
+
+# Docker — exec into the API container
+docker exec -it hindsight-api hindsight-admin backup /data/backup.zip
+
+# Kubernetes — exec into an API pod
+kubectl exec deploy/hindsight-api -- hindsight-admin run-db-migration
+```
+
+Use `--schema` to target a specific tenant schema (commands default to the configured base schema). See [Environment Variables](#environment-variables) below.
 
 ## Commands
 
@@ -27,6 +49,8 @@ hindsight-admin run-db-migration [OPTIONS]
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--schema`, `-s` | Database schema to run migrations on. If omitted, migrate the base schema plus all discovered tenant schemas. | All schemas |
+| `--embedding-dimension` | Expected embedding dimension to enforce after migrations. Omit to skip the post-migration dimension sync. | Skipped |
+| `--skip-extension-reconcile` | Skip the post-migration vector / text-search index reconcile (it only does work when `HINDSIGHT_API_VECTOR_EXTENSION` / `HINDSIGHT_API_TEXT_SEARCH_EXTENSION` differs from a schema's existing indexes). Makes a no-change re-migration across many tenant schemas much faster; only use when the backend is unchanged. | Reconcile runs |
 
 **Examples:**
 
@@ -41,6 +65,79 @@ hindsight-admin run-db-migration --schema tenant_acme
 :::tip Disabling Auto-Migrations
 To disable automatic migrations on API startup, set `HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP=false`. This is useful when you want to run migrations as a separate step in your deployment pipeline.
 :::
+
+---
+
+### repair-bank
+
+Verify and repair a bank's per-`(bank, fact_type)` vector index coverage.
+
+These partial indexes are normally created when a bank is first created (instant on an empty bank), and PostgreSQL maintains them incrementally as the bank grows. A bank that becomes **populated outside that create-time path** — via a logical restore, a cross-version upgrade, or a vector-extension switch — never gets them, so its bank-scoped recall silently falls back to a global index + post-filter. That fallback is both **slower** and can **under-return** results (the approximate nearest-neighbour search draws its candidates from every bank, then filters to yours afterward).
+
+Run this after any of those events to restore full coverage. It detects **missing or invalid** coverage (an INVALID leftover from an interrupted build, or an index whose type drifted after a backend switch, both count as missing) and rebuilds it with `CREATE INDEX CONCURRENTLY`, so it never blocks live retain/recall/consolidation. It is idempotent and safe to re-run.
+
+```bash
+hindsight-admin repair-bank (--bank BANK_ID | --all) [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--bank`, `-b` | Bank id to repair. Mutually exclusive with `--all`. | — |
+| `--all` | Repair every bank in the base schema and all discovered tenant schemas. | — |
+| `--schema`, `-s` | Limit to a single schema. | All schemas |
+| `--dry-run` | Report what would be repaired without creating or dropping any index. | Off |
+
+Exactly one of `--bank` or `--all` is required. No-op for backends that use a single global vector index (AlloyDB ScaNN, Oracle). It is idempotent — safe to re-run and safe to run while the API is serving traffic.
+
+**Examples:**
+
+```bash
+# See which banks are missing coverage without changing anything
+hindsight-admin repair-bank --all --dry-run
+
+# Repair every bank across all schemas (run once after a restore/upgrade)
+hindsight-admin repair-bank --all
+
+# Repair a single bank
+hindsight-admin repair-bank --bank acme-prod
+```
+
+---
+
+### rename-bank
+
+Change a bank's id in place. Every memory, document, entity, mental model and knowledge page is kept exactly as it is. Nothing is re-extracted or re-embedded, and no LLM calls are made.
+
+```bash
+hindsight-admin rename-bank --from OLD_ID --to NEW_ID [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--from` | Current bank id. | — |
+| `--to` | New bank id. Must not already exist. | — |
+| `--schema`, `-s` | Schema the bank lives in. | Configured base schema |
+| `--dry-run` | Run the whole rename, print the rows that would move per table, then roll back. | Off |
+
+**Before you run it:**
+
+- **Stop the bank's clients.** Anything still calling the old id gets a 404, or, if it creates banks on demand, silently starts a new, empty bank under the old id. Point every client, and any API key scoped to the bank, at the new id before restarting them.
+- **Let the bank's operations finish.** The command refuses while the bank has pending or processing operations.
+
+The rename runs in a single transaction and only locks that bank's rows. Other banks keep serving. Its duration grows with the bank's size. Afterwards, the bank's vector indexes are rebuilt with `CREATE INDEX CONCURRENTLY`, and until that finishes, recall on the renamed bank runs without them. Running API servers may keep answering for the old id until their bank-info cache expires. PostgreSQL only.
+
+**Examples:**
+
+```bash
+# See what would move, change nothing
+hindsight-admin rename-bank --from acme --to acme-prod --dry-run
+
+hindsight-admin rename-bank --from acme --to acme-prod
+```
 
 ---
 
@@ -80,6 +177,9 @@ The backup includes:
 - Entities and their relationships
 - Memory units (facts, experiences, observations)
 - Entity cooccurrences and memory links
+- Mental models and directives
+- Webhooks and file storage
+- Internal operational tables (async operations, audit log, graph-maintenance queue, and similar bookkeeping) so a restore reproduces a faithful full-database snapshot
 
 :::note Consistency
 Backups are created within a database transaction with `REPEATABLE READ` isolation, ensuring a consistent snapshot across all tables.
@@ -146,6 +246,7 @@ hindsight-admin decommission-worker WORKER_ID [OPTIONS]
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--schema`, `-s` | Database schema | `public` |
+| `--yes`, `-y` | Skip confirmation prompt | `false` |
 
 **Examples:**
 
@@ -242,6 +343,93 @@ hindsight-admin worker-status --schema tenant_acme
 - **Before decommissioning**: Inspect which workers have stale tasks and how long they have been stuck
 - **Debugging throughput**: Diagnose why the queue is not draining (are tasks stuck in processing?)
 - **Worker health check**: Spot workers whose `last_update_ago` keeps growing, indicating a dead or unresponsive worker
+
+---
+
+### export-bank
+
+Export an entire bank to a portable ZIP archive — documents, facts, observations, bank configuration, mental models, directives, and webhooks. Embeddings are **never** included; they are regenerated on import. This is the source half of a cross-instance migration (e.g. moving to a different embedding model, vector extension, or text-search backend). PostgreSQL only.
+
+```bash
+hindsight-admin export-bank --bank <BANK_ID> --output <FILE.zip> [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--bank`, `-b` | Bank id to export. | (required) |
+| `--output`, `-o` | Path to write the `.zip` archive. | (required) |
+| `--schema`, `-s` | Schema the bank lives in. | base schema |
+| `--include-history` | Also export operational history (`audit_log`, `llm_requests`). | `false` |
+
+**Examples:**
+
+```bash
+hindsight-admin export-bank --bank my-bank --output my-bank.zip
+
+# include operational history
+hindsight-admin export-bank --bank my-bank --output my-bank.zip --include-history
+```
+
+Read-only — safe to run against a live instance.
+
+---
+
+### import-bank
+
+Restore a whole-bank archive (produced by `export-bank`) into **this** instance. Facts are re-embedded with this instance's configured embedding model and links/indexes are rebuilt; bank configuration, mental models, directives, and webhooks are restored exactly. No LLM fact-extraction runs, and because a migration restores state, it does **not** fire webhooks or re-run consolidation. PostgreSQL only.
+
+```bash
+hindsight-admin import-bank --archive <FILE.zip> [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--archive`, `-a` | Path to the `.zip` produced by `export-bank`. | (required) |
+| `--schema`, `-s` | Target schema. | base schema |
+| `--target-bank` | Override the bank id (defaults to the archive's source bank). | source bank |
+| `--include-history` | Also restore history if present in the archive. | `false` |
+
+**Examples:**
+
+```bash
+hindsight-admin import-bank --archive my-bank.zip
+```
+
+Run this against an instance configured with the **target** embedding model / vector extension / text-search backend — that's what re-embedding uses.
+
+:::warning Target bank must not exist
+Import restores a **whole bank** (config, facts, mental models, …) — it is **not a merge**. If a bank with the target id already exists, the command fails. Delete that bank first, or use `--target-bank` to restore under a fresh id.
+:::
+
+---
+
+## Migrating a bank to a new instance
+
+Changing a bank's **embedding model** (e.g. a 384-dim encoder → a 1024-dim one), **vector extension** (pgvector / vchord / pgvectorscale), or **text-search backend** can't be done in place on a populated bank — the stored vectors and indexes are tied to those settings. Because every embedding and index is a deterministic function of text already on disk, the supported path is to **move the bank to a fresh instance configured with the new settings and re-derive everything there — with no LLM re-extraction**.
+
+`export-bank` / `import-bank` carry documents, facts, observations, bank config, mental models, directives, and webhooks — but never embeddings, which the target instance regenerates with its own model.
+
+**Blue-green runbook:**
+
+1. Stand up a **new instance** on a fresh database, configured with the new embedding model / vector extension / text-search backend.
+2. Quiesce writes to the source bank (maintenance window) and run `hindsight-admin backup` for safety.
+3. Export from the source, then import into the target:
+   ```bash
+   # on the source instance:
+   hindsight-admin export-bank --bank my-bank --output my-bank.zip
+   # on the target instance (configured with the new settings):
+   hindsight-admin import-bank --archive my-bank.zip
+   ```
+4. Verify on the target: run representative recall queries and compare results.
+5. Cut traffic over to the new instance. The old instance stays as an instant rollback until you're confident.
+
+:::note Why a new instance, not in-place
+The embedding model is server-level, and a bank's `memory_units.embedding` column has a single dimension shared across the schema, so a different-dimension or different-backend bank needs its own instance/database. The old vectors are never mutated, which makes rollback trivial.
+:::
 
 ---
 

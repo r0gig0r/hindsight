@@ -1,6 +1,7 @@
 """
 Test that LLM calls record token metrics via the metrics collector.
 """
+
 import os
 from unittest.mock import MagicMock, patch
 import pytest
@@ -31,7 +32,9 @@ async def test_llm_metrics_recorded_for_groq():
     mock_collector = MagicMock(spec=MetricsCollector)
 
     # Patch the provider module where get_metrics_collector is actually called
-    with patch("hindsight_api.engine.providers.openai_compatible_llm.get_metrics_collector", return_value=mock_collector):
+    with patch(
+        "hindsight_api.engine.providers.openai_compatible_llm.get_metrics_collector", return_value=mock_collector
+    ):
         llm = LLMProvider(
             provider="groq",
             api_key=api_key,
@@ -40,14 +43,16 @@ async def test_llm_metrics_recorded_for_groq():
         )
 
         # Make an LLM call with clear instruction
-        response = await llm.call(
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant. Always respond."},
-                {"role": "user", "content": "What is 2+2? Reply with just the number."}
-            ],
-            max_completion_tokens=50,
-            scope="test_metrics",
-        )
+        response = (
+            await llm.call(
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant. Always respond."},
+                    {"role": "user", "content": "What is 2+2? Reply with just the number."},
+                ],
+                max_completion_tokens=50,
+                scope="test_metrics",
+            )
+        ).content
 
         # Verify record_llm_call was called - this is the main test
         assert mock_collector.record_llm_call.called, "record_llm_call should have been called"
@@ -92,7 +97,9 @@ async def test_llm_metrics_recorded_for_structured_output():
     mock_collector = MagicMock(spec=MetricsCollector)
 
     # Patch the provider module where get_metrics_collector is actually called
-    with patch("hindsight_api.engine.providers.openai_compatible_llm.get_metrics_collector", return_value=mock_collector):
+    with patch(
+        "hindsight_api.engine.providers.openai_compatible_llm.get_metrics_collector", return_value=mock_collector
+    ):
         llm = LLMProvider(
             provider="groq",
             api_key=api_key,
@@ -101,12 +108,14 @@ async def test_llm_metrics_recorded_for_structured_output():
         )
 
         # Make a structured output call
-        response = await llm.call(
-            messages=[{"role": "user", "content": "Say hello in French. Return greeting and language."}],
-            response_format=SimpleResponse,
-            max_completion_tokens=100,
-            scope="structured_output_test",
-        )
+        response = (
+            await llm.call(
+                messages=[{"role": "user", "content": "Say hello in French. Return greeting and language."}],
+                response_format=SimpleResponse,
+                max_completion_tokens=100,
+                scope="structured_output_test",
+            )
+        ).content
 
         # Verify structured response
         assert isinstance(response, SimpleResponse)
@@ -149,19 +158,21 @@ async def test_noop_collector_when_metrics_disabled():
         model="openai/gpt-oss-20b",
     )
 
-    response = await llm.call(
-        messages=[{"role": "user", "content": "Say 'test' in one word."}],
-        max_completion_tokens=50,
-    )
+    response = (
+        await llm.call(
+            messages=[{"role": "user", "content": "Say 'test' in one word."}],
+            max_completion_tokens=50,
+        )
+    ).content
 
     assert response is not None
     print(f"\nLLM call succeeded with NoOpMetricsCollector: {response}")
 
 
 @pytest.mark.asyncio
-async def test_return_usage_returns_tuple():
+async def test_call_reports_token_usage():
     """
-    Test that return_usage=True returns (result, TokenUsage) tuple.
+    Test that call() returns an LLMCallResult carrying token usage.
     """
     from hindsight_api.engine.response_models import TokenUsage
 
@@ -176,15 +187,16 @@ async def test_return_usage_returns_tuple():
         model="openai/gpt-oss-20b",
     )
 
-    # Call with return_usage=True
-    result, usage = await llm.call(
+    # Call and read the usage off the result
+    call_result = await llm.call(
         messages=[
             {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "What is 2+2? Reply with just the number."}
+            {"role": "user", "content": "What is 2+2? Reply with just the number."},
         ],
         max_completion_tokens=50,
-        return_usage=True,
     )
+    result = call_result.content
+    usage = call_result.usage
 
     # Verify result is the response text
     assert result is not None
@@ -196,15 +208,15 @@ async def test_return_usage_returns_tuple():
     assert usage.output_tokens >= 0, f"Expected output_tokens >= 0, got {usage.output_tokens}"
     assert usage.total_tokens == usage.input_tokens + usage.output_tokens
 
-    print(f"\nreturn_usage=True test:")
+    print("\ncall() usage test:")
     print(f"  result: {result}")
     print(f"  usage: {usage}")
 
 
 @pytest.mark.asyncio
-async def test_return_usage_with_structured_output():
+async def test_call_reports_token_usage_for_structured_output():
     """
-    Test that return_usage=True works with structured output (JSON).
+    Test that usage is reported for structured output (JSON) too.
     """
     from pydantic import BaseModel
     from hindsight_api.engine.response_models import TokenUsage
@@ -224,13 +236,14 @@ async def test_return_usage_with_structured_output():
         model="openai/gpt-oss-20b",
     )
 
-    # Call with return_usage=True and structured output
-    result, usage = await llm.call(
+    # Call and read the usage off the result and structured output
+    call_result = await llm.call(
         messages=[{"role": "user", "content": "What is 5+3? Return the answer and a brief explanation."}],
         response_format=MathAnswer,
         max_completion_tokens=100,
-        return_usage=True,
     )
+    result = call_result.content
+    usage = call_result.usage
 
     # Verify result is the parsed response
     assert isinstance(result, MathAnswer)
@@ -242,6 +255,6 @@ async def test_return_usage_with_structured_output():
     assert usage.input_tokens > 0
     assert usage.output_tokens > 0
 
-    print(f"\nStructured output with return_usage=True:")
+    print("\nStructured output usage:")
     print(f"  result: {result}")
     print(f"  usage: {usage}")
