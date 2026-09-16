@@ -8,6 +8,7 @@ the FastAPI application with all API endpoints.
 import asyncio
 import json
 import logging
+import os
 import re
 import uuid
 from contextlib import asynccontextmanager
@@ -3322,26 +3323,45 @@ def _register_routes(app: FastAPI):
                 "recall", bank_id=bank_id, source="api", budget=request.budget.value, max_tokens=request.max_tokens
             ):
                 recall_start = time.time()
-                core_result = await app.state.memory.recall_async(
-                    bank_id=bank_id,
-                    query=request.query,
-                    budget=request.budget,
-                    max_tokens=request.max_tokens,
-                    enable_trace=request.trace,
-                    fact_type=fact_types,
-                    question_date=question_date,
-                    include_entities=include_entities,
-                    max_entity_tokens=max_entity_tokens,
-                    include_chunks=include_chunks,
-                    max_chunk_tokens=max_chunk_tokens,
-                    include_source_facts=include_source_facts,
-                    max_source_facts_tokens=max_source_facts_tokens,
-                    max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,
-                    request_context=request_context,
-                    tags=request.tags,
-                    tags_match=request.tags_match,
-                    tag_groups=request.tag_groups,
-                )
+                # why: HINDSIGHT_API_RECALL_USES_EXP routes all /recall traffic through the
+                # experimental recall_exp_async pipeline (full recall + entity enrichment +
+                # KNN diversity clustering). Dropped params on this branch: budget,
+                # enable_trace, include_entities/chunks/source_facts, tag_groups, question_date.
+                if os.environ.get("HINDSIGHT_API_RECALL_USES_EXP", "").lower() in ("1", "true", "yes"):
+                    logging.info(
+                        f"[RECALL HTTP] bank={bank_id} routing via recall_exp_async "
+                        f"(HINDSIGHT_API_RECALL_USES_EXP=on)"
+                    )
+                    core_result = await app.state.memory.recall_exp_async(
+                        bank_id=bank_id,
+                        query=request.query,
+                        max_tokens=request.max_tokens,
+                        fact_type=fact_types,
+                        request_context=request_context,
+                        tags=request.tags,
+                        tags_match=request.tags_match,
+                    )
+                else:
+                    core_result = await app.state.memory.recall_async(
+                        bank_id=bank_id,
+                        query=request.query,
+                        budget=request.budget,
+                        max_tokens=request.max_tokens,
+                        enable_trace=request.trace,
+                        fact_type=fact_types,
+                        question_date=question_date,
+                        include_entities=include_entities,
+                        max_entity_tokens=max_entity_tokens,
+                        include_chunks=include_chunks,
+                        max_chunk_tokens=max_chunk_tokens,
+                        include_source_facts=include_source_facts,
+                        max_source_facts_tokens=max_source_facts_tokens,
+                        max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,
+                        request_context=request_context,
+                        tags=request.tags,
+                        tags_match=request.tags_match,
+                        tag_groups=request.tag_groups,
+                    )
 
             # Convert core MemoryFact objects to API RecallResult objects (excluding internal metrics)
             def _fact_to_result(fact: "MemoryFact") -> RecallResult:
